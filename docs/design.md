@@ -13,7 +13,7 @@ IAM role quotas (1,000 roles per account by default, max 5,000) make "one IAM ro
 Goals
 - A few IAM roles per account, one per **permission shape** (e.g. `shape-s3-reader`, `shape-dynamo-rw`).
 - Workload identity = **SPIFFE ID**, obtained through the standard SPIFFE Workload API from a pluggable issuer. SPIRE is the reference issuer, not a dependency of the design. Uniform across all clusters regardless of platform or cloud provider.
-- Per-workload scope enforced via ABAC session tags and, where needed, **session policies** issued by a central broker.
+- Every credential is issued by a central broker, which sets per-workload ABAC session tags and, where needed, **session policies**. The issuer's keys never leave the cluster; AWS only ever sees the broker's role.
 - **Who may get what** lives in a **pluggable authorization store** behind a small, backend-neutral interface. SpiceDB is the reference backend, not a dependency of the design. **What a credential may look like** lives in a signed, Git-managed bundle.
 - No application/SDK code changes. No AWS credentials on disk. The only on-disk secrets are JWT-SVIDs with a TTL of at most 5 minutes, each bound to a single audience.
 - Attestation is the identity issuer's job. Crachá never re-attests a workload; it verifies what the issuer signed.
@@ -24,27 +24,25 @@ Non-goals
 - Human access.
 - Coupling the broker or node agent to one authorization engine or one identity issuer. Backend-specific types never leave their adapter package.
 - Long-lived credentials.
-- Replacing ABAC-only access (Path A) for the majority of workloads.
+- Direct federation of workload tokens with AWS (IRSA-style `AssumeRoleWithWebIdentity`, or IAM Roles Anywhere with X.509-SVIDs). Both publish the issuer's keys to AWS and bypass the authorization store.
 
 ## 3. Architecture overview
 
-Two credential paths share one identity system:
+One credential path for every workload:
 
-| Path | Use when | Mechanism |
-|---|---|---|
-| **A (default)** | Same actions, different resources | SDK reads a JWT-SVID (`aud=sts.amazonaws.com`) from a file and calls `sts:AssumeRoleWithWebIdentity` on a shape role itself; ABAC via session tags in the JWT |
-| **C (broker)** | Permissions must be centrally narrowed and enforced | SDK reads a JWT-SVID (`aud=cracha-broker`) from a file and calls the broker over HTTPS using the container-credentials protocol → broker verifies the JWT → authz check → `sts:AssumeRole` with session policy + tags |
+1. cracha-csi writes the pod's JWT-SVID (`aud=cracha-broker`, TTL ≤ 5 min) into the pod before its containers start, and rotates it.
+2. The AWS SDK's container-credentials provider, which every first-party SDK has, reads the token from a file and calls the broker over HTTPS.
+3. The broker verifies the JWT-SVID against the trust bundle, checks the authorization store, renders and validates the session policy, and calls `sts:AssumeRole` on a shape role with `SourceIdentity`, session tags and the session policy.
+4. The SDK caches the session and refreshes it through the same call.
 
-In both paths the pod's only secret is a short-lived JWT-SVID, written and rotated by cracha-csi, and the AWS SDK uses it through a provider it already has. Nothing in the cluster sits between the SDK and its credential source except, in Path C, the broker.
-
-(Path B, IAM Roles Anywhere with X.509-SVIDs, is reserved for non-AWS-hosted workloads and is out of scope for the first implementation.)
+The pod's only secret is the short-lived JWT-SVID, and the application code is unchanged. Nothing in the cluster sits between the SDK and the broker.
 
 ```mermaid
 flowchart TB
     subgraph k8snode["Node"]
         subgraph pod["Pod"]
-            app["app (AWS SDK)<br/>Path A: AWS_WEB_IDENTITY_TOKEN_FILE + AWS_ROLE_ARN<br/>Path C: AWS_CONTAINER_CREDENTIALS_FULL_URI (https) + AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"]
-            files["/var/run/cracha/<br/>JWT-SVID, rotated"]
+            app["app (AWS SDK)<br/>AWS_CONTAINER_CREDENTIALS_FULL_URI (https)<br/>AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"]
+            files["/var/run/cracha/token<br/>JWT-SVID, rotated"]
             files -->|read on every refresh| app
         end
         agent["cracha-csi (DaemonSet, unprivileged)<br/>CSI node plugin<br/>• NodePublish/Unpublish → pod registry<br/>• fetch + rotate the pod's JWT-SVID via the issuer adapter"]
@@ -57,11 +55,10 @@ flowchart TB
     bundle["grant bundle<br/>(signed, from Git)"]
     sts["STS"]
     shapes["Shape roles in target accounts<br/>(permission boundary + SCP ceiling)"]
-    app -->|"Path C: HTTPS + JWT-SVID"| broker
-    app -->|"Path A: AssumeRoleWithWebIdentity + JWT-SVID"| sts
+    app -->|"HTTPS + JWT-SVID"| broker
     broker -->|Check| authz
     bundle -->|poll + verify| broker
-    broker -->|"AssumeRole (broker's own creds via Path A)"| sts
+    broker -->|"AssumeRole (broker's own credentials, 5)"| sts
     sts --> shapes
 ```
 
@@ -70,9 +67,9 @@ flowchart TB
 The design depends on the **SPIFFE standard**, not on a particular issuer. Any issuer that meets the contract in 4.1 can be used; SPIRE is the reference implementation (4.2).
 
 - **SPIFFE ID scheme:** `spiffe://<trust-domain>/ns/<namespace>/sa/<serviceaccount>`. The scheme is enforced by the issuer's registration policy, whatever the issuer.
-- The cluster is **not** part of the identity. The same workload running in several clusters of a trust domain has one SPIFFE ID, so active-active deployments share grants by default. Cluster is context: in Path C the broker knows which cluster it serves and attaches it; in Path A it is available only when the issuer can add claims. Per-cluster scoping is expressed as an assignment condition (6.4), never as a separate identity.
+- The cluster is **not** part of the identity. The same workload running in several clusters of a trust domain has one SPIFFE ID, so active-active deployments share grants by default. Cluster is context: the broker knows which cluster it serves and attaches it. Per-cluster scoping is expressed as an assignment condition (6.4), never as a separate identity.
 - The issuer is a Tier-0 service: signing keys in KMS/HSM, per-region deployment or a nested hierarchy under a shared root.
-- Crachá is trust-domain-agnostic. Trust domain topology (one domain with a nested hierarchy, or several federated domains) is the issuer operator's choice. It touches Crachá in two places only: Path A needs one IAM OIDC provider per trust domain, and a workload's identity is scoped to its trust domain, so per-region domains give the same workload a different identity per region.
+- Crachá is trust-domain-agnostic. Trust domain topology (one domain with a nested hierarchy, or several federated domains) is the issuer operator's choice. It touches Crachá in one place only: a workload's identity is scoped to its trust domain, so per-region domains give the same workload a different identity per region. AWS never learns about trust domains, because only the broker talks to STS.
 - The service mesh (Istio, multi-primary) should eventually consume the same issuer via Envoy SDS, so mesh identity == AWS identity. Not required for v1.
 
 ### 4.1 Identity issuer contract
@@ -82,10 +79,7 @@ What Crachá needs from the issuer, and the standard mechanism for each:
 | Need | Used by | Standard mechanism | Adapter responsibility |
 |---|---|---|---|
 | Own X.509-SVID and trust bundle (incl. federated bundles) | broker (JWT verification, service-to-service mTLS) | SPIFFE Workload API (`go-spiffe/v2`) | none, standard |
-| JWT-SVID for its own identity | broker's own creds (Path A) | SPIFFE Workload API | none, standard |
-| OIDC discovery (JWKS) for the trust domain | IAM OIDC provider (Path A) | SPIFFE OIDC federation, public HTTPS endpoint | issuer-specific deployment |
-| ABAC claims in JWT-SVIDs (`https://aws.amazon.com/tags`) | Path A | no standard | issuer hook where available; otherwise ABAC tags are derived by IAM from `sub` path segments (`StringLike` conditions) |
-| **Per-pod JWT-SVID obtained by cracha-csi on the pod's behalf** | cracha-csi (both paths) | SPIFFE Broker API (experimental; standardised under the SPIFFE project, not SPIRE-specific) | issuer adapter: fetch a JWT-SVID for a pod identified by a Kubernetes object reference (namespace, name, UID) for a given audience; the issuer resolves and attests the pod itself and refuses unknown or mismatched references |
+| **Per-pod JWT-SVID obtained by cracha-csi on the pod's behalf** | cracha-csi | SPIFFE Broker API (experimental; standardised under the SPIFFE project, not SPIRE-specific) | issuer adapter: fetch a JWT-SVID for a pod identified by a Kubernetes object reference (namespace, name, UID) for a given audience; the issuer resolves and attests the pod itself and refuses unknown or mismatched references |
 | Node and workload attestation | all | issuer-specific | platform-specific attestor per cluster type (e.g. instance identity for cloud nodes, projected SA tokens for self-hosted clusters) |
 
 Rules:
@@ -99,8 +93,6 @@ Rules:
 - SPIRE server per region (or nested SPIRE under a shared upstream root). Keys via KMS/HSM UpstreamAuthority.
 - Node attestation: `aws_iid` for EC2-backed nodes, `k8s_psat` for self-hosted clusters.
 - Workload attestation: k8s workload attestor. Entries managed by SPIRE Controller Manager `ClusterSPIFFEID`.
-- OIDC discovery: SPIRE OIDC Discovery Provider.
-- ABAC claims: a **CredentialComposer** plugin adds `principal_tags` (ns, sa, cluster; plus service/team once the authz store is live).
 - Per-pod JWT-SVID fetch: `FetchJWTSVID` on the **SPIFFE Broker API** served by the SPIRE agent (≥ 1.15.2, `experimental { broker { … } }`). The request carries a `KubernetesObjectReference` with namespace, name and UID. The agent's k8s workload attestor resolves and attests the pod itself, so every selector it can produce works in entries, and sending the UID makes it reject a recycled pod name. Not the Delegated Identity API: that needs hand-built selectors and `hostPID`.
   - cracha-csi is the configured broker: its own workload SVID is the mTLS client certificate the endpoint authorises against the broker `idTemplate`; `allowed_reference_types` = `KubernetesObjectReference` over the Unix socket only; `pod_reference_scope: agent_node`.
   - Access policy `enforced`: the agent runs a SubjectAccessReview with verb `impersonate-via-spire` on the pod, username = cracha-csi's SPIFFE ID, so RBAC bounds which pods it may fetch for. `permissive` only for bring-up.
@@ -118,20 +110,20 @@ Several systems restrict characters, so one deterministic encoding, owned by a s
 
 The mapping (encoded → full SPIFFE ID) is logged at every issuance to keep audit reversible.
 
-## 5. Path A: JWT-SVID direct federation (default)
+## 5. Broker credentials
 
-- The issuer's OIDC discovery endpoint at a public HTTPS URL; registered as an IAM OIDC provider per trust domain.
-- JWT-SVID with `aud=sts.amazonaws.com`, TTL ≤ 5 min, written to the pod by cracha-csi (7). The SDK's web-identity provider reads it from `AWS_WEB_IDENTITY_TOKEN_FILE` on every refresh and calls `AssumeRoleWithWebIdentity` on the role in `AWS_ROLE_ARN`. `AWS_ROLE_SESSION_NAME` is set to the STS encoding of the workload (4.3).
-- ABAC tags come from the `https://aws.amazon.com/tags` claim (`principal_tags`: ns, sa, cluster; plus service/team once the authz store is live) when the issuer can add it (SPIRE: CredentialComposer). Without that hook, policies fall back to `StringLike` conditions on the `sub` path segments, which covers ns/sa but not cluster, service or team.
-- One role per shape; trust policy `StringLike` on `<provider>:sub` (scoped pattern) and allows `sts:TagSession`.
-- Policies scope resources with `${aws:PrincipalTag/...}` and `aws:ResourceTag/...`.
-- The broker's own credentials use Path A.
+The broker is the only principal that calls STS, so it is the only thing that needs AWS credentials of its own. It gets them from the platform, not from the identity issuer:
 
-## 6. Path C: credential broker
+- Preferred: the platform's native workload identity for the broker's pods (EKS Pod Identity, or an instance profile on the broker's dedicated nodes), bound to the `cracha-broker-<env>` role.
+- Clusters without a platform identity: an IAM OIDC provider for the issuer's trust domain, used by the broker alone with its own JWT-SVID (`aud=sts.amazonaws.com`) through the SDK's web-identity provider, with a trust policy pinned to the broker's SPIFFE ID. This is the one case where the issuer's JWKS must be published to AWS, and it covers a single identity.
+
+Shape-role trust policies name only the broker role (6.6), so workload identities are never visible to IAM.
+
+## 6. Credential broker
 
 ### 6.1 Responsibilities split
 
-- **Grant bundle (Git, signed):** shapes, base roles, policy templates, allowed ARN envelopes, profiles. Answers *what*.
+- **Grant bundle (Git, signed):** shapes (base roles and their ARN envelopes) and grants (policy templates with parameters). Answers *what*.
 - **Authorization store (pluggable, SpiceDB reference):** assignments of grants to services/workloads, service membership, ownership, temporary access. Answers *who*.
 
 ### 6.2 Grant definition (bundle)
@@ -143,7 +135,6 @@ metadata:
 spec:
   account: "111122223333"
   baseRole: arn:aws:iam::111122223333:role/broker/shape-dynamo-rw
-  profile: default                 # named profiles for workloads needing >1 shape
   sessionPolicy:
     template: dynamo-table-rw
     params: { tables: [ledger, ledger-outbox] }   # or resolved via the authz store (Level 3)
@@ -154,12 +145,14 @@ spec:
     - arn:aws:dynamodb:*:111122223333:table/payments-*
 ```
 
+A workload has exactly one shape, and its session policy is composed by the broker at issuance time from every grant currently assigned to it in the authorization store. Permissions therefore change by assignment, with no redeploy and no per-workload configuration. All grants assigned to one workload must share its shape; a mix of shapes is ambiguous and denied. There are no profiles: one workload, one shape, one credential source.
+
 CI (`grant-compiler`) pipeline:
 1. Render templates.
 2. Access Analyzer `ValidatePolicy`.
 3. `CheckNoNewAccess` against the shape's envelope policy.
 4. Size budget lint (2,048-char inline session policy + packed tag budget).
-5. Uniqueness: at most one grant per (profile, account) per assignee.
+5. Composition lint, for assignments known in Git: the union of an assignee's grants stays within one shape, the size budget and the envelope. The broker re-checks all three at issuance, since assignments can also come from the approval flow.
 6. Compile → sign (KMS or cosign) → publish to S3.
 
 Broker polls the bundle, verifies signature, swaps atomically, and **keeps the last good bundle on failure (never fails open).**
@@ -170,8 +163,8 @@ The broker depends only on this contract. Each backend is an adapter chosen by c
 
 | Question | Operation | Answer | Required |
 |---|---|---|---|
-| May this workload assume this grant? | Check(subject, grant, consistency) | allow/deny, the matching grant (ambiguity is a deny, see 6.5), ABAC tags such as service and team, a consistency token, a decision trace | yes |
-| Which grants (profiles) may this workload assume? | ListGrants(subject, consistency) | grant list + consistency token | yes |
+| Which grants does this workload hold? | ListGrants(subject, consistency) | grant list, ABAC tags such as service and team, a consistency token, a decision trace | yes |
+| Does this workload hold this grant? | Check(subject, grant, consistency) | allow/deny + consistency token; used to re-validate cached sessions grant by grant | yes |
 | Which resources of a kind may this workload use? | LookupResources(subject, kind, permission) | resource list, for Level 3 template filling | optional |
 | What changed since this token? | Watch(since) | stream of assignment changes, for cache invalidation | optional; without it the cache degrades to TTL-only invalidation |
 
@@ -240,19 +233,20 @@ Deployment (SpiceDB): one instance per region on its own Postgres. The reconcile
 ### 6.5 Broker API
 
 ```
-GET /v1/credentials?profile=default[&account=111122223333]
+GET /v1/credentials
     Authorization: <JWT-SVID, aud=cracha-broker>      (SPIFFE ID from `sub`)
 
 200 { "AccessKeyId", "SecretAccessKey", "Token", "Expiration" }   container-credentials format
-    Cracha-Grant: payments-ledger-rw
+    Cracha-Shape: shape-dynamo-rw
+    Cracha-Grants: payments-ledger-rw, payments-outbox-r
     Cracha-Bundle-Version: ...
     Cracha-Consistency-Token: ...
-403 { "reason": "no_grant" | "ambiguous" | "subject_suspended" | "envelope_violation" }
+403 { "reason": "no_grant" | "ambiguous" | "subject_suspended" | "envelope_violation" | "policy_too_large" }
 
-GET /v1/profiles              (same authorization) → profiles the caller can assume (`Store.ListGrants`)
+GET /v1/grants                (same authorization) → the caller's shape, grants and composed session policy, for inspection
 ```
 
-The request is exactly what the SDK's container-credentials provider sends, so the broker is a drop-in credential source for any SDK. Query parameters are fixed per workload by the webhook (7.4).
+The request is exactly what the SDK's container-credentials provider sends, with nothing workload-specific in it: the identity in the token selects everything. The broker is therefore a drop-in credential source for any SDK. `ambiguous` means the caller's grants span more than one shape.
 
 Authentication:
 - The broker validates the JWT-SVID with go-spiffe against the trust bundle (and federated bundles) from its own Workload API: signature, `aud=cracha-broker`, `exp`, and that `sub` matches the SPIFFE ID scheme (4).
@@ -287,7 +281,7 @@ Authentication:
 
 ### 6.7 Caching
 
-- Broker cache key: `(account, grant, bundleVersion, encoded workload)`. In-memory only, singleflight on miss, refresh-ahead at ~70% TTL, never return creds with <20 min left.
+- Broker cache key: `(shape, sorted grant set, bundleVersion, encoded workload)`. A change in the grant set is a new key, so an added or removed assignment takes effect at the next fetch. In-memory only, singleflight on miss, refresh-ahead at ~70% TTL, never return creds with <20 min left.
 - **Re-check the authz store on every issuance, including cache hits** (cheap at refresh frequency).
 - `Store.Watch` invalidates affected cache entries on assignment changes. Backends without Watch degrade to TTL-only invalidation, and the broker exposes which mode is active.
 - Consistency: minimize latency by default; at-least-as-fresh when a caller (approver/revocation tool) supplies a consistency token.
@@ -318,7 +312,7 @@ Its role:
 - **Context check, not attestation.** It verifies the kubelet-supplied bound ServiceAccount token against the pod UID it was given. Workload attestation is the issuer's: the fetch names the pod by namespace, name and UID, and the issuer resolves, attests and answers only for pods its own agent sees on that node.
 
 What it is not:
-- Not on the request path. The SDK talks to STS or the broker directly; a cracha-csi restart is invisible to running pods until their next rotation.
+- Not on the request path. The SDK talks to the broker directly; a cracha-csi restart is invisible to running pods until their next rotation.
 - Not a credential holder. It caches nothing and never sees AWS credentials.
 - Not privileged. No host networking, no host PID namespace, no capabilities. Its host access is the kubelet plugin socket and the issuer agent's socket.
 
@@ -345,17 +339,16 @@ spec:
 
 ```
 /var/run/cracha/
-└── token         JWT-SVID for the workload's path:
-                  aud=sts.amazonaws.com (Path A) or aud=cracha-broker (Path C)
+└── token         JWT-SVID, aud=cracha-broker
 ```
 
-One file, one audience. A workload is on one path; the webhook decides which (7.4).
+One file, one audience.
 
 ### 7.3 NodePublishVolume and rotation
 
 1. Read pod UID, namespace, SA from the volume context (kubelet-supplied).
 2. Verify the kubelet-provided bound SA token. Its pod-binding claims must match the volume-context pod UID.
-3. Register the pod. Fetch its JWT-SVID for the path's audience through the issuer adapter (SPIRE: Broker API `FetchJWTSVID` with a Kubernetes object reference of namespace, name and UID). The issuer refuses pods it cannot resolve and attest on this node. Containers have not started at this point, so only pod-level selectors (namespace, service account, labels) are available; the ID scheme (4) keys on exactly those.
+3. Register the pod. Fetch its JWT-SVID (`aud=cracha-broker`) through the issuer adapter (SPIRE: Broker API `FetchJWTSVID` with a Kubernetes object reference of namespace, name and UID). The issuer refuses pods it cannot resolve and attest on this node. Containers have not started at this point, so only pod-level selectors (namespace, service account, labels) are available; the ID scheme (4) keys on exactly those.
 4. Write the token atomically (write temp + rename).
 
 Kubelet doesn't start containers until publish succeeds, so a valid token is present before app start.
@@ -366,16 +359,15 @@ Kubelet doesn't start containers until publish succeeds, so a valid token is pre
 
 ### 7.4 Webhook (`cracha-webhook`)
 
-For ServiceAccounts annotated `cracha.dev/enabled: "true"`, inject the CSI inline volume, `AWS_REGION` (from the node's topology region, or the cluster default), and the path's environment:
-
-| Path | Selected by | Injected |
-|---|---|---|
-| A (default) | `cracha.dev/role-arn: <shape role>` on the SA | `AWS_WEB_IDENTITY_TOKEN_FILE=/var/run/cracha/token`, `AWS_ROLE_ARN=<shape role>`, `AWS_ROLE_SESSION_NAME=<STS encoding>` |
-| C | `cracha.dev/path: broker` on the SA, optional `cracha.dev/profile`, `cracha.dev/account` | `AWS_CONTAINER_CREDENTIALS_FULL_URI=https://<broker>/v1/credentials?profile=<p>[&account=<a>]`, `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE=/var/run/cracha/token` |
+For ServiceAccounts annotated `cracha.dev/enabled: "true"`, inject:
+- the CSI inline volume
+- `AWS_CONTAINER_CREDENTIALS_FULL_URI=https://<broker>/v1/credentials`
+- `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE=/var/run/cracha/token`
+- `AWS_REGION` from the node's topology region, or the cluster default
 
 It strips or rejects `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, and any `AWS_WEB_IDENTITY_*`, `AWS_ROLE_*`, `AWS_CONTAINER_CREDENTIALS_*` or `AWS_CONTAINER_AUTHORIZATION_*` the pod set itself. IMDS is blocked for pods (hop limit 1 / CNI policy).
 
-### 7.5 Sequence (Path C; Path A is the same with STS in place of the broker)
+### 7.5 Sequence
 
 ```mermaid
 sequenceDiagram
@@ -401,10 +393,10 @@ sequenceDiagram
 
     Note over P,B: credential fetch (every SDK refresh)
     P->>P: read /var/run/cracha/token
-    P->>B: GET https://broker/v1/credentials?profile=default<br/>Authorization: JWT-SVID
+    P->>B: GET https://broker/v1/credentials<br/>Authorization: JWT-SVID
     B->>B: verify signature, aud, exp, then take the SPIFFE ID from sub
-    B->>B: authz Check, grant lookup, envelope check
-    alt cache hit for (account, grant, bundle, workload)
+    B->>B: authz ListGrants, compose session policy, envelope check
+    alt cache hit for (shape, grant set, bundle, workload)
         B-->>P: credentials (container-credentials JSON)
     else miss or refresh due
         B->>B: sts:AssumeRole with SourceIdentity, tags, session policy
@@ -418,8 +410,8 @@ sequenceDiagram
 
 ### 7.6 Workload requirements
 
-- Path A: an SDK whose default chain supports `AWS_WEB_IDENTITY_TOKEN_FILE`. All first-party SDKs have since 2019.
-- Path C: an SDK that supports an HTTPS `AWS_CONTAINER_CREDENTIALS_FULL_URI` together with `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`. Added across first-party SDKs for EKS Pod Identity (releases from late 2023). The image must trust the broker's certificate (6.5).
+- An SDK that supports an HTTPS `AWS_CONTAINER_CREDENTIALS_FULL_URI` together with `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`. Added across first-party SDKs for EKS Pod Identity (releases from late 2023).
+- The image must trust the broker's certificate (6.5).
 - Nothing else: no exec, no shell, no config file, no sidecar.
 - One credential source per process. A workload that needs more than one shape at once is an open question (10).
 
@@ -433,7 +425,7 @@ sequenceDiagram
 
 | Failure | Behavior |
 |---|---|
-| Broker down | Path A unaffected. Path C pods keep their SDK-cached session until it expires (≤1h); new Path C pods start but fail their first credential fetch until the broker returns. |
+| Broker down | Running pods keep their SDK-cached session until it expires (≤1h); new pods start but fail their first credential fetch until the broker returns. |
 | STS throttle/outage | Broker serves cache, retries with jitter, alerts on cache age. |
 | Authz store down | Fail closed for new keys; bounded-staleness cache hits (<10 min since last check). |
 | Identity issuer agent down | Token rotation stops; pods can refresh credentials only while their current token is valid (≤5 min), then run on their cached session until it expires. New pods block at publish. |
@@ -455,10 +447,12 @@ sequenceDiagram
 
 ## 10. Open questions
 
-- Q1: Approval flow for temporary access: build vs reuse existing tooling.
-- Q2: Workloads needing more than one shape in one process. The SDK takes one credential source per process; options are named profiles via a small `credential_process` helper, or splitting the workload.
-- Q3: CSI plugin on the Broker API vs. a sidecar on the standard Workload API as the token writer. The sidecar avoids the experimental API at the cost of a container per pod.
-- Q4: Confirm that the Broker API attests a pod at NodePublishVolume time, before any container has started, with pod-level selectors. Aether only uses it after CNI ADD with running containers.
+- Q1: Approval flow for temporary access. The model already has the primitive: a time-bounded assignment (`grant#assignee_workload` with the `within_window` condition) written by a trusted `access-approver` (6.4), which the broker picks up at the next fetch and which expires on its own. What is undecided is the human side:
+  - Who may request, and who approves: the owning team from `service#owner` is the natural approver, with a second approver for production shapes.
+  - Where the request and approval are recorded, so the decision log can point at an attributable approval, and how break-glass (pre-approved, short expiry, loud audit) differs from planned access.
+  - Options: (a) a Git change carrying `expiresAt`, approved through CODEOWNERS and applied by the reconciler. Reuses existing review tooling, no new service, minutes of latency. (b) Integration with an existing access-request or just-in-time tool that calls the `access-approver` writer. Fastest for users, one more integration to secure. (c) A small purpose-built approver (CLI or chat bot). Most flexible, most to build and to harden, since it holds write access to the authorization store.
+  - Constraints whichever is chosen: the writer is the only path to a temporary relationship, every relationship carries an expiry, and revocation (6.8) must be able to end it early.
+- Q2: Confirm that the Broker API attests a pod at NodePublishVolume time, before any container has started, with pod-level selectors. Aether only uses it after CNI ADD with running containers.
 
 ## 11. Invariants
 
