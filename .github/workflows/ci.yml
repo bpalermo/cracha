@@ -1,0 +1,106 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Third-party actions are pinned to commit SHAs, not tags; the version each SHA
+# corresponds to is in the comment beside it. Dependabot keeps them current.
+#
+# Caches: every job RESTORES the Bazel caches, but only runs on main SAVE them
+# (cache-save below), so only reviewed code populates a cache that a later
+# trusted build consumes. Gated on the ref rather than the event, because
+# workflow_dispatch can target any branch.
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # No version is pinned here: bazelisk reads .bazelversion, so the
+      # checkout is the single source of the Bazel version.
+      - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
+
+      # Starlark (with buildifier's lint warnings), Go and shell. The loop is
+      # there because a language whose formatter did not run reports nothing,
+      # which looks the same as clean.
+      - name: Everything is formatted
+        run: |
+          out="$(bazel run --config=ci //:format.check 2>&1)" || { echo "${out}"; echo "::error::run 'bazel run //:format'" >&2; exit 1; }
+          echo "${out}"
+          for language in Starlark Go Shell; do
+            if ! grep -q "^Formatted ${language} " <<<"${out}"; then
+              echo "::error::the formatter did not run for ${language}" >&2
+              exit 1
+            fi
+          done
+
+      # --config=ci refuses lockfile drift, and runs shellcheck on every
+      # script as part of the build (bazel/lint/linters.bzl).
+      - name: bazel build //...
+        run: bazel build //... --config=ci
+
+      # The image targets are in `//...` already; naming them keeps a rename
+      # or a removal from passing here and failing on the first publish.
+      - name: the image targets build
+        run: |
+          bazel build --config=ci \
+            //broker:image_push //broker:image_index \
+            //csi:image_push //csi:image_index \
+            //webhook:image_push //webhook:image_index
+
+      # Includes the linters: the Go analyzers of //:nogo run as part of
+      # compiling, so the build above already failed on a finding.
+      - name: bazel test //...
+        run: bazel test //... --config=ci
+
+      # Gazelle generates the BUILD files, so a hand-edited or stale one is a
+      # real failure mode: the build keeps working against the old graph until
+      # someone regenerates and the diff appears in an unrelated PR.
+      - name: BUILD files are up to date
+        run: |
+          bazel run --config=ci //:gazelle
+          if ! git diff --exit-code -- 'BUILD.bazel' '**/BUILD.bazel'; then
+            echo "::error::BUILD files are stale; run 'bazel run //:gazelle'" >&2
+            exit 1
+          fi
+
+  # The single check a ruleset should require. A required status check is
+  # matched by check-run name, so requiring the jobs themselves ties the
+  # ruleset to their names; requiring one aggregate leaves the jobs free to
+  # change. if: always() so it runs even when a job fails; a skipped job
+  # reports nothing, and a required check that never reports blocks the pull
+  # request.
+  ci:
+    name: ci
+    needs: [build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: every job this depends on must have succeeded
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "results: ${results}"
+          for result in ${results}; do
+            if [ "${result}" != "success" ]; then
+              echo "::error::a required job reported '${result}'" >&2
+              exit 1
+            fi
+          done
