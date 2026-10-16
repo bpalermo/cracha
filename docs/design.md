@@ -402,14 +402,10 @@ For workloads that can't use credential_process:
 
 ## 10. Open questions
 
-- Q1 (resolved 2026-10-16): the cluster is not in the SPIFFE ID path. Identity is cluster-agnostic; per-cluster scoping is an assignment condition.
-- Q2 (resolved 2026-10-16): trust domain topology is out of scope; the design is trust-domain-agnostic (see 4).
-- Q3 (resolved 2026-10-16): the source of truth behind `service#member@workload` is out of scope. Crachá requires a trusted writer, not a particular catalog.
-- Q4 (resolved 2026-10-16): session duration is configurable per grant, default 1h.
-- Q5: Approval flow for temporary access: build vs reuse existing tooling.
-- Q6: Minimum SDK versions across the fleet that support `credential_process` in the default chain.
-- Q8: Second production-grade authz backend to prove the store contract (OpenFGA vs. a Cedar-based store), and when.
-- Q9: Second identity issuer to prove the issuer contract (cert-manager csi-driver-spiffe is the likely candidate), and whether per-pod delivery without a delegated API is acceptable there.
+- Q1: Approval flow for temporary access: build vs reuse existing tooling.
+- Q2: Minimum SDK versions across the fleet that support `credential_process` in the default chain.
+- Q3: Second production-grade authz backend to prove the store contract (OpenFGA vs. a Cedar-based store), and when.
+- Q4: Second identity issuer to prove the issuer contract (cert-manager csi-driver-spiffe is the likely candidate), and whether per-pod delivery without a delegated API is acceptable there.
 
 ## 11. Invariants
 
