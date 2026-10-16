@@ -15,7 +15,7 @@ Goals
 - Workload identity = **SPIFFE ID**, obtained through the standard SPIFFE Workload API from a pluggable issuer. SPIRE is the reference issuer, not a dependency of the design. Uniform across all clusters regardless of platform or cloud provider.
 - Per-workload scope enforced via ABAC session tags and, where needed, **session policies** issued by a central broker.
 - **Who may get what** lives in a **pluggable authorization store** behind a small, backend-neutral interface. SpiceDB is the reference backend, not a dependency of the design. **What a credential may look like** lives in a signed, Git-managed bundle.
-- No application/SDK code changes. No bearer secrets on disk or on the network in the default mode.
+- No application/SDK code changes. No AWS credentials on disk. The only on-disk secret in the default mode is a pod-scoped endpoint token that is useless outside that pod.
 - CloudTrail attributes every call on a shared role to the real workload (`SourceIdentity`).
 - Targeted revocation of live sessions for a single workload.
 
@@ -40,13 +40,14 @@ Two credential paths share one identity system:
 flowchart TB
     subgraph k8snode["Node"]
         subgraph pod["Pod"]
-            app["app (AWS SDK)<br/>AWS_CONFIG_FILE=/var/run/cracha/config"]
-            helper["cracha-helper<br/>credential_process"]
-            app -->|exec| helper
+            app["app (AWS SDK)<br/>AWS_CONTAINER_CREDENTIALS_FULL_URI=http://169.254.170.2/v1/credentials<br/>AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE=/var/run/cracha/token"]
+            helper["cracha-helper<br/>credential_process (opt-in)"]
+            app -.->|exec| helper
         end
-        agent["cracha-node (DaemonSet, hostPID)<br/>CSI node plugin + agent<br/>• NodePublish/Unpublish → pod registry, renders config<br/>• SO_PEERCRED → PID → cgroup → pod UID attestation<br/>• per-pod X.509-SVID from the issuer<br/>• node credential cache"]
+        agent["cracha-node (DaemonSet, hostNetwork)<br/>CSI node plugin + agent<br/>• NodePublish/Unpublish → pod registry, pod token<br/>• endpoint token + source IP attestation (default)<br/>• SO_PEERCRED attestation (credential_process)<br/>• per-pod X.509-SVID from the issuer<br/>• node credential cache"]
         issuer["identity issuer agent<br/>(SPIRE reference)"]
-        helper -->|"Unix socket /var/run/cracha/agent.sock"| agent
+        app -->|"HTTP on 169.254.170.2 + pod token"| agent
+        helper -.->|"Unix socket (opt-in)"| agent
         issuer -->|"per-pod SVIDs"| agent
     end
     broker["cracha-broker (per cluster, stateless, ≥3 replicas)<br/>authn (mTLS) → authz Check → grant bundle lookup<br/>→ render + envelope-validate session policy<br/>→ cache/singleflight → sts:AssumeRole (regional STS)"]
@@ -295,6 +296,15 @@ Optionally triggered automatically when Watch observes an assignment deletion.
 
 ## 7. Delivery: cracha-node (CSI + node agent)
 
+cracha-node is a DaemonSet that owns the pod registry on its node, holds the node credential cache, obtains per-pod SVIDs from the issuer, and hands credentials to pods in one of two modes:
+
+| Mode | SDK mechanism | Attestation | Requires from the pod |
+|---|---|---|---|
+| **Endpoint (default)** | container-credentials protocol: `AWS_CONTAINER_CREDENTIALS_FULL_URI` + `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` | per-pod token + source IP == registered pod IP | an SDK that supports the token file; nothing else |
+| **credential_process (opt-in)** | `AWS_CONFIG_FILE` with `credential_process` entries | `SO_PEERCRED` → PID → cgroup → pod UID | exec on the volume, a shell for most SDKs |
+
+The mode is chosen per ServiceAccount (`cracha.dev/mode`, default `endpoint`). Both modes share the registry, the cache and the broker path.
+
 ### 7.1 CSIDriver
 
 ```yaml
@@ -316,12 +326,13 @@ spec:
 
 ```
 /var/run/cracha/
-├── config              rendered per pod
-├── bin/cracha-helper   static binary (CGO_ENABLED=0), matched to node arch
-└── agent.sock          Unix socket served by cracha-node
+├── token               per-pod endpoint token, random, generated at publish   (endpoint mode)
+├── config              rendered per pod                                       (credential_process mode, or extra profiles)
+├── bin/cracha-helper   static binary (CGO_ENABLED=0), matched to node arch    (credential_process mode)
+└── agent.sock          Unix socket served by cracha-node                      (credential_process mode)
 ```
 
-Rendered config:
+Rendered config, when present:
 
 ```ini
 [default]
@@ -338,44 +349,63 @@ region = <...>
 
 1. Read pod UID, namespace, SA from the volume context (kubelet-supplied).
 2. Verify the kubelet-provided bound SA token. Its pod-binding claims must match the volume-context pod UID.
-3. Register the pod. Subscribe to its X.509-SVID through the issuer adapter (SPIRE: Delegated Identity API, `k8s:pod-uid:<uid>`).
-4. Fetch profiles from the broker (`GET /v1/profiles`) and render `config` atomically (write temp + rename).
-5. Prefetch default credentials into the node cache.
+3. Register the pod with its UID, identity and pod IP. Subscribe to its X.509-SVID through the issuer adapter (SPIRE: Delegated Identity API, `k8s:pod-uid:<uid>`).
+4. Generate the per-pod endpoint token and bind it to the registry entry.
+5. In credential_process mode, or when the workload has named profiles: fetch profiles from the broker (`GET /v1/profiles`) and render `config` atomically (write temp + rename).
+6. Prefetch default credentials into the node cache.
 
 Kubelet doesn't start containers until publish succeeds, so credentials are ready before app start.
 
-`requiresRepublish`: re-validate the pod, re-render config when profiles change. Note: SDKs usually parse the config only when a client is created, so new profiles appear on new clients/restarts. Removal is effective immediately via the broker.
+`requiresRepublish`: re-validate the pod, rotate the token if compromised, re-render config when profiles change. SDKs usually parse the config only when a client is created, so new profiles appear on new clients/restarts. Removal is effective immediately via the broker.
 
-`NodeUnpublishVolume`: drop the registry entry, the SVID subscription and the cache refs.
+`NodeUnpublishVolume`: drop the registry entry, the token, the SVID subscription and the cache refs.
 
-### 7.4 Request path and attestation
+### 7.4 Endpoint mode (default)
 
-- `cracha-helper` connects to `agent.sock`, requests `{profile, account}`, and prints credential_process JSON: `{"Version":1,"AccessKeyId","SecretAccessKey","SessionToken","Expiration"}`. `Expiration` is mandatory, so SDKs refresh.
+- cracha-node runs with `hostNetwork` and serves the container-credentials protocol on `169.254.170.2:80`. The address lives on a dummy interface: provided by machine config on platforms that allow it, otherwise created by an init container with `NET_ADMIN`. `169.254.170.23` stays reserved for the EKS Pod Identity agent, so both can coexist.
+- The SDK sends `GET /v1/credentials` with the token from `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` in the `Authorization` header. SDKs re-read the token file on every refresh, so rotation needs no restart.
+- Attestation: the token maps to exactly one registered pod, and the request's source IP must equal that pod's registered IP. hostNetwork callers are denied. Either check failing is a 403 with no further detail.
+- Response is the container-credentials JSON (`AccessKeyId`, `SecretAccessKey`, `Token`, `Expiration`). `Expiration` is mandatory, so SDKs refresh.
+- The endpoint serves the workload's `default` profile only, because the SDK supports a single endpoint URI per process. Workloads that need more than one shape get named profiles through credential_process entries in the rendered config, alongside the endpoint.
+- Precondition: the CNI must deliver pod traffic to the node's link-local address unmasqueraded, so the source IP is the pod's real IP. Where the CNI masquerades or does not route link-local traffic to the host, the IP check is unsound and the endpoint must not be enabled.
+
+### 7.5 credential_process mode (opt-in)
+
+- `cracha-helper` connects to `agent.sock`, requests `{profile, account}`, and prints credential_process JSON: `{"Version":1,"AccessKeyId","SecretAccessKey","SessionToken","Expiration"}`.
 - cracha-node attests via `SO_PEERCRED` → PID → `/proc/<pid>/cgroup` → pod UID (requires `hostPID: true`). Re-validate after lookup to avoid PID-reuse races. Must match a registered pod.
+- Use it where the IP-based check is unavailable (CNI precondition unmet) or where SO_PEERCRED attestation is explicitly wanted.
+
+### 7.6 Common request path
+
 - Node cache keyed by `(workload identity, account, profile)`, shared by pods of the same workload on the node. Refresh at 50% TTL.
 - To the broker: one mTLS connection pool per workload identity, presenting that pod's SVID.
 
-### 7.5 Webhook (`cracha-webhook`)
+### 7.7 Webhook (`cracha-webhook`)
 
-For ServiceAccounts annotated `cracha.dev/enabled: "true"`, inject:
-- the CSI inline volume
-- `AWS_CONFIG_FILE=/var/run/cracha/config`, `AWS_SDK_LOAD_CONFIG=1`
+For ServiceAccounts annotated `cracha.dev/enabled: "true"`, inject the CSI inline volume and, per mode:
+- endpoint: `AWS_CONTAINER_CREDENTIALS_FULL_URI=http://169.254.170.2/v1/credentials`, `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE=/var/run/cracha/token`
+- credential_process: `AWS_CONFIG_FILE=/var/run/cracha/config`, `AWS_SDK_LOAD_CONFIG=1`
+- both, when the workload has named profiles
 
-It strips or rejects `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_CONTAINER_CREDENTIALS_*`. Pods with their own `AWS_CONFIG_FILE` use merge mode (managed profiles + ConfigMap-provided profiles). IMDS is blocked for pods (hop limit 1 / CNI policy).
+It strips or rejects `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_WEB_IDENTITY_TOKEN_FILE` and any `AWS_CONTAINER_CREDENTIALS_*` / `AWS_CONTAINER_AUTHORIZATION_*` the pod set itself. Pods with their own `AWS_CONFIG_FILE` use merge mode (managed profiles + ConfigMap-provided profiles). IMDS is blocked for pods (hop limit 1 / CNI policy).
 
-### 7.6 Fallback mode: link-local endpoint (opt-in)
+### 7.8 Workload requirements
 
-For workloads that can't use credential_process:
-- cracha-node serves the container-credentials protocol on `169.254.170.2` (dummy interface; Talos via machine config, EKS needs `NET_ADMIN`). `.23` stays reserved for the EKS Pod Identity agent.
-- The CSI volume additionally contains a per-pod random token. Inject `AWS_CONTAINER_CREDENTIALS_FULL_URI` and `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`.
-- Validate token + **source IP == registered pod IP**. hostNetwork callers are denied.
-- Precondition: the CNI must deliver pod traffic to the node's link-local address unmasqueraded, so the source IP is the pod's real IP. Where the CNI masquerades or does not route link-local traffic to the host, the IP check is unsound and fallback mode must stay disabled.
+Endpoint mode:
+- An AWS SDK or CLI that supports `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`. This was added across first-party SDKs for EKS Pod Identity (releases from late 2023). Older SDKs support only the inline `AWS_CONTAINER_AUTHORIZATION_TOKEN`, which cannot rotate and is not offered.
+- Nothing else: no exec, no shell, no config file.
 
-### 7.7 cracha-node hardening
+credential_process mode:
+- An SDK whose default chain reads the shared config file and supports `credential_process` (all first-party SDKs since 2018). Go SDK v1 additionally needs `AWS_SDK_LOAD_CONFIG=1`, which the webhook injects.
+- The container can execute the helper: the CSI volume is mounted without `noexec`, and the helper is static and matches the node architecture.
+- A POSIX `sh` on `PATH` for SDKs that spawn the process through a shell (Go, Java, JavaScript, .NET). Python and the CLI exec the helper directly.
 
-- Distroless, read-only rootfs, dedicated namespace. `hostPID` required. No `NET_ADMIN` unless fallback mode is enabled on EKS.
+### 7.9 cracha-node hardening
+
+- Distroless, read-only rootfs, dedicated namespace. `hostNetwork` required for the endpoint. `NET_ADMIN` only in the init container that creates the dummy interface, and only where the platform does not provide it. `hostPID` only when credential_process mode is enabled on the node.
+- The endpoint listens on the link-local address only, never on node or pod-network addresses.
 - Issuer agent: the per-pod delivery hook is restricted to cracha-node's identity (SPIRE: admin socket with `authorized_delegates` = cracha-node's SPIFFE ID only). Registration entry restricted to the cracha-node SA/namespace.
-- Alert on per-pod SVID subscriptions for pod UIDs absent from the node's kubelet view.
+- Alert on per-pod SVID subscriptions for pod UIDs absent from the node's kubelet view, and on endpoint requests whose token and source IP disagree.
 
 ## 8. Failure modes
 
@@ -385,16 +415,17 @@ For workloads that can't use credential_process:
 | STS throttle/outage | Broker serves cache, retries with jitter, alerts on cache age. |
 | Authz store down | Fail closed for new keys; bounded-staleness cache hits (<10 min since last check). |
 | Identity issuer agent down | Existing SVIDs work until TTL; new pods block at publish. |
-| cracha-node restart | Registry rebuilt from kubelet pods + existing CSI mounts; brief errors, SDK retries. |
+| cracha-node restart | Registry and tokens rebuilt from kubelet pods + existing CSI mounts; endpoint unavailable for seconds, SDK retries. |
 | Bad/unsigned bundle | Keep last good bundle, alert. Never fail open. |
 
 ## 9. Threat model (summary)
 
 | Compromise | Impact | Mitigation |
 |---|---|---|
-| App container | Its own grants | Read-only volume, no secrets on disk (default mode) |
+| App container | Its own grants | Read-only volume; the only on-disk secret is the pod's endpoint token, accepted only from that pod's IP on that node |
 | Node | Pods on that node | Per-node parenting of workload entries, node attestation, short SVID TTL |
-| cracha-node | Pods on that node (≈ node) | Hardening §7.7, delegate alerts |
+| Pod spoofing another pod's IP on the node | That pod's grants | Token required in addition to IP; CNI anti-spoofing; alert on token/IP mismatch |
+| cracha-node | Pods on that node (≈ node) | Hardening §7.9, delegate alerts |
 | Broker | Grants in its environment, capped by shape ceilings | Dedicated nodes, per-env roles, alert on shape-role assumption without `SourceIdentity` / by other principals |
 | Grant repo | Misuse within shape envelopes | CODEOWNERS, `CheckNoNewAccess`, signed bundles |
 | Authz store writes | Misassignment within shapes | Restricted writers, change-feed audit log, envelope check |
@@ -403,9 +434,7 @@ For workloads that can't use credential_process:
 ## 10. Open questions
 
 - Q1: Approval flow for temporary access: build vs reuse existing tooling.
-- Q2: Minimum SDK versions across the fleet that support `credential_process` in the default chain.
-- Q3: Second production-grade authz backend to prove the store contract (OpenFGA vs. a Cedar-based store), and when.
-- Q4: Second identity issuer to prove the issuer contract (cert-manager csi-driver-spiffe is the likely candidate), and whether per-pod delivery without a delegated API is acceptable there.
+- Q2: Use the kubelet-projected bound ServiceAccount token (audience `cracha-node`) as the endpoint token instead of a CSI-generated one. It would remove the CSI volume from endpoint mode entirely, at the cost of cracha-node validating tokens against the API server.
 
 ## 11. Invariants
 
@@ -414,7 +443,7 @@ These hold regardless of backend, issuer or platform. Any implementation must be
 - Never fail open: an unavailable authz store, issuer or bundle results in denial, or in serving already-issued credentials within bounded staleness, never in broader access.
 - Every rendered session policy is checked against the grant's envelope before STS is called.
 - `SourceIdentity` is set on every assumed session and is reversible to a SPIFFE ID through the decision log.
-- cracha-node writes no credentials to disk in default mode.
+- cracha-node writes no AWS credentials to disk in either mode. The endpoint token is not an AWS credential and is accepted only from its own pod.
 - The cache never returns credentials with less than 20 minutes remaining.
 - All identity encodings come from the single shared encoding library. Nothing hand-formats a SourceIdentity or an authz subject ID.
 - Backend-specific and issuer-specific types never leave their adapter.
