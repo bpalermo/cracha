@@ -369,6 +369,43 @@ Kubelet doesn't start containers until publish succeeds, so credentials are read
 - The endpoint serves the workload's `default` profile only, because the SDK supports a single endpoint URI per process. Workloads that need more than one shape get named profiles through credential_process entries in the rendered config, alongside the endpoint.
 - Precondition: the CNI must deliver pod traffic to the node's link-local address unmasqueraded, so the source IP is the pod's real IP. Where the CNI masquerades or does not route link-local traffic to the host, the IP check is unsound and the endpoint must not be enabled.
 
+Publish and request sequence:
+
+```mermaid
+sequenceDiagram
+    participant K as kubelet
+    participant N as cracha-node
+    participant I as identity issuer
+    participant P as pod (AWS SDK)
+    participant B as cracha-broker
+
+    Note over K,N: NodePublishVolume (before containers start)
+    K->>N: NodePublishVolume(pod UID, ns, SA, bound SA token)
+    N->>N: verify SA token claims match pod UID
+    N->>N: register pod: UID, SPIFFE ID, pod IP (from kubelet)
+    N->>I: subscribe per-pod X.509-SVID (pod UID)
+    I-->>N: SVID stream
+    N->>N: generate random token, bind to registry entry
+    N-->>K: volume with /var/run/cracha/token
+    K->>P: start containers (volume mounted, env injected)
+
+    Note over P,N: credential fetch (every SDK refresh)
+    P->>N: GET http://169.254.170.2/v1/credentials<br/>Authorization: token
+    N->>N: token → registry entry (exactly one)
+    N->>N: source IP == entry.pod IP? hostNetwork → deny
+    alt cache hit for (workload, account, default)
+        N-->>P: credentials JSON
+    else miss or refresh due
+        N->>B: POST /v1/credentials (mTLS with the pod's SVID)
+        B-->>N: credentials
+        N-->>P: credentials JSON
+    end
+
+    Note over K,N: NodeUnpublishVolume
+    K->>N: NodeUnpublishVolume(pod UID)
+    N->>N: drop registry entry, token, SVID subscription, cache refs
+```
+
 ### 7.5 credential_process mode (opt-in)
 
 - `cracha-helper` connects to `agent.sock`, requests `{profile, account}`, and prints credential_process JSON: `{"Version":1,"AccessKeyId","SecretAccessKey","SessionToken","Expiration"}`.
