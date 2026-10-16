@@ -65,8 +65,10 @@ flowchart TB
 
 The design depends on the **SPIFFE standard**, not on a particular issuer. Any issuer that meets the contract in 4.1 can be used; SPIRE is the reference implementation (4.2).
 
-- **SPIFFE ID scheme:** `spiffe://<trust-domain>/c/<cluster>/ns/<namespace>/sa/<serviceaccount>` (see open question Q1 on whether to include the cluster). The scheme is enforced by the issuer's registration policy, whatever the issuer.
+- **SPIFFE ID scheme:** `spiffe://<trust-domain>/ns/<namespace>/sa/<serviceaccount>`. The scheme is enforced by the issuer's registration policy, whatever the issuer.
+- The cluster is **not** part of the identity. The same workload running in several clusters of a trust domain has one SPIFFE ID, so active-active deployments share grants by default. Cluster is context: in Path C the broker knows which cluster it serves and attaches it; in Path A it is available only when the issuer can add claims. Per-cluster scoping is expressed as an assignment condition (6.4), never as a separate identity.
 - The issuer is a Tier-0 service: signing keys in KMS/HSM, per-region deployment or a nested hierarchy under a shared root.
+- Crachá is trust-domain-agnostic. Trust domain topology (one domain with a nested hierarchy, or several federated domains) is the issuer operator's choice. It touches Crachá in two places only: Path A needs one IAM OIDC provider per trust domain, and a workload's identity is scoped to its trust domain, so per-region domains give the same workload a different identity per region.
 - The service mesh (Istio, multi-primary) should eventually consume the same issuer via Envoy SDS, so mesh identity == AWS identity. Not required for v1.
 
 ### 4.1 Identity issuer contract
@@ -113,7 +115,7 @@ The mapping (encoded → full SPIFFE ID) is logged at every issuance to keep aud
 
 - The issuer's OIDC discovery endpoint at a public HTTPS URL; registered as an IAM OIDC provider per trust domain.
 - JWT-SVID with `aud=sts.amazonaws.com`, TTL ≤ 5 min, fetched through the Workload API.
-- ABAC tags come from the `https://aws.amazon.com/tags` claim (`principal_tags`: ns, sa, cluster; plus service/team once the authz store is live) when the issuer can add it (SPIRE: CredentialComposer). Without that hook, policies fall back to `StringLike` conditions on the `sub` path segments, which covers ns/sa/cluster but not service/team.
+- ABAC tags come from the `https://aws.amazon.com/tags` claim (`principal_tags`: ns, sa, cluster; plus service/team once the authz store is live) when the issuer can add it (SPIRE: CredentialComposer). Without that hook, policies fall back to `StringLike` conditions on the `sub` path segments, which covers ns/sa but not cluster, service or team.
 - One role per shape; trust policy `StringLike` on `<provider>:sub` (scoped pattern) and allows `sts:TagSession`.
 - Policies scope resources with `${aws:PrincipalTag/...}` and `aws:ResourceTag/...`.
 - The broker's own credentials use Path A.
@@ -140,7 +142,7 @@ spec:
     params: { tables: [ledger, ledger-outbox] }   # or resolved via the authz store (Level 3)
   managedPolicyArns: []            # escape hatch for large policies (max 10)
   sessionTags: { team: payments }
-  duration: 3600
+  duration: 3600                   # optional; default 1h, capped at 1h by role chaining
   envelope:                        # runtime ARN allowlist for rendered policies
     - arn:aws:dynamodb:*:111122223333:table/payments-*
 ```
@@ -167,7 +169,7 @@ The broker depends only on this contract. Each backend is an adapter chosen by c
 | What changed since this token? | Watch(since) | stream of assignment changes, for cache invalidation | optional; without it the cache degrades to TTL-only invalidation |
 
 Rules:
-- Subject = the workload's authz encoding (4.3) plus its cluster. The subject never carries anything the workload can set itself.
+- Subject = the workload's authz encoding (4.3) plus the cluster the broker serves. The subject never carries anything the workload can set itself.
 - Consistency tokens are opaque outside the adapter. SpiceDB's zedToken is one implementation; a static backend may use a file hash. Callers may ask for minimize-latency or at-least-as-fresh(token).
 - Any failure to answer is a deny. Backends never fail open.
 - Time-bounded and cluster-bounded assignments are part of the model, not of one backend's caveat feature. A backend without native conditions evaluates them in its adapter.
@@ -218,7 +220,7 @@ Integration levels:
 - **L2 (v1):** service/team returned in `Decision.Tags` become session tags for ABAC.
 - **L3 (later, exceptions only):** `Store.LookupResources` fills template resource lists; every ARN is validated against the grant envelope at runtime; violations reject the request.
 
-Relationship writers (write access to the authz store is security-critical, whatever the backend):
+Relationship writers (write access to the authz store is security-critical, whatever the backend). Where a writer reads its source of truth from is out of scope; what Crachá requires is that the writer is trusted and that no relationship is derived from anything the workload controls:
 
 | Relationship | Source of truth | Writer |
 |---|---|---|
@@ -245,7 +247,7 @@ The broker terminates mTLS itself with go-spiffe (trust bundle + federated bundl
 
 ### 6.6 STS mechanics
 
-- Broker's role (`cracha-broker`, per environment) → `AssumeRole` on shape roles. This is role chaining, so the session max is 1 hour.
+- Broker's role (`cracha-broker`, per environment) → `AssumeRole` on shape roles. This is role chaining, so the session max is 1 hour. Session duration is configurable per grant and defaults to 1 hour; targeted revocation (6.8) covers the window.
 - Each call sets:
   - `SourceIdentity` = `RoleSessionName` = idenc STS encoding (per workload, not per pod)
   - `Policy` / `PolicyArns` = rendered session policy
@@ -367,6 +369,7 @@ For workloads that can't use credential_process:
 - cracha-node serves the container-credentials protocol on `169.254.170.2` (dummy interface; Talos via machine config, EKS needs `NET_ADMIN`). `.23` stays reserved for the EKS Pod Identity agent.
 - The CSI volume additionally contains a per-pod random token. Inject `AWS_CONTAINER_CREDENTIALS_FULL_URI` and `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`.
 - Validate token + **source IP == registered pod IP**. hostNetwork callers are denied.
+- Precondition: the CNI must deliver pod traffic to the node's link-local address unmasqueraded, so the source IP is the pod's real IP. Where the CNI masquerades or does not route link-local traffic to the host, the IP check is unsound and fallback mode must stay disabled.
 
 ### 7.7 cracha-node hardening
 
@@ -399,13 +402,12 @@ For workloads that can't use credential_process:
 
 ## 10. Open questions
 
-- Q1: Include cluster in SPIFFE ID path? (Cluster-agnostic access for active-active vs per-cluster scoping.)
-- Q2: One trust domain with a nested issuer hierarchy vs per-region trust domains with federation (affects IAM OIDC provider count, max 100/account).
-- Q3: Source of truth for `service#member@workload`: Backstage/catalog vs Git.
-- Q4: Default session duration (1h with targeted revocation vs 30 min).
+- Q1 (resolved 2026-10-16): the cluster is not in the SPIFFE ID path. Identity is cluster-agnostic; per-cluster scoping is an assignment condition.
+- Q2 (resolved 2026-10-16): trust domain topology is out of scope; the design is trust-domain-agnostic (see 4).
+- Q3 (resolved 2026-10-16): the source of truth behind `service#member@workload` is out of scope. Crachá requires a trusted writer, not a particular catalog.
+- Q4 (resolved 2026-10-16): session duration is configurable per grant, default 1h.
 - Q5: Approval flow for temporary access: build vs reuse existing tooling.
 - Q6: Minimum SDK versions across the fleet that support `credential_process` in the default chain.
-- Q7: Validate pod→node link-local routing on VPC CNI and Cilium before enabling fallback mode.
 - Q8: Second production-grade authz backend to prove the store contract (OpenFGA vs. a Cedar-based store), and when.
 - Q9: Second identity issuer to prove the issuer contract (cert-manager csi-driver-spiffe is the likely candidate), and whether per-pod delivery without a delegated API is acceptable there.
 
