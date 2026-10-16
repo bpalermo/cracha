@@ -402,7 +402,7 @@ sequenceDiagram
     Note over P,B: credential fetch (every SDK refresh)
     P->>P: read /var/run/cracha/token
     P->>B: GET https://broker/v1/credentials?profile=default<br/>Authorization: JWT-SVID
-    B->>B: verify signature, aud, exp; SPIFFE ID from sub
+    B->>B: verify signature, aud, exp, then take the SPIFFE ID from sub
     B->>B: authz Check, grant lookup, envelope check
     alt cache hit for (account, grant, bundle, workload)
         B-->>P: credentials (container-credentials JSON)
