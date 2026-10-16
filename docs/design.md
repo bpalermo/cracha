@@ -340,8 +340,8 @@ credential_process = /var/run/cracha/bin/cracha-helper --profile default
 region = <from node topology.kubernetes.io/region>
 sts_regional_endpoints = regional
 
-[profile archive]
-credential_process = /var/run/cracha/bin/cracha-helper --profile archive --account 444455556666
+[profile <another-profile>]
+credential_process = /var/run/cracha/bin/cracha-helper --profile <another-profile> --account <account-id>
 region = <...>
 ```
 
