@@ -64,6 +64,23 @@ go_sdk.nogo(nogo = "//:nogo")
 
 go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
 go_deps.from_file(go_mod = "//:go.mod")
+
+# The SpiceDB client's generated API package depends on these two, whose
+# checked-in BUILD files regenerate their Go from the .proto sources, which
+# compiles protoc. Both ship the generated .pb.go, so their BUILD files are
+# regenerated here with proto generation off.
+[
+    go_deps.gazelle_override(
+        build_file_generation = "clean",
+        directives = ["gazelle:proto disable_global"],
+        path = path,
+    )
+    for path in [
+        "github.com/envoyproxy/protoc-gen-validate",
+        "github.com/grpc-ecosystem/grpc-gateway/v2",
+    ]
+]
+
 use_repo(go_deps, "co_honnef_go_tools", "com_github_authzed_authzed_go", "com_github_aws_aws_sdk_go_v2", "com_github_aws_aws_sdk_go_v2_config", "com_github_aws_aws_sdk_go_v2_credentials", "com_github_aws_aws_sdk_go_v2_service_accessanalyzer", "com_github_aws_aws_sdk_go_v2_service_kms", "com_github_aws_aws_sdk_go_v2_service_s3", "com_github_aws_aws_sdk_go_v2_service_sts", "com_github_container_storage_interface_spec", "com_github_go_logr_logr", "com_github_google_go_cmp", "com_github_spiffe_go_spiffe_v2", "com_github_uudashr_gocognit", "in_gopkg_evanphx_json_patch_v4", "in_gopkg_yaml_v3", "io_k8s_api", "io_k8s_apimachinery", "io_k8s_client_go", "io_k8s_klog_v2", "io_k8s_sigs_yaml", "org_golang_google_grpc", "org_golang_google_protobuf", "org_golang_x_sync")
 
 # Container image base: distroless static on Debian 13, nonroot variant (user
