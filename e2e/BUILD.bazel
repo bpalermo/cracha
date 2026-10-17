@@ -10,6 +10,16 @@ go_test(
         "rotation_test.go",
         "webhook_test.go",
     ],
+    # What e2e/run.sh deploys beside the chart and runs: the manifests, the
+    # values files, spire.sh and run.sh itself. The test reads none of them;
+    # they are its data so that a change to any of them impacts the test in
+    # the Bazel graph, which is how CI decides whether to run the kind job
+    # (bazel/ci-impacted-targets.sh).
+    data = glob([
+        "manifests/*",
+        "*.sh",
+        "*.yaml",
+    ]),
     # Needs a cluster: excluded from `bazel test //...` by the e2e tag (see
     # .bazelrc) and run unsandboxed by e2e/run.sh, so it can read the
     # kubeconfig KUBECONFIG names.

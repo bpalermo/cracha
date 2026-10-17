@@ -25,3 +25,12 @@ sh_test(
     srcs = ["workspace_status_test.sh"],
     data = ["workspace_status.sh"],
 )
+
+# The decision of ci-impacted-targets.sh (the `diff` job of ci.yml): which
+# impacted targets CI builds, tests and runs the e2e for, on fixture lists.
+sh_test(
+    name = "ci_impacted_targets_test",
+    size = "small",
+    srcs = ["ci_impacted_targets_test.sh"],
+    data = ["ci-impacted-targets.sh"],
+)

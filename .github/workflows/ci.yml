@@ -20,9 +20,19 @@ concurrency:
 # (cache-save below), so only reviewed code populates a cache that a later
 # trusted build consumes. Gated on the ref rather than the event, because
 # workflow_dispatch can target any branch.
+#
+# Target determination: `diff` computes, with bazel-diff, the targets this
+# change impacts (bazel/ci-impacted-targets.sh) and hands `build` the lists to
+# build and test from; `build` is skipped when nothing is impacted and `e2e`
+# runs only when something the suite deploys or runs is. The checks that cover
+# the whole tree cheaply (the formatter, Gazelle) run every time, in `lint`.
+# Anything bazel-diff cannot decide (no base, an error) is a full run.
 jobs:
-  build:
-    name: build
+  # The whole-tree checks that cost no build of consequence: the formatter and
+  # the BUILD files' freshness. Unconditional, so a change bazel-diff scopes
+  # down to nothing is still formatted and generated right.
+  lint:
+    name: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -34,7 +44,7 @@ jobs:
       - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}
+          disk-cache: ${{ github.workflow }}-lint
           repository-cache: true
           cache-save: ${{ github.ref == 'refs/heads/main' }}
 
@@ -52,25 +62,6 @@ jobs:
             fi
           done
 
-      # --config=ci refuses lockfile drift, and runs shellcheck on every
-      # script as part of the build (bazel/lint/linters.bzl).
-      - name: bazel build //...
-        run: bazel build //... --config=ci
-
-      # The image targets are in `//...` already; naming them keeps a rename
-      # or a removal from passing here and failing on the first publish.
-      - name: the image targets build
-        run: |
-          bazel build --config=ci \
-            //broker:image_push //broker:image_index \
-            //csi:image_push //csi:image_index \
-            //webhook:image_push //webhook:image_index
-
-      # Includes the linters: the Go analyzers of //:nogo run as part of
-      # compiling, so the build above already failed on a finding.
-      - name: bazel test //...
-        run: bazel test //... --config=ci
-
       # Gazelle generates the BUILD files, so a hand-edited or stale one is a
       # real failure mode: the build keeps working against the old graph until
       # someone regenerates and the diff appears in an unrelated PR.
@@ -82,16 +73,179 @@ jobs:
             exit 1
           fi
 
+      # The image targets are built by `build` whenever they are impacted;
+      # naming them here keeps a rename or a removal from passing CI and
+      # failing on the first publish. A query, not a build: it fails on a
+      # label that does not exist and costs nothing else.
+      - name: the image targets exist
+        run: |
+          bazel query --config=ci --noshow_progress 'set(
+            //broker:image_push //broker:image_index
+            //csi:image_push //csi:image_index
+            //webhook:image_push //webhook:image_index)'
+
+  # Target determination. bazel-diff hashes the build graph at the base and at
+  # the head of the range under test and reports the targets whose hash
+  # changed; bazel/ci-impacted-targets.sh splits them into what to build, what
+  # to test and whether the e2e is affected, and uploads the lists for `build`.
+  # On any error, or without a base (workflow_dispatch), it falls back to a
+  # full run; it never reports an empty set on a failure.
+  #
+  # The range: on pull_request the checkout is the merge of the pull request
+  # into its base, so the base is the merge's first parent and the head the
+  # merge itself, the tree every job builds. On push to main the parent of the
+  # squash-merged commit is what main was before it. workflow_dispatch has no
+  # base, and runs everything.
+  diff:
+    name: diff
+    runs-on: ubuntu-latest
+    outputs:
+      has_any: ${{ steps.impacted.outputs.has_any }}
+      has_test: ${{ steps.impacted.outputs.has_test }}
+      has_e2e: ${{ steps.impacted.outputs.has_e2e }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The whole history: the base has to be reachable for the diff.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: the range under test
+        id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          base=""
+          case "${EVENT}" in
+            pull_request)
+              if [ "$(git rev-parse HEAD^2 2>/dev/null)" = "${PR_HEAD}" ]; then
+                base="$(git rev-parse HEAD^1)"
+              else
+                echo "::warning::the checkout is not the merge of ${PR_HEAD}; no base, running everything" >&2
+              fi
+              ;;
+            push)
+              base="$(git rev-parse HEAD^1 2>/dev/null)" || base=""
+              ;;
+          esac
+          echo "base=${base}" >>"${GITHUB_OUTPUT}"
+          echo "head=$(git rev-parse HEAD)" >>"${GITHUB_OUTPUT}"
+          echo "range: ${base:-<none: full run>} .. $(git rev-parse HEAD)"
+
+      - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
+        with:
+          bazelisk-cache: true
+          repository-cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
+
+      # bazel-diff, the statically linked binary of its GitHub release, pinned
+      # by version and checksum (the digest GitHub records for the asset).
+      # Releases after v47.0.0 ship no bazel-diff_deploy.jar any more, so no
+      # Java is needed.
+      - name: bazel-diff
+        env:
+          VERSION: v60.0.0
+          SHA256: 4c1e70c955a7a950fc0ce15d921e976078a5fd1571e423c05016cb6e7c433dac
+        run: |
+          curl -fsSL -o "${RUNNER_TEMP}/bazel-diff" \
+            "https://github.com/Tinder/bazel-diff/releases/download/${VERSION}/bazel-diff-rust-linux-amd64"
+          echo "${SHA256}  ${RUNNER_TEMP}/bazel-diff" | sha256sum -c -
+          chmod +x "${RUNNER_TEMP}/bazel-diff"
+
+      # From a copy outside the tree: the script checks the base and the head
+      # out in turn, which would otherwise swap the script file mid-run.
+      - name: bazel/ci-impacted-targets.sh
+        id: impacted
+        env:
+          BASE_SHA: ${{ steps.range.outputs.base }}
+          HEAD_SHA: ${{ steps.range.outputs.head }}
+          BAZEL_DIFF: ${{ runner.temp }}/bazel-diff
+          OUT_DIR: ${{ runner.temp }}/bazel-diff-out
+        run: |
+          cp bazel/ci-impacted-targets.sh "${RUNNER_TEMP}/ci-impacted-targets.sh"
+          bash "${RUNNER_TEMP}/ci-impacted-targets.sh"
+
+      - name: upload the impacted target lists
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: impacted-targets
+          path: ${{ runner.temp }}/bazel-diff-out/impacted_*.txt
+          if-no-files-found: error
+
+  # Builds every impacted target and runs the impacted tests. Skipped when
+  # nothing is impacted; the aggregate below accepts that only when `diff`
+  # said so.
+  build:
+    name: build
+    needs: [diff]
+    if: needs.diff.outputs.has_any == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: download the impacted target lists
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: impacted-targets
+          path: ${{ runner.temp }}/impacted
+
+      # A list that is not there is not an empty list, a list of another
+      # commit's tree is not a list of this one, and a flag `diff` set has to
+      # agree with its list: the gate below trusts the flags.
+      - name: the lists are for this checkout and agree with diff
+        env:
+          LISTS: ${{ runner.temp }}/impacted
+          HAS_ANY: ${{ needs.diff.outputs.has_any }}
+          HAS_TEST: ${{ needs.diff.outputs.has_test }}
+        run: |
+          for f in impacted_build.txt impacted_test.txt impacted_commit.txt; do
+            [ -r "${LISTS}/${f}" ] || { echo "::error::${f} is missing from the impacted-targets artifact" >&2; exit 1; }
+          done
+          if [ "$(cat "${LISTS}/impacted_commit.txt")" != "$(git rev-parse HEAD)" ]; then
+            echo "::error::the lists are for $(cat "${LISTS}/impacted_commit.txt"); this job checked out $(git rev-parse HEAD)" >&2
+            exit 1
+          fi
+          [ "${HAS_ANY}" = true ] && [ -s "${LISTS}/impacted_build.txt" ] || { echo "::error::has_any is '${HAS_ANY}' and impacted_build.txt has $(wc -l <"${LISTS}/impacted_build.txt") target(s)" >&2; exit 1; }
+          case "${HAS_TEST}" in
+            true) [ -s "${LISTS}/impacted_test.txt" ] ;;
+            false) [ ! -s "${LISTS}/impacted_test.txt" ] ;;
+            *) false ;;
+          esac || { echo "::error::has_test is '${HAS_TEST}' and impacted_test.txt has $(wc -l <"${LISTS}/impacted_test.txt") target(s)" >&2; exit 1; }
+          echo "build: $(wc -l <"${LISTS}/impacted_build.txt") target(s); test: $(wc -l <"${LISTS}/impacted_test.txt")"
+
+      # --config=ci refuses lockfile drift, and runs shellcheck on every
+      # script as part of the build (bazel/lint/linters.bzl). The Go analyzers
+      # of //:nogo run as part of compiling, so a finding fails here.
+      - name: bazel build the impacted targets
+        run: bazel build --config=ci --target_pattern_file="${RUNNER_TEMP}/impacted/impacted_build.txt"
+
+      - name: bazel test the impacted tests
+        if: needs.diff.outputs.has_test == 'true'
+        run: bazel test --config=ci --target_pattern_file="${RUNNER_TEMP}/impacted/impacted_test.txt"
+
   # End to end in a kind cluster: the images are built from this commit, loaded
   # into the node and exercised as pods against a SPIRE agent and an STS
   # stand-in (e2e/run.sh). A CSI plugin, an admission webhook and the SDK's
   # credential path can only be validated against a real kubelet and
   # apiserver, so this is where the system as deployed is tested; everything
   # else is unit tests. After `build`, so a change that does not compile never
-  # gets as far as creating a cluster.
+  # gets as far as creating a cluster, and only when `diff` found something
+  # the suite deploys or runs impacted: a documentation-only change pays for
+  # no cluster.
   e2e:
     name: e2e (kind)
-    needs: [build]
+    needs: [build, diff]
+    if: needs.diff.outputs.has_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -119,19 +273,37 @@ jobs:
   # change. if: always() so it runs even when a job fails; a skipped job
   # reports nothing, and a required check that never reports blocks the pull
   # request.
+  #
+  # A job bazel-diff scoped out is `skipped`, and that passes only where
+  # `diff` said so, in so many words: `build` skipped with has_any `false`,
+  # `e2e` skipped with has_e2e `false`. An output that was never set reads as
+  # the empty string, skips the job exactly as `false` does, and is refused
+  # here. Everything else has to be `success`.
   ci:
     name: ci
-    needs: [build, e2e]
+    needs: [lint, diff, build, e2e]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: every job this depends on must have succeeded
+      - name: every job ended the way diff's outputs say it must
+        env:
+          LINT: ${{ needs.lint.result }}
+          DIFF: ${{ needs.diff.result }}
+          BUILD: ${{ needs.build.result }}
+          E2E: ${{ needs.e2e.result }}
+          HAS_ANY: ${{ needs.diff.outputs.has_any }}
+          HAS_E2E: ${{ needs.diff.outputs.has_e2e }}
         run: |
-          results="${{ join(needs.*.result, ' ') }}"
-          echo "results: ${results}"
-          for result in ${results}; do
-            if [ "${result}" != "success" ]; then
-              echo "::error::a required job reported '${result}'" >&2
-              exit 1
-            fi
-          done
+          echo "lint=${LINT} diff=${DIFF} build=${BUILD} e2e=${E2E} has_any='${HAS_ANY}' has_e2e='${HAS_E2E}'"
+          ok=1
+          [ "${LINT}" = success ] || { echo "::error::lint reported '${LINT}'" >&2; ok=0; }
+          [ "${DIFF}" = success ] || { echo "::error::diff reported '${DIFF}'" >&2; ok=0; }
+          case "${BUILD}:${HAS_ANY}" in
+            success:true | skipped:false) ;;
+            *) echo "::error::build reported '${BUILD}' with has_any '${HAS_ANY}'" >&2; ok=0 ;;
+          esac
+          case "${E2E}:${HAS_E2E}" in
+            success:true | skipped:false) ;;
+            *) echo "::error::e2e reported '${E2E}' with has_e2e '${HAS_E2E}'" >&2; ok=0 ;;
+          esac
+          [ "${ok}" = 1 ]

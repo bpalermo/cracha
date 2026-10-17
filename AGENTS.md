@@ -66,6 +66,33 @@ CI runs with `--config=ci`, which fails if `MODULE.bazel.lock` is out of date,
 and requires that Gazelle leaves no diff. Regenerate BUILD files rather than
 hand-editing what Gazelle owns.
 
+### What CI runs for a change
+
+CI builds and tests only what a change impacts. The `diff` job hashes the
+build graph at the base and the head of the change with bazel-diff
+(`bazel/ci-impacted-targets.sh`) and hands `build` the impacted rules to
+build and the impacted tests to run; `build` is skipped when nothing is
+impacted, and the `e2e (kind)` job runs only when the impacted set reaches
+something the suite deploys or runs: anything under `//e2e/...`, the chart
+`//charts/cracha:cracha` or a component's `image_load`. The suite's
+manifests, values files, `spire.sh` and `run.sh` are `data` of
+`//e2e:e2e_test`, so editing one of them is an e2e-relevant change; a new
+fixture the suite deploys goes in that glob. A documentation-only change
+builds nothing and creates no kind cluster; the formatter and the Gazelle
+check run on every change regardless. A change to the files CI itself
+depends on and Bazel does not hash (`.bazelrc`, `.bazelversion`,
+`MODULE.bazel` and its lock, `ci.yml`, the script) runs everything, as does
+any error in the computation: the fallback is always a full run, never a
+smaller one. To see what a change would run, from a clone (the script checks
+revisions out, so not the checkout you are working in) with bazel-diff from
+its GitHub release at the version `ci.yml` pins:
+
+```bash
+BASE_SHA=origin/main BAZEL_DIFF=~/bin/bazel-diff bazel/ci-impacted-targets.sh
+```
+
+The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
+
 ## Layout
 
 - No `cmd/`. Each binary lives in a root-level directory with its `main.go`:
