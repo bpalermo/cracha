@@ -359,13 +359,15 @@ Kubelet doesn't start containers until publish succeeds, so a valid token is pre
 
 ### 7.4 Webhook (`cracha-webhook`)
 
-For ServiceAccounts annotated `cracha.dev/enabled: "true"`, inject:
-- the CSI inline volume
+A mutating admission webhook on Pod CREATE. For pods whose ServiceAccount is annotated `cracha.dev/enabled: "true"` (looked up through the API, remembered briefly), inject into every container and init container:
+- the CSI inline volume (`cracha`, driver `csi.cracha.dev`, read-only), mounted read-only at `/var/run/cracha`
 - `AWS_CONTAINER_CREDENTIALS_FULL_URI=https://<broker>/v1/credentials`
 - `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE=/var/run/cracha/token`
-- `AWS_REGION` from the node's topology region, or the cluster default
+- `AWS_REGION` from the cluster default, unless the container sets its own. The pod is not scheduled at admission, so the node's topology region is not available; a per-namespace override (`cracha.dev/region` on the Namespace) is the hook for anything finer.
 
-It strips or rejects `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, and any `AWS_WEB_IDENTITY_*`, `AWS_ROLE_*`, `AWS_CONTAINER_CREDENTIALS_*` or `AWS_CONTAINER_AUTHORIZATION_*` the pod set itself. IMDS is blocked for pods (hop limit 1 / CNI policy).
+The pod is marked `cracha.dev/injected: "true"`, and a pod that already carries the injection is left unchanged.
+
+It rejects (by default) or strips (`--conflicting-env=strip`, recording what it removed in `cracha.dev/stripped-env`) `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, and any `AWS_WEB_IDENTITY_*`, `AWS_ROLE_*`, `AWS_CONTAINER_CREDENTIALS_*` or `AWS_CONTAINER_AUTHORIZATION_*` the pod set itself, whether literal or from `valueFrom`. It rejects a pod that mounts anything else at or under `/var/run/cracha`. A failure to look the ServiceAccount up denies the pod rather than admitting it unwired, and the webhook configuration's `failurePolicy` must be `Fail` for the same to hold when the webhook itself is unreachable. IMDS is blocked for pods (hop limit 1 / CNI policy).
 
 ### 7.5 Sequence
 
