@@ -156,3 +156,39 @@ webhooks:
             - {{ . }}
             {{- end }}
 {{- end -}}
+
+{{/*
+How the grant bundle's signature is verified, from broker.bundle: "" when no
+bundle source is configured, else exactly one of "inline" (verifyKey, kept in
+a Secret the chart makes), "secret" (existingSecret) or "kms" (kmsKey).
+*/}}
+{{- define "cracha.bundleKey" -}}
+{{- $b := .Values.broker.bundle -}}
+{{- $keys := list -}}
+{{- if $b.verifyKey }}{{ $keys = append $keys "inline" }}{{ end -}}
+{{- if $b.existingSecret }}{{ $keys = append $keys "secret" }}{{ end -}}
+{{- if $b.kmsKey }}{{ $keys = append $keys "kms" }}{{ end -}}
+{{- if not $b.source -}}
+{{- if $keys }}{{ fail "broker.bundle.verifyKey, existingSecret and kmsKey need broker.bundle.source" }}{{ end -}}
+{{- else if ne (len $keys) 1 -}}
+{{- fail "broker.bundle.source needs exactly one of broker.bundle.verifyKey, broker.bundle.existingSecret or broker.bundle.kmsKey" -}}
+{{- else -}}
+{{ first $keys }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The directory of a local bundle source (broker.bundle.source local:<dir>),
+or "" for S3 or no source. A local source needs broker.bundle.volume.
+*/}}
+{{- define "cracha.bundleDir" -}}
+{{- $source := .Values.broker.bundle.source -}}
+{{- if hasPrefix "local:" $source -}}
+{{- $dir := trimPrefix "local:" $source -}}
+{{- if not $dir }}{{ fail "broker.bundle.source local: needs a directory" }}{{ end -}}
+{{- if not .Values.broker.bundle.volume }}{{ fail "a local broker.bundle.source needs broker.bundle.volume, the volume mounted at its directory" }}{{ end -}}
+{{ $dir }}
+{{- else if and $source (not (hasPrefix "s3://" $source)) -}}
+{{- fail (printf "broker.bundle.source must be local:<dir> or s3://bucket[/prefix], not %q" $source) -}}
+{{- end -}}
+{{- end -}}

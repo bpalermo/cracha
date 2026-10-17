@@ -31,24 +31,14 @@ broker:
             - cracha/e2e/client
           grants:
             - name: e2e-s3-reader
-  # One grant on one shape role, with a session policy inside its envelope.
-  grants:
-    document:
-      version: e2e-1
-      grants:
-        - name: e2e-s3-reader
-          account: "111122223333"
-          baseRole: arn:aws:iam::111122223333:role/broker/shape-e2e
-          sessionPolicy:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: [s3:GetObject]
-                Resource: arn:aws:s3:::cracha-e2e-bucket/*
-          sessionTags: {team: platform}
-          durationSeconds: 3600
-          envelope:
-            - arn:aws:s3:::cracha-e2e-*
+  # The grants come the production way: a bundle run.sh compiles from
+  # e2e/grants (one grant on one shape role, with a session policy inside
+  # its envelope), signs with a key it generates and publishes into the
+  # ConfigMap cracha-e2e-bundle, mounted at this directory. The volume
+  # (whose item paths carry the bundle's version) and the public key are in
+  # the values file run.sh writes beside this one.
+  bundle:
+    source: local:/etc/cracha/bundle
   env:
     # The broker's own AWS credentials (design 5) are the platform's; here,
     # anything the stub accepts, which is anything.

@@ -14,8 +14,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// What e2e/stsstub answers and e2e/values.yaml (the chart's assignments and
-// grants) grants.
+// What e2e/stsstub answers and e2e/values.yaml (the chart's assignments)
+// and e2e/grants (the compiled bundle) grant.
 const (
 	stubAccessKeyID = "ASIACRACHAE2ESTUB000"
 	grantName       = "e2e-s3-reader"
@@ -27,7 +27,31 @@ const (
 	// jwtTTL is the JWT-SVID lifetime e2e/spire.sh registers the test
 	// workloads with.
 	jwtTTL = 240 * time.Second
+	// bundleConfigMap is where e2e/run.sh puts the bundle it compiled,
+	// signed and published, in the chart's namespace; latestKey holds the
+	// publication's latest pointer, whose version the broker must report.
+	bundleConfigMap = "cracha-e2e-bundle"
+	latestKey       = "latest"
 )
+
+// publishedBundleVersion reads the version of the bundle e2e/run.sh
+// published, from the latest pointer in the ConfigMap the broker mounts.
+func publishedBundleVersion(ctx context.Context) (string, error) {
+	cm, err := client.CoreV1().ConfigMaps(systemNamespace).Get(ctx, bundleConfigMap, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("reading the published bundle: %w", err)
+	}
+	var latest struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(cm.Data[latestKey]), &latest); err != nil {
+		return "", fmt.Errorf("decoding the published bundle's %s pointer: %w", latestKey, err)
+	}
+	if latest.Version == "" {
+		return "", fmt.Errorf("the published bundle's %s pointer names no version: %q", latestKey, cm.Data[latestKey])
+	}
+	return latest.Version, nil
+}
 
 // report is the first line e2e/client prints.
 type report struct {
@@ -251,10 +275,16 @@ func TestWorkloadObtainsCredentials(t *testing.T) {
 		if ex.Status != 200 {
 			t.Errorf("broker answered %d: %s", ex.Status, ex.Body)
 		}
+		// The bundle version is the compiled bundle's: the broker served
+		// the bundle run.sh published, verified, not a fixture.
+		bundleVersion, err := publishedBundleVersion(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
 		for header, want := range map[string]string{
 			"Cracha-Shape":          shapeName,
 			"Cracha-Grants":         grantName,
-			"Cracha-Bundle-Version": "e2e-1",
+			"Cracha-Bundle-Version": bundleVersion,
 		} {
 			if got := strings.Join(ex.Headers[header], ","); got != want {
 				t.Errorf("%s = %q, want %q", header, got, want)

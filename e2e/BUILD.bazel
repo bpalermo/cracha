@@ -11,11 +11,13 @@ go_test(
         "webhook_test.go",
     ],
     # What e2e/run.sh deploys beside the chart and runs: the manifests, the
-    # values files, spire.sh and run.sh itself. The test reads none of them;
-    # they are its data so that a change to any of them impacts the test in
-    # the Bazel graph, which is how CI decides whether to run the kind job
+    # values files, the grant sources it compiles into the bundle, spire.sh
+    # and run.sh itself. The test reads none of them; they are its data so
+    # that a change to any of them impacts the test in the Bazel graph,
+    # which is how CI decides whether to run the kind job
     # (bazel/ci-impacted-targets.sh).
     data = glob([
+        "grants/**",
         "manifests/*",
         "*.sh",
         "*.yaml",

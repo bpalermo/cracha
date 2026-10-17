@@ -3,10 +3,11 @@
 // policy from the workload's grants and assumes a shape role on the
 // workload's behalf (docs/design.md, section 6).
 //
-// This slice wires the static authorization backend and a resolved-grants
-// fixture file; the compiled bundle loader, the cache and revocation come
-// later. Configuration is by flags, each with a CRACHA_* environment
-// fallback (see config.go).
+// Grants come from the signed, polled bundle grantc publishes
+// (--bundle-source, broker/internal/bundle) or, for development, from a
+// resolved-grants fixture file (--grants-fixture); the authorization backend
+// is the static one. The cache and revocation come later. Configuration is
+// by flags, each with a CRACHA_* environment fallback (see config.go).
 package main
 
 import (
@@ -25,7 +26,6 @@ import (
 	"github.com/bpalermo/cracha/broker/internal/api"
 	"github.com/bpalermo/cracha/broker/internal/authn"
 	"github.com/bpalermo/cracha/broker/internal/authz/static"
-	"github.com/bpalermo/cracha/broker/internal/grants"
 	"github.com/bpalermo/cracha/broker/internal/issuer"
 	"github.com/bpalermo/cracha/broker/internal/sts"
 	"github.com/bpalermo/cracha/common/version"
@@ -66,12 +66,6 @@ func run(ctx context.Context, cfg config) error {
 	}
 	log.Info("loaded assignments", "path", cfg.assignments, "consistency_token", string(store.Token()))
 
-	src, err := grants.LoadFixture(cfg.grantsFixture)
-	if err != nil {
-		return err
-	}
-	log.Info("loaded grants fixture", "path", cfg.grantsFixture, "bundle_version", src.Version(), "grants", src.Names())
-
 	var awsOpts []func(*awsconfig.LoadOptions) error
 	if cfg.awsRegion != "" {
 		awsOpts = append(awsOpts, awsconfig.WithRegion(cfg.awsRegion))
@@ -79,6 +73,11 @@ func run(ctx context.Context, cfg config) error {
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsOpts...)
 	if err != nil {
 		return fmt.Errorf("aws config: %w", err)
+	}
+
+	src, err := newGrantSource(ctx, cfg, awsCfg, log)
+	if err != nil {
+		return err
 	}
 
 	bundles, err := authn.NewWorkloadAPISource(ctx, cfg.workloadAPISocket)
@@ -96,9 +95,13 @@ func run(ctx context.Context, cfg config) error {
 		Cluster: cfg.cluster,
 		Log:     log,
 	}
+	handler := api.New(authn.New(bundles), direct, log)
+	if src.ready != nil {
+		handler.AddReadiness(src.ready)
+	}
 	srv := &http.Server{
 		Addr:              cfg.listen,
-		Handler:           api.New(authn.New(bundles), direct, log),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,

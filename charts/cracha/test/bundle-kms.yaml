@@ -1,0 +1,5 @@
+# An S3 bundle source verified through KMS, on top of the required values.
+broker:
+  bundle:
+    source: s3://grant-bundles/cracha/prod
+    kmsKey: arn:aws:kms:eu-west-1:111122223333:key/0123abcd-0123-0123-0123-0123456789ab
