@@ -1,0 +1,18 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "issuer",
+    srcs = [
+        "fake.go",
+        "issuer.go",
+        "retry.go",
+    ],
+    importpath = "github.com/bpalermo/cracha/csi/internal/issuer",
+    visibility = ["//csi:__subpackages__"],
+)
+
+go_test(
+    name = "issuer_test",
+    srcs = ["retry_test.go"],
+    embed = [":issuer"],
+)
