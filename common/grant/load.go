@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -24,6 +25,8 @@ type Source struct {
 	Grants []*Grant
 	// Assignments, sorted by name.
 	Assignments []*Assignment
+	// Services, sorted by name.
+	Services []*Service
 	// Templates by name.
 	Templates map[string]*Template
 }
@@ -33,6 +36,16 @@ func (s *Source) Grant(name string) *Grant {
 	for _, g := range s.Grants {
 		if g.Name() == name {
 			return g
+		}
+	}
+	return nil
+}
+
+// ServiceOf returns the service the subject is a member of, or nil.
+func (s *Source) ServiceOf(subject string) *Service {
+	for _, svc := range s.Services {
+		if slices.Contains(svc.Spec.Members, subject) {
+			return svc
 		}
 	}
 	return nil
@@ -67,7 +80,7 @@ const (
 )
 
 // Load reads a source tree (see the package documentation): every *.yaml and
-// *.yml file under dir is a Grant or an Assignment, and every *.json file
+// *.yml file under dir is a Grant, an Assignment or a Service, and every *.json file
 // under dir/templates is a template. It reports every problem it finds, not
 // only the first.
 func Load(dir string) (*Source, error) {
@@ -76,6 +89,7 @@ func Load(dir string) (*Source, error) {
 	src := l.src
 	sort.Slice(src.Grants, func(i, j int) bool { return src.Grants[i].Name() < src.Grants[j].Name() })
 	sort.Slice(src.Assignments, func(i, j int) bool { return src.Assignments[i].Name() < src.Assignments[j].Name() })
+	sort.Slice(src.Services, func(i, j int) bool { return src.Services[i].Name() < src.Services[j].Name() })
 	if len(l.errs) > 0 {
 		return nil, errors.Join(l.errs...)
 	}
@@ -89,10 +103,11 @@ type loader struct {
 	templatesDir string
 	src          *Source
 	errs         errList
-	// seenGrants and seenAssignments map a name to the file that defined
-	// it, to report a second definition.
+	// seenGrants, seenAssignments and seenServices map a name to the file
+	// that defined it, to report a second definition.
 	seenGrants      map[string]string
 	seenAssignments map[string]string
+	seenServices    map[string]string
 }
 
 func newLoader(dir string) *loader {
@@ -102,6 +117,7 @@ func newLoader(dir string) *loader {
 		src:             &Source{Templates: map[string]*Template{}},
 		seenGrants:      map[string]string{},
 		seenAssignments: map[string]string{},
+		seenServices:    map[string]string{},
 	}
 }
 
@@ -151,7 +167,8 @@ func (l *loader) loadTemplate(path, rel string) {
 	l.src.Templates[t.Name] = t
 }
 
-// loadDocument loads one YAML file as the Grant or Assignment it declares.
+// loadDocument loads one YAML file as the Grant, Assignment or Service it
+// declares.
 func (l *loader) loadDocument(path, rel string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -168,6 +185,8 @@ func (l *loader) loadDocument(path, rel string) {
 		l.addGrant(o, rel)
 	case *Assignment:
 		l.addAssignment(o, rel)
+	case *Service:
+		l.addService(o, rel)
 	}
 }
 
@@ -194,8 +213,20 @@ func (l *loader) addAssignment(a *Assignment, rel string) {
 	l.src.Assignments = append(l.src.Assignments, a)
 }
 
-// ParseDocument parses one YAML document into a *Grant or an *Assignment,
-// chosen by its kind. Unknown fields are an error.
+// addService records a service loaded from rel, which must not redefine a
+// name.
+func (l *loader) addService(s *Service, rel string) {
+	s.Path = rel
+	if prev, dup := l.seenServices[s.Name()]; dup {
+		l.errs.addf("%s: service %q already defined in %s", rel, s.Name(), prev)
+		return
+	}
+	l.seenServices[s.Name()] = rel
+	l.src.Services = append(l.src.Services, s)
+}
+
+// ParseDocument parses one YAML document into a *Grant, an *Assignment or a
+// *Service, chosen by its kind. Unknown fields are an error.
 func ParseDocument(data []byte) (any, error) {
 	var head struct {
 		Kind string `json:"kind"`
@@ -205,28 +236,29 @@ func ParseDocument(data []byte) (any, error) {
 	}
 	switch head.Kind {
 	case KindGrant:
-		var g Grant
-		if err := yaml.UnmarshalStrict(data, &g); err != nil {
-			return nil, err
-		}
-		if g.Name() == "" {
-			return nil, errors.New("metadata.name is required")
-		}
-		return &g, nil
+		return parseStrict(data, func(g *Grant) *Metadata { return &g.Metadata })
 	case KindAssignment:
-		var a Assignment
-		if err := yaml.UnmarshalStrict(data, &a); err != nil {
-			return nil, err
-		}
-		if a.Name() == "" {
-			return nil, errors.New("metadata.name is required")
-		}
-		return &a, nil
+		return parseStrict(data, func(a *Assignment) *Metadata { return &a.Metadata })
+	case KindService:
+		return parseStrict(data, func(s *Service) *Metadata { return &s.Metadata })
 	case "":
 		return nil, errors.New("kind is required")
 	default:
-		return nil, fmt.Errorf("unknown kind %q (want %s or %s)", head.Kind, KindGrant, KindAssignment)
+		return nil, fmt.Errorf("unknown kind %q (want %s, %s or %s)", head.Kind, KindGrant, KindAssignment, KindService)
 	}
+}
+
+// parseStrict decodes a document of type T, rejecting unknown fields, and
+// requires a name; meta returns the document's metadata.
+func parseStrict[T any](data []byte, meta func(*T) *Metadata) (*T, error) {
+	obj := new(T)
+	if err := yaml.UnmarshalStrict(data, obj); err != nil {
+		return nil, err
+	}
+	if meta(obj).Name == "" {
+		return nil, errors.New("metadata.name is required")
+	}
+	return obj, nil
 }
 
 // LoadTemplate reads one template file. The template's name is the file's

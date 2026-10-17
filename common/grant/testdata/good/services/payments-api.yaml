@@ -1,0 +1,12 @@
+kind: Service
+metadata:
+  name: payments-api
+spec:
+  team: payments
+  members:
+    - prod/payments/ledger
+    - prod/payments/api
+  grants:
+    - name: payments-ledger-rw
+    - name: payments-outbox-r
+      expiresAt: "2030-01-01T00:00:00Z"

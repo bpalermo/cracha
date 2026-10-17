@@ -1,8 +1,10 @@
 // Package grant is the grant bundle model and its compiler (docs/design.md,
-// section 6.2): it loads Grant and Assignment documents and session policy
-// templates from a Git checkout, validates them, renders the templates, runs
-// the lints of the grant-compiler pipeline, compiles the signed bundle the
-// broker consumes, and signs and publishes it.
+// section 6.2): it loads Grant, Assignment and Service documents and
+// session policy templates from a Git checkout, validates them, renders the
+// templates, runs the lints of the grant-compiler pipeline, compiles the
+// signed bundle the broker consumes, and signs and publishes it. The same
+// tree is the source of truth of the authorization store: the reconciler
+// (reconciler/) turns its Assignments and Services into relationships.
 //
 // # Source tree
 //
@@ -12,10 +14,15 @@
 //
 //	grants/payments-ledger-rw.yaml      kind: Grant
 //	assignments/payments.yaml           kind: Assignment
+//	services/payments-api.yaml          kind: Service
 //	templates/dynamo-table-rw.json      a session policy template
 //
 // Unknown fields are rejected, so a typo in a field name fails the load
-// rather than silently widening or narrowing a grant.
+// rather than silently widening or narrowing a grant. Names (of grants,
+// assignments, services, teams and templates) are DNS labels: lowercase
+// letters, digits and dashes, at most 63 characters, so they are safe as
+// file names, session tag values, metrics labels and authorization-store
+// object IDs.
 //
 // # Grant
 //
@@ -54,13 +61,42 @@
 //	  grants: [payments-ledger-rw, payments-outbox-r]
 //	  expiresAt: "2026-12-31T00:00:00Z"    # optional, RFC 3339
 //	  clusters: [prod-us-east-1]           # optional; absent means every cluster
+//	  suspended: true                      # optional; the subject holds nothing while set
 //
 // The subject is the authorization subject encoding of design section 4.3,
 // <td-short>/<ns>/<sa>, produced by the shared encoding library; this package
 // treats it as an opaque string. A subject may appear in several Assignments
 // (a permanent one and a temporary one, say); the composition lint unions
 // them per cluster. An Assignment whose expiresAt is in the past is left out
-// of the composition and reported.
+// of the composition and reported. A suspended Assignment may name no
+// grants: it is then only the suspension, which the authorization store
+// enforces (the subject holds nothing, through any source, until it is
+// cleared); the composition lint still checks the subject's union, so that
+// lifting the suspension cannot surprise.
+//
+// # Service
+//
+// A Service groups the workloads of one team that share grants, the way the
+// authorization store's service and team do (design 6.4): every member
+// holds the service's grants and carries its name and team as session tags.
+//
+//	kind: Service
+//	metadata:
+//	  name: payments-api
+//	spec:
+//	  team: payments
+//	  members:                             # authz subject encodings
+//	    - prod/payments/ledger
+//	    - prod/payments/api
+//	  grants:                              # each bounded like an Assignment
+//	    - name: payments-ledger-rw
+//	    - name: payments-outbox-r
+//	      expiresAt: "2026-12-31T00:00:00Z"
+//	      clusters: [prod-us-east-1]
+//
+// A workload is a member of at most one service across the tree. The
+// composition lint sees a subject's grants from its Assignments and from
+// its service together.
 //
 // # Session policy templates
 //

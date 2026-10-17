@@ -1,0 +1,6 @@
+kind: Service
+metadata:
+  name: payments-batch
+spec:
+  team: payments
+  members: [prod/payments/ledger]

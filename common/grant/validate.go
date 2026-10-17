@@ -10,10 +10,11 @@ import (
 const maxNameLen = 63
 
 var (
-	// nameRE is the charset of grant, assignment and template names: a DNS
-	// label with dots, so a name is safe in a file name, a session tag value
-	// and a metrics label.
-	nameRE    = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$`)
+	// nameRE is the charset of grant, assignment, service, team and template
+	// names: a DNS label, so a name is safe in a file name, a session tag
+	// value, a metrics label and an authorization-store object ID (SpiceDB's
+	// charset has no dot).
+	nameRE    = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 	accountRE = regexp.MustCompile(`^[0-9]{12}$`)
 	// roleARNRE captures the account and the role name of an IAM role ARN.
 	roleARNRE = regexp.MustCompile(`^arn:(?:aws|aws-cn|aws-us-gov|aws-iso[a-z-]*):iam::([0-9]{12}):role/(?:[\w+=,.@-]+/)*([\w+=,.@-]+)$`)
@@ -49,7 +50,7 @@ func validateName(what, name string) error {
 		return fmt.Errorf("%s %q: longer than %d characters", what, name, maxNameLen)
 	}
 	if !nameRE.MatchString(name) {
-		return fmt.Errorf("%s %q: must be lowercase letters, digits, dots and dashes, starting and ending with a letter or digit", what, name)
+		return fmt.Errorf("%s %q: must be lowercase letters, digits and dashes, starting and ending with a letter or digit", what, name)
 	}
 	return nil
 }
@@ -235,23 +236,29 @@ func ValidateAssignment(a *Assignment) error {
 	}
 	errs.add(validateName("assignment name", a.Name()))
 	s := &a.Spec
-	if !subjectRE.MatchString(s.Subject) || len(s.Subject) > maxSubjectLen {
-		errs.addf("subject %q: must be an authorization subject encoding (design 4.3)", s.Subject)
+	errs.add(validateSubject(s.Subject))
+	if len(s.Grants) == 0 && !s.Suspended {
+		errs.addf("grants: at least one grant is required")
 	}
-	errs = append(errs, validateAssignedGrants(s.Grants)...)
+	errs = append(errs, validateGrantNames(s.Grants)...)
 	_, err := s.Expiry()
 	errs.add(err)
 	errs = append(errs, validateClusters(s.Clusters)...)
 	return errors.Join(errs...)
 }
 
-// validateAssignedGrants checks an assignment's grant names: at least one,
-// each listed once, each a valid name.
-func validateAssignedGrants(grants []string) errList {
-	var errs errList
-	if len(grants) == 0 {
-		errs.addf("grants: at least one grant is required")
+// validateSubject checks an authorization subject encoding (design 4.3).
+func validateSubject(subject string) error {
+	if !subjectRE.MatchString(subject) || len(subject) > maxSubjectLen {
+		return fmt.Errorf("subject %q: must be an authorization subject encoding (design 4.3)", subject)
 	}
+	return nil
+}
+
+// validateGrantNames checks a list of grant names: each listed once, each a
+// valid name.
+func validateGrantNames(grants []string) errList {
+	var errs errList
 	seen := map[string]bool{}
 	for _, name := range grants {
 		if seen[name] {
@@ -263,6 +270,39 @@ func validateAssignedGrants(grants []string) errList {
 		}
 	}
 	return errs
+}
+
+// ValidateService checks a Service's own fields; whether its grants exist
+// and its members belong to no other service is checked by ValidateSource.
+func ValidateService(s *Service) error {
+	var errs errList
+	if s.Kind != KindService {
+		errs.addf("kind must be %s", KindService)
+	}
+	errs.add(validateName("service name", s.Name()))
+	errs.add(validateName("team", s.Spec.Team))
+	seen := map[string]bool{}
+	for _, member := range s.Spec.Members {
+		if seen[member] {
+			errs.addf("members: %q listed twice", member)
+		}
+		seen[member] = true
+		if err := validateSubject(member); err != nil {
+			errs.addf("members: %w", err)
+		}
+	}
+	names := make([]string, 0, len(s.Spec.Grants))
+	for _, g := range s.Spec.Grants {
+		names = append(names, g.Name)
+		if _, err := g.Expiry(); err != nil {
+			errs.addf("grants: %s: %w", g.Name, err)
+		}
+		for _, cerr := range validateClusters(g.Clusters) {
+			errs.addf("grants: %s: %w", g.Name, cerr)
+		}
+	}
+	errs = append(errs, validateGrantNames(names)...)
+	return errors.Join(errs...)
 }
 
 // validateClusters checks an assignment's cluster names: none empty, each
@@ -283,8 +323,9 @@ func validateClusters(clusters []string) errList {
 }
 
 // ValidateSource validates every document of a source tree and the
-// references between them: a grant's template must exist, and an
-// assignment's grants must exist.
+// references between them: a grant's template must exist, an assignment's
+// and a service's grants must exist, and a workload is a member of at most
+// one service.
 func ValidateSource(src *Source) error {
 	var errs errList
 	for _, g := range src.Grants {
@@ -293,7 +334,35 @@ func ValidateSource(src *Source) error {
 	for _, a := range src.Assignments {
 		errs = append(errs, validateSourceAssignment(src, a)...)
 	}
+	memberOf := map[string]*Service{}
+	for _, s := range src.Services {
+		errs = append(errs, validateSourceService(src, s, memberOf)...)
+	}
 	return errors.Join(errs...)
+}
+
+// validateSourceService validates one service and, when it is valid, that
+// every grant it names exists and that no member belongs to a service seen
+// before, which memberOf records.
+func validateSourceService(src *Source, s *Service, memberOf map[string]*Service) errList {
+	var errs errList
+	if err := ValidateService(s); err != nil {
+		errs.addf("service %s (%s): %w", s.Name(), s.Path, err)
+		return errs
+	}
+	for _, g := range s.Spec.Grants {
+		if src.Grant(g.Name) == nil {
+			errs.addf("service %s (%s): grant %q not found", s.Name(), s.Path, g.Name)
+		}
+	}
+	for _, member := range s.Spec.Members {
+		if prev, ok := memberOf[member]; ok {
+			errs.addf("service %s (%s): %q is already a member of service %s (%s); a workload is a member of at most one service", s.Name(), s.Path, member, prev.Name(), prev.Path)
+			continue
+		}
+		memberOf[member] = s
+	}
+	return errs
 }
 
 // validateSourceGrant validates one grant and, when it is valid, that the

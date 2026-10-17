@@ -501,13 +501,13 @@ func printGrant(w io.Writer, g grant.GrantResult) {
 }
 
 // printComposition writes a line per subject and cluster scope, then the
-// assignments left out as expired.
+// assignments and service grants left out as expired.
 func printComposition(w io.Writer, r *grant.CompositionReport) {
 	for _, c := range r.Compositions {
 		printSubject(w, c)
 	}
-	for _, name := range r.Expired {
-		fmt.Fprintf(w, "assignment %s: expired, left out of the composition\n", name)
+	for _, source := range r.Expired {
+		fmt.Fprintf(w, "%s: expired, left out of the composition\n", source)
 	}
 }
 

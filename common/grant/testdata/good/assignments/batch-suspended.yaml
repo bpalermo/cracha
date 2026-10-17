@@ -1,0 +1,7 @@
+# A suspension alone: the subject holds nothing until it is lifted.
+kind: Assignment
+metadata:
+  name: batch-suspended
+spec:
+  subject: prod/payments/batch
+  suspended: true

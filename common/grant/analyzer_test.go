@@ -167,7 +167,7 @@ func TestLintOffline(t *testing.T) {
 			t.Errorf("%s: %+v", g.Grant, g)
 		}
 	}
-	if report.Composition == nil || len(report.Composition.Compositions) != 2 {
+	if report.Composition == nil || len(report.Composition.Compositions) != 3 {
 		t.Errorf("composition = %+v", report.Composition)
 	}
 }
