@@ -1,0 +1,8 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "authz",
+    srcs = ["authz.go"],
+    importpath = "github.com/bpalermo/cracha/broker/internal/authz",
+    visibility = ["//broker:__subpackages__"],
+)

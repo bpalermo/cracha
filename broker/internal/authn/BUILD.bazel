@@ -1,0 +1,25 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "authn",
+    srcs = ["authn.go"],
+    importpath = "github.com/bpalermo/cracha/broker/internal/authn",
+    visibility = ["//broker:__subpackages__"],
+    deps = [
+        "//common/idenc",
+        "@com_github_spiffe_go_spiffe_v2//bundle/jwtbundle",
+        "@com_github_spiffe_go_spiffe_v2//svid/jwtsvid",
+        "@com_github_spiffe_go_spiffe_v2//workloadapi",
+    ],
+)
+
+go_test(
+    name = "authn_test",
+    srcs = ["authn_test.go"],
+    embed = [":authn"],
+    deps = [
+        "//broker/internal/authn/authntest",
+        "//common/idenc",
+        "@com_github_spiffe_go_spiffe_v2//bundle/jwtbundle",
+    ],
+)

@@ -1,0 +1,24 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "sts",
+    srcs = ["sts.go"],
+    importpath = "github.com/bpalermo/cracha/broker/internal/sts",
+    visibility = ["//broker:__subpackages__"],
+    deps = [
+        "@com_github_aws_aws_sdk_go_v2//aws",
+        "@com_github_aws_aws_sdk_go_v2_service_sts//:sts",
+        "@com_github_aws_aws_sdk_go_v2_service_sts//types",
+    ],
+)
+
+go_test(
+    name = "sts_test",
+    srcs = ["sts_test.go"],
+    embed = [":sts"],
+    deps = [
+        "@com_github_aws_aws_sdk_go_v2//aws",
+        "@com_github_aws_aws_sdk_go_v2_service_sts//:sts",
+        "@com_github_aws_aws_sdk_go_v2_service_sts//types",
+    ],
+)

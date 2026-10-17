@@ -1,13 +1,26 @@
-load("@rules_go//go:def.bzl", "go_binary", "go_library")
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 load("//bazel:registry.bzl", "IMAGE_REGISTRY", "image_repository")
 load("//bazel/image:defs.bzl", "go_image")
 
 go_library(
     name = "broker_lib",
-    srcs = ["main.go"],
+    srcs = [
+        "config.go",
+        "main.go",
+    ],
     importpath = "github.com/bpalermo/cracha/broker",
     visibility = ["//visibility:private"],
-    deps = ["//common/version"],
+    deps = [
+        "//broker/internal/api",
+        "//broker/internal/authn",
+        "//broker/internal/authz/static",
+        "//broker/internal/grants",
+        "//broker/internal/issuer",
+        "//broker/internal/sts",
+        "//common/idenc",
+        "//common/version",
+        "@com_github_aws_aws_sdk_go_v2_config//:config",
+    ],
 )
 
 go_binary(
@@ -27,4 +40,10 @@ go_image(
     path = "/cracha-broker",
     registry = IMAGE_REGISTRY,
     repository = image_repository("broker"),
+)
+
+go_test(
+    name = "broker_test",
+    srcs = ["config_test.go"],
+    embed = [":broker_lib"],
 )
