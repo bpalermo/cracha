@@ -1,0 +1,29 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "cache",
+    srcs = ["cache.go"],
+    importpath = "github.com/bpalermo/cracha/broker/internal/cache",
+    visibility = ["//broker:__subpackages__"],
+    deps = [
+        "//broker/internal/authz",
+        "//broker/internal/grants",
+        "//broker/internal/issuer",
+        "//broker/internal/sts",
+        "//common/idenc",
+        "@org_golang_x_sync//singleflight",
+    ],
+)
+
+go_test(
+    name = "cache_test",
+    srcs = ["cache_test.go"],
+    embed = [":cache"],
+    deps = [
+        "//broker/internal/authz",
+        "//broker/internal/grants",
+        "//broker/internal/issuer",
+        "//broker/internal/sts",
+        "//common/idenc",
+    ],
+)

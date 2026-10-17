@@ -64,6 +64,11 @@ spec:
             - --aws-region={{ . }}
             {{- end }}
             - --log-level={{ include "cracha.logLevel" .Values.broker.logLevel }}
+            - --cache={{ .Values.broker.cache.enabled }}
+            - --cache-min-remaining={{ .Values.broker.cache.minRemaining }}
+            - --cache-refresh-at={{ .Values.broker.cache.refreshAt }}
+            - --cache-max-entries={{ .Values.broker.cache.maxEntries }}
+            - --cache-stale-check-max={{ .Values.broker.cache.staleCheckMax }}
           {{- with .Values.broker.env }}
           env:
             {{- toYaml . | nindent 12 }}
