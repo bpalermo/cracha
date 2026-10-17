@@ -40,32 +40,7 @@ func parseConfig(args []string, lookupEnv func(string) (string, bool), stderr io
 	var c config
 	fs := flag.NewFlagSet("cracha-broker", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	env := func(name, def string) string {
-		if v, ok := lookupEnv("CRACHA_" + strings.ToUpper(strings.ReplaceAll(name, "-", "_"))); ok {
-			return v
-		}
-		return def
-	}
-	envBool := func(name string, def bool) bool {
-		v := env(name, "")
-		if v == "" {
-			return def
-		}
-		b, err := strconv.ParseBool(v)
-		return err == nil && b
-	}
-	fs.StringVar(&c.listen, "listen", env("listen", ":8443"), "address to listen on")
-	fs.StringVar(&c.tlsCert, "tls-cert", env("tls-cert", ""), "path to the TLS certificate (PEM); required unless --insecure-plaintext")
-	fs.StringVar(&c.tlsKey, "tls-key", env("tls-key", ""), "path to the TLS private key (PEM)")
-	fs.BoolVar(&c.insecurePlaintext, "insecure-plaintext", envBool("insecure-plaintext", false), "serve plain HTTP; for tests only, JWT-SVIDs travel in the clear")
-	fs.StringVar(&c.workloadAPISocket, "workload-api-socket", env("workload-api-socket", "unix:///run/spire/sockets/agent.sock"), "SPIFFE Workload API address, for the trust bundles")
-	fs.StringVar(&c.cluster, "cluster", env("cluster", ""), "name of the cluster this broker serves (required)")
-	fs.StringVar(&c.trustDomainLabels, "trust-domain-labels", env("trust-domain-labels", ""), "trust domain short labels, <trust-domain>=<label>,...; unmapped domains get td.<name>")
-	fs.StringVar(&c.assignments, "assignments", env("assignments", ""), "path to the static authorization backend's assignments file (required)")
-	fs.StringVar(&c.grantsFixture, "grants-fixture", env("grants-fixture", ""), "path to the resolved-grants fixture file (required until the compiled bundle loader lands)")
-	fs.StringVar(&c.awsRegion, "aws-region", env("aws-region", ""), "AWS region for STS; the SDK's default chain when empty")
-	fs.StringVar(&c.logLevel, "log-level", env("log-level", "info"), "log level: debug, info, warn or error")
-	fs.BoolVar(&c.showVersion, "version", false, "print the version and exit")
+	c.bindFlags(fs, envDefaults(lookupEnv))
 	if err := fs.Parse(args); err != nil {
 		return c, err
 	}
@@ -75,35 +50,98 @@ func parseConfig(args []string, lookupEnv func(string) (string, bool), stderr io
 	if fs.NArg() > 0 {
 		return c, fmt.Errorf("unexpected arguments: %q", fs.Args())
 	}
+	err := c.validate()
+	return c, err
+}
 
+// envDefaults resolves a flag's default from the environment: CRACHA_<FLAG>
+// with the flag's dashes as underscores, else the built-in default. A flag
+// given on the command line still wins, since it overrides the default.
+type envDefaults func(string) (string, bool)
+
+// str is the environment's value for the flag, or def when unset.
+func (env envDefaults) str(flag, def string) string {
+	if v, ok := env("CRACHA_" + strings.ToUpper(strings.ReplaceAll(flag, "-", "_"))); ok {
+		return v
+	}
+	return def
+}
+
+// boolean is the environment's value for the flag parsed as a bool, def
+// when unset, and false when it is set to something that is not a bool.
+func (env envDefaults) boolean(flag string, def bool) bool {
+	v := env.str(flag, "")
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	return err == nil && b
+}
+
+// bindFlags declares the broker's flags on fs with their defaults from env.
+func (c *config) bindFlags(fs *flag.FlagSet, env envDefaults) {
+	fs.StringVar(&c.listen, "listen", env.str("listen", ":8443"), "address to listen on")
+	fs.StringVar(&c.tlsCert, "tls-cert", env.str("tls-cert", ""), "path to the TLS certificate (PEM); required unless --insecure-plaintext")
+	fs.StringVar(&c.tlsKey, "tls-key", env.str("tls-key", ""), "path to the TLS private key (PEM)")
+	fs.BoolVar(&c.insecurePlaintext, "insecure-plaintext", env.boolean("insecure-plaintext", false), "serve plain HTTP; for tests only, JWT-SVIDs travel in the clear")
+	fs.StringVar(&c.workloadAPISocket, "workload-api-socket", env.str("workload-api-socket", "unix:///run/spire/sockets/agent.sock"), "SPIFFE Workload API address, for the trust bundles")
+	fs.StringVar(&c.cluster, "cluster", env.str("cluster", ""), "name of the cluster this broker serves (required)")
+	fs.StringVar(&c.trustDomainLabels, "trust-domain-labels", env.str("trust-domain-labels", ""), "trust domain short labels, <trust-domain>=<label>,...; unmapped domains get td.<name>")
+	fs.StringVar(&c.assignments, "assignments", env.str("assignments", ""), "path to the static authorization backend's assignments file (required)")
+	fs.StringVar(&c.grantsFixture, "grants-fixture", env.str("grants-fixture", ""), "path to the resolved-grants fixture file (required until the compiled bundle loader lands)")
+	fs.StringVar(&c.awsRegion, "aws-region", env.str("aws-region", ""), "AWS region for STS; the SDK's default chain when empty")
+	fs.StringVar(&c.logLevel, "log-level", env.str("log-level", "info"), "log level: debug, info, warn or error")
+	fs.BoolVar(&c.showVersion, "version", false, "print the version and exit")
+}
+
+// validate checks the parsed flags against each other and parses the trust
+// domain labels into c.labels. Every problem found is reported, joined by
+// "; ".
+func (c *config) validate() error {
 	var problems []string
-	if c.cluster == "" {
-		problems = append(problems, "--cluster is required")
+	required := []struct{ value, flag string }{
+		{c.cluster, "--cluster"},
+		{c.assignments, "--assignments"},
+		{c.grantsFixture, "--grants-fixture"},
 	}
-	if c.assignments == "" {
-		problems = append(problems, "--assignments is required")
+	for _, r := range required {
+		if r.value == "" {
+			problems = append(problems, r.flag+" is required")
+		}
 	}
-	if c.grantsFixture == "" {
-		problems = append(problems, "--grants-fixture is required")
-	}
-	switch {
-	case c.insecurePlaintext && (c.tlsCert != "" || c.tlsKey != ""):
-		problems = append(problems, "--insecure-plaintext excludes --tls-cert and --tls-key")
-	case !c.insecurePlaintext && (c.tlsCert == "" || c.tlsKey == ""):
-		problems = append(problems, "--tls-cert and --tls-key are required (TLS is mandatory; --insecure-plaintext is for tests)")
+	if p := c.tlsProblem(); p != "" {
+		problems = append(problems, p)
 	}
 	labels, err := idenc.ParseLabels(c.trustDomainLabels)
 	if err != nil {
 		problems = append(problems, err.Error())
 	}
 	c.labels = labels
-	switch c.logLevel {
-	case "debug", "info", "warn", "error":
-	default:
+	if !validLogLevel(c.logLevel) {
 		problems = append(problems, fmt.Sprintf("--log-level %q is not debug, info, warn or error", c.logLevel))
 	}
 	if len(problems) > 0 {
-		return c, errors.New(strings.Join(problems, "; "))
+		return errors.New(strings.Join(problems, "; "))
 	}
-	return c, nil
+	return nil
+}
+
+// tlsProblem is what is wrong with the TLS flags, or empty: plaintext
+// excludes a certificate and key, and TLS requires both.
+func (c *config) tlsProblem() string {
+	switch {
+	case c.insecurePlaintext && (c.tlsCert != "" || c.tlsKey != ""):
+		return "--insecure-plaintext excludes --tls-cert and --tls-key"
+	case !c.insecurePlaintext && (c.tlsCert == "" || c.tlsKey == ""):
+		return "--tls-cert and --tls-key are required (TLS is mandatory; --insecure-plaintext is for tests)"
+	}
+	return ""
+}
+
+func validLogLevel(level string) bool {
+	switch level {
+	case "debug", "info", "warn", "error":
+		return true
+	}
+	return false
 }

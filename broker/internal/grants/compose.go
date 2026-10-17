@@ -78,96 +78,191 @@ type Composed struct {
 // MaxDurationSeconds; session tags are merged, and a key with two values is
 // "ambiguous". A denial is a *DenyError; any other error means the source's
 // content is unusable, which is also a deny.
+//
+// The grants are folded in name order, and the first fault found is the
+// one reported: for each grant, its shape and account, then its statements,
+// then its session tags; after all grants, the policy size, the managed
+// policy count and the duration.
 func Compose(src Source, names []string) (Composed, error) {
 	names = sortedUnique(names)
 	if len(names) == 0 {
 		return Composed{}, &DenyError{ReasonNoGrant, "no grants assigned"}
 	}
+	resolved, err := resolveGrants(src, names)
+	if err != nil {
+		return Composed{}, err
+	}
+	c, err := newComposition(resolved[0], names)
+	if err != nil {
+		return Composed{}, err
+	}
+	for _, g := range resolved {
+		if err := c.add(g); err != nil {
+			return Composed{}, err
+		}
+	}
+	return c.finish()
+}
+
+// resolveGrants looks every name up in the source, in order; a name the
+// source lacks is "no_grant".
+func resolveGrants(src Source, names []string) ([]ResolvedGrant, error) {
 	resolved := make([]ResolvedGrant, 0, len(names))
 	for _, n := range names {
 		g, ok := src.Lookup(n)
 		if !ok {
-			return Composed{}, &DenyError{ReasonNoGrant, fmt.Sprintf("grant %q is not in bundle version %q", n, src.Version())}
+			return nil, &DenyError{ReasonNoGrant, fmt.Sprintf("grant %q is not in bundle version %q", n, src.Version())}
 		}
 		resolved = append(resolved, g)
 	}
+	return resolved, nil
+}
 
-	out := Composed{
-		BaseRole:    resolved[0].BaseRole,
-		Account:     resolved[0].Account,
-		Grants:      names,
-		SessionTags: map[string]string{},
-	}
-	if out.BaseRole == "" {
-		return Composed{}, fmt.Errorf("grant %q has no base role", resolved[0].Name)
-	}
-	out.Shape = ShapeName(out.BaseRole)
+// composition accumulates the grants of one workload, in name order, into a
+// Composed. The first grant fixes the shape and account every later grant
+// must share.
+type composition struct {
+	first      ResolvedGrant
+	out        Composed
+	statements []json.RawMessage
+	managed    map[string]bool
+	tagSource  map[string]string // the grant each session tag came from
+	duration   int32             // the shortest duration so far; 0 until a grant sets one
+}
 
-	var statements []json.RawMessage
-	managed := map[string]bool{}
-	tagSource := map[string]string{}
-	var duration int32
-	for _, g := range resolved {
-		if g.BaseRole != out.BaseRole {
-			return Composed{}, &DenyError{ReasonAmbiguous, fmt.Sprintf("grant %q has shape %s, grant %q has shape %s", resolved[0].Name, out.BaseRole, g.Name, g.BaseRole)}
-		}
-		if g.Account != out.Account {
-			return Composed{}, &DenyError{ReasonAmbiguous, fmt.Sprintf("grant %q is in account %s, grant %q in %s", resolved[0].Name, out.Account, g.Name, g.Account)}
-		}
-		stmts, err := statementsOf(g)
-		if err != nil {
-			return Composed{}, err
-		}
-		statements = append(statements, stmts...)
-		for _, arn := range g.ManagedPolicyARNs {
-			managed[arn] = true
-		}
-		for k, v := range g.SessionTags {
-			if k != "team" && k != "service" {
-				return Composed{}, fmt.Errorf("grant %q sets session tag %q; only team and service are allowed", g.Name, k)
-			}
-			if prev, ok := out.SessionTags[k]; ok && prev != v {
-				return Composed{}, &DenyError{ReasonAmbiguous, fmt.Sprintf("session tag %q is %q in grant %q and %q in grant %q", k, prev, tagSource[k], v, g.Name)}
-			}
-			out.SessionTags[k], tagSource[k] = v, g.Name
-		}
-		if g.DurationSeconds > 0 && (duration == 0 || g.DurationSeconds < duration) {
-			duration = g.DurationSeconds
-		}
+// newComposition starts a composition from the first grant, whose base role
+// is the shape of the whole set.
+func newComposition(first ResolvedGrant, names []string) (*composition, error) {
+	if first.BaseRole == "" {
+		return nil, fmt.Errorf("grant %q has no base role", first.Name)
 	}
+	return &composition{
+		first: first,
+		out: Composed{
+			BaseRole:    first.BaseRole,
+			Shape:       ShapeName(first.BaseRole),
+			Account:     first.Account,
+			Grants:      names,
+			SessionTags: map[string]string{},
+		},
+		managed:   map[string]bool{},
+		tagSource: map[string]string{},
+	}, nil
+}
 
-	if len(statements) > 0 {
-		doc, err := json.Marshal(struct {
-			Version   string            `json:"Version"`
-			Statement []json.RawMessage `json:"Statement"`
-		}{PolicyVersion, statements})
-		if err != nil {
-			return Composed{}, fmt.Errorf("compose policy: %w", err)
-		}
-		if len(doc) > MaxPolicyChars {
-			return Composed{}, &DenyError{ReasonPolicyTooLarge, fmt.Sprintf("inline session policy is %d characters, over %d", len(doc), MaxPolicyChars)}
-		}
-		out.Policy = string(doc)
+// add folds one grant in: its shape and account must match the first
+// grant's, its statements are appended, its managed policies and session
+// tags unioned, and its duration shortens the set's.
+func (c *composition) add(g ResolvedGrant) error {
+	if err := c.sameShape(g); err != nil {
+		return err
 	}
+	stmts, err := statementsOf(g)
+	if err != nil {
+		return err
+	}
+	c.statements = append(c.statements, stmts...)
+	for _, arn := range g.ManagedPolicyARNs {
+		c.managed[arn] = true
+	}
+	if err := c.mergeTags(g); err != nil {
+		return err
+	}
+	if g.DurationSeconds > 0 && (c.duration == 0 || g.DurationSeconds < c.duration) {
+		c.duration = g.DurationSeconds
+	}
+	return nil
+}
 
-	for arn := range managed {
-		out.ManagedPolicyARNs = append(out.ManagedPolicyARNs, arn)
+// sameShape is "ambiguous" when g names another shape role or account than
+// the first grant.
+func (c *composition) sameShape(g ResolvedGrant) error {
+	if g.BaseRole != c.out.BaseRole {
+		return &DenyError{ReasonAmbiguous, fmt.Sprintf("grant %q has shape %s, grant %q has shape %s", c.first.Name, c.out.BaseRole, g.Name, g.BaseRole)}
 	}
-	sort.Strings(out.ManagedPolicyARNs)
-	if len(out.ManagedPolicyARNs) > MaxManagedPolicies {
-		return Composed{}, &DenyError{ReasonPolicyTooLarge, fmt.Sprintf("%d managed policies, over %d", len(out.ManagedPolicyARNs), MaxManagedPolicies)}
+	if g.Account != c.out.Account {
+		return &DenyError{ReasonAmbiguous, fmt.Sprintf("grant %q is in account %s, grant %q in %s", c.first.Name, c.out.Account, g.Name, g.Account)}
 	}
+	return nil
+}
 
+// mergeTags unions g's session tags into the set. Only team and service are
+// allowed; a key an earlier grant set to another value is "ambiguous".
+func (c *composition) mergeTags(g ResolvedGrant) error {
+	for k, v := range g.SessionTags {
+		if k != "team" && k != "service" {
+			return fmt.Errorf("grant %q sets session tag %q; only team and service are allowed", g.Name, k)
+		}
+		if prev, ok := c.out.SessionTags[k]; ok && prev != v {
+			return &DenyError{ReasonAmbiguous, fmt.Sprintf("session tag %q is %q in grant %q and %q in grant %q", k, prev, c.tagSource[k], v, g.Name)}
+		}
+		c.out.SessionTags[k], c.tagSource[k] = v, g.Name
+	}
+	return nil
+}
+
+// finish applies the limits of sections 6.2 and 6.6 and returns the result.
+func (c *composition) finish() (Composed, error) {
+	policy, err := policyDocument(c.statements)
+	if err != nil {
+		return Composed{}, err
+	}
+	c.out.Policy = policy
+	c.out.ManagedPolicyARNs = sortedKeys(c.managed)
+	if len(c.out.ManagedPolicyARNs) > MaxManagedPolicies {
+		return Composed{}, &DenyError{ReasonPolicyTooLarge, fmt.Sprintf("%d managed policies, over %d", len(c.out.ManagedPolicyARNs), MaxManagedPolicies)}
+	}
+	duration, err := sessionDuration(c.duration)
+	if err != nil {
+		return Composed{}, err
+	}
+	c.out.DurationSeconds = duration
+	return c.out, nil
+}
+
+// policyDocument renders the unioned statements as one compact policy, or
+// nothing when there are none. A document over MaxPolicyChars is
+// "policy_too_large".
+func policyDocument(statements []json.RawMessage) (string, error) {
+	if len(statements) == 0 {
+		return "", nil
+	}
+	doc, err := json.Marshal(struct {
+		Version   string            `json:"Version"`
+		Statement []json.RawMessage `json:"Statement"`
+	}{PolicyVersion, statements})
+	if err != nil {
+		return "", fmt.Errorf("compose policy: %w", err)
+	}
+	if len(doc) > MaxPolicyChars {
+		return "", &DenyError{ReasonPolicyTooLarge, fmt.Sprintf("inline session policy is %d characters, over %d", len(doc), MaxPolicyChars)}
+	}
+	return string(doc), nil
+}
+
+// sessionDuration turns the shortest grant duration (0 when no grant set
+// one) into the one asked of STS: the default when unset, capped at the
+// role-chaining ceiling, and an error under STS's floor.
+func sessionDuration(shortest int32) (int32, error) {
 	switch {
-	case duration == 0:
-		duration = DefaultDurationSeconds
-	case duration < MinDurationSeconds:
-		return Composed{}, fmt.Errorf("session duration %ds is under STS's minimum of %ds", duration, MinDurationSeconds)
-	case duration > MaxDurationSeconds:
-		duration = MaxDurationSeconds
+	case shortest == 0:
+		return DefaultDurationSeconds, nil
+	case shortest < MinDurationSeconds:
+		return 0, fmt.Errorf("session duration %ds is under STS's minimum of %ds", shortest, MinDurationSeconds)
+	case shortest > MaxDurationSeconds:
+		return MaxDurationSeconds, nil
 	}
-	out.DurationSeconds = duration
-	return out, nil
+	return shortest, nil
+}
+
+// sortedKeys returns the keys of set, sorted, or nil when it is empty.
+func sortedKeys(set map[string]bool) []string {
+	var keys []string
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // statementsOf parses a grant's rendered session policy and checks every
@@ -176,6 +271,25 @@ func statementsOf(g ResolvedGrant) ([]json.RawMessage, error) {
 	if strings.TrimSpace(g.SessionPolicy) == "" {
 		return nil, nil
 	}
+	stmts, err := policyStatements(g)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]json.RawMessage, 0, len(stmts))
+	for i, raw := range stmts {
+		stmt, err := normalizeStatement(g, i, raw)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, stmt)
+	}
+	return out, nil
+}
+
+// policyStatements parses the policy document of g and returns its
+// Statement as a list, whether it was written as one or as a single
+// statement.
+func policyStatements(g ResolvedGrant) ([]json.RawMessage, error) {
 	var doc struct {
 		Version   string          `json:"Version"`
 		Statement json.RawMessage `json:"Statement"`
@@ -189,46 +303,49 @@ func statementsOf(g ResolvedGrant) ([]json.RawMessage, error) {
 	if len(doc.Statement) == 0 {
 		return nil, fmt.Errorf("grant %q: session policy has no Statement", g.Name)
 	}
+	if !bytes.HasPrefix(bytes.TrimSpace(doc.Statement), []byte("[")) {
+		return []json.RawMessage{doc.Statement}, nil
+	}
 	var stmts []json.RawMessage
-	if bytes.HasPrefix(bytes.TrimSpace(doc.Statement), []byte("[")) {
-		if err := json.Unmarshal(doc.Statement, &stmts); err != nil {
-			return nil, fmt.Errorf("grant %q: session policy Statement: %w", g.Name, err)
-		}
-	} else {
-		stmts = []json.RawMessage{doc.Statement}
+	if err := json.Unmarshal(doc.Statement, &stmts); err != nil {
+		return nil, fmt.Errorf("grant %q: session policy Statement: %w", g.Name, err)
 	}
-	out := make([]json.RawMessage, 0, len(stmts))
-	for i, raw := range stmts {
-		var stmt map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &stmt); err != nil {
-			return nil, fmt.Errorf("grant %q: statement %d: %w", g.Name, i, err)
-		}
-		if _, ok := stmt["NotResource"]; ok {
-			return nil, &DenyError{ReasonEnvelopeViolation, fmt.Sprintf("grant %q: statement %d uses NotResource, which no envelope can bound", g.Name, i)}
-		}
-		resRaw, ok := stmt["Resource"]
-		if !ok {
-			return nil, &DenyError{ReasonEnvelopeViolation, fmt.Sprintf("grant %q: statement %d has no Resource", g.Name, i)}
-		}
-		resources, err := stringOrList(resRaw)
-		if err != nil {
-			return nil, fmt.Errorf("grant %q: statement %d: Resource: %w", g.Name, i, err)
-		}
-		if len(resources) == 0 {
-			return nil, &DenyError{ReasonEnvelopeViolation, fmt.Sprintf("grant %q: statement %d has an empty Resource", g.Name, i)}
-		}
-		for _, r := range resources {
-			if !inEnvelope(r, g.Envelope) {
-				return nil, &DenyError{ReasonEnvelopeViolation, fmt.Sprintf("grant %q: statement %d: resource %q matches no envelope pattern %q", g.Name, i, r, g.Envelope)}
-			}
-		}
-		var compact bytes.Buffer
-		if err := json.Compact(&compact, raw); err != nil {
-			return nil, fmt.Errorf("grant %q: statement %d: %w", g.Name, i, err)
-		}
-		out = append(out, compact.Bytes())
+	return stmts, nil
+}
+
+// normalizeStatement checks statement i of g against the envelope and
+// returns it compact. A statement no envelope can bound (NotResource, no or
+// empty Resource, a Resource outside every pattern) is
+// "envelope_violation".
+func normalizeStatement(g ResolvedGrant, i int, raw json.RawMessage) (json.RawMessage, error) {
+	var stmt map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &stmt); err != nil {
+		return nil, fmt.Errorf("grant %q: statement %d: %w", g.Name, i, err)
 	}
-	return out, nil
+	if _, ok := stmt["NotResource"]; ok {
+		return nil, &DenyError{ReasonEnvelopeViolation, fmt.Sprintf("grant %q: statement %d uses NotResource, which no envelope can bound", g.Name, i)}
+	}
+	resRaw, ok := stmt["Resource"]
+	if !ok {
+		return nil, &DenyError{ReasonEnvelopeViolation, fmt.Sprintf("grant %q: statement %d has no Resource", g.Name, i)}
+	}
+	resources, err := stringOrList(resRaw)
+	if err != nil {
+		return nil, fmt.Errorf("grant %q: statement %d: Resource: %w", g.Name, i, err)
+	}
+	if len(resources) == 0 {
+		return nil, &DenyError{ReasonEnvelopeViolation, fmt.Sprintf("grant %q: statement %d has an empty Resource", g.Name, i)}
+	}
+	for _, r := range resources {
+		if !inEnvelope(r, g.Envelope) {
+			return nil, &DenyError{ReasonEnvelopeViolation, fmt.Sprintf("grant %q: statement %d: resource %q matches no envelope pattern %q", g.Name, i, r, g.Envelope)}
+		}
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, raw); err != nil {
+		return nil, fmt.Errorf("grant %q: statement %d: %w", g.Name, i, err)
+	}
+	return compact.Bytes(), nil
 }
 
 func stringOrList(raw json.RawMessage) ([]string, error) {

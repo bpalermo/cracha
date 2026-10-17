@@ -49,6 +49,33 @@ func TestParseConfigEnvFallback(t *testing.T) {
 	}
 }
 
+func TestEnvDefaults(t *testing.T) {
+	env := envDefaults(envOf(map[string]string{
+		"CRACHA_LISTEN":             ":8080",
+		"CRACHA_INSECURE_PLAINTEXT": "maybe",
+		"CRACHA_TLS_CERT":           "",
+	}))
+	if got := env.str("listen", ":8443"); got != ":8080" {
+		t.Errorf("listen %q", got)
+	}
+	if got := env.str("tls-cert", "default.pem"); got != "" {
+		t.Errorf("an empty variable is a value, got %q", got)
+	}
+	if got := env.str("tls-key", "k.pem"); got != "k.pem" {
+		t.Errorf("unset variable gave %q, want the default", got)
+	}
+	// A bool set to something that is not a bool is false, not the default.
+	if env.boolean("insecure-plaintext", true) {
+		t.Error("non-bool value read as true")
+	}
+	if !env.boolean("tls-key", true) {
+		t.Error("unset bool did not take the default")
+	}
+	if !env.boolean("tls-cert", true) {
+		t.Error("empty bool did not take the default")
+	}
+}
+
 func TestParseConfigVersion(t *testing.T) {
 	if _, err := parseConfig([]string{"--version"}, envOf(nil), io.Discard); !errors.Is(err, errVersion) {
 		t.Fatalf("got %v", err)

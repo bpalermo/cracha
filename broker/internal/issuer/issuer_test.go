@@ -112,8 +112,17 @@ func TestIssue(t *testing.T) {
 	if !reflect.DeepEqual(iss.SessionTags, wantTags) {
 		t.Errorf("tags %v, want %v", iss.SessionTags, wantTags)
 	}
+	checkSTSRequest(t, assumer.req, wantTags)
+	// The issuance log maps the encodings back to the SPIFFE ID.
+	checkLogFields(t, logs.String(),
+		`"msg":"issued"`, `"spiffe_id":"spiffe://example.org/ns/payments/sa/ledger"`, `"source_identity":"w.prod.payments.ledger"`,
+		`"subject":"prod/payments/ledger"`, `"bundle_version":"bundle-7"`, `"consistency_token":"tok-1"`)
+}
 
-	req := assumer.req
+// checkSTSRequest checks the AssumeRole request for the ledger workload
+// holding the ledger and outbox grants.
+func checkSTSRequest(t *testing.T, req sts.Request, wantTags map[string]string) {
+	t.Helper()
 	if req.RoleARN != dynamoRole || req.SessionName != "w.prod.payments.ledger" || req.DurationSeconds != 3600 {
 		t.Errorf("sts request %+v", req)
 	}
@@ -123,10 +132,12 @@ func TestIssue(t *testing.T) {
 	if !reflect.DeepEqual(req.Tags, wantTags) {
 		t.Errorf("sts tags %v", req.Tags)
 	}
+}
 
-	// The issuance log maps the encodings back to the SPIFFE ID.
-	line := logs.String()
-	for _, want := range []string{`"msg":"issued"`, `"spiffe_id":"spiffe://example.org/ns/payments/sa/ledger"`, `"source_identity":"w.prod.payments.ledger"`, `"subject":"prod/payments/ledger"`, `"bundle_version":"bundle-7"`, `"consistency_token":"tok-1"`} {
+// checkLogFields checks that every want appears in the log line.
+func checkLogFields(t *testing.T, line string, wants ...string) {
+	t.Helper()
+	for _, want := range wants {
 		if !strings.Contains(line, want) {
 			t.Errorf("log lacks %s:\n%s", want, line)
 		}

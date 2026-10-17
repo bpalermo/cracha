@@ -229,6 +229,51 @@ func TestComposeErrors(t *testing.T) {
 	}
 }
 
+func TestStatementsOf(t *testing.T) {
+	policy := func(statement string) string {
+		return `{"Version":"2012-10-17","Statement":` + statement + `}`
+	}
+	tests := []struct {
+		name   string
+		policy string
+		reason Reason // "" when the policy is unusable rather than denied
+	}{
+		{"no statement", `{"Version":"2012-10-17"}`, ""},
+		{"statement not an object", policy(`[1]`), ""},
+		{"statement list malformed", policy(`[{"Effect":"Allow"},`), ""},
+		{"resource neither string nor list", policy(`[{"Effect":"Allow","Resource":5}]`), ""},
+		{"empty resource list", policy(`[{"Effect":"Allow","Resource":[]}]`), ReasonEnvelopeViolation},
+		{"second statement outside envelope", policy(`[{"Effect":"Allow","Resource":"arn:aws:dynamodb:us-east-1:111122223333:table/payments-a"},{"Effect":"Allow","Resource":"arn:aws:dynamodb:us-east-1:111122223333:table/billing"}]`), ReasonEnvelopeViolation},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := ledgerRW()
+			g.SessionPolicy = tt.policy
+			_, err := statementsOf(g)
+			if err == nil {
+				t.Fatal("accepted")
+			}
+			var d *DenyError
+			if got := errors.As(err, &d); got != (tt.reason != "") {
+				t.Fatalf("deny %v, want %v: %v", got, tt.reason != "", err)
+			}
+			if d != nil && d.Reason != tt.reason {
+				t.Fatalf("reason %q, want %q", d.Reason, tt.reason)
+			}
+		})
+	}
+	// A single statement, not in a list, and a policy without a Version.
+	g := ledgerRW()
+	g.SessionPolicy = `{"Statement":{"Effect":"Allow","Action":"dynamodb:GetItem", "Resource": "arn:aws:dynamodb:us-east-1:111122223333:table/payments-a"}}`
+	stmts, err := statementsOf(g)
+	if err != nil || len(stmts) != 1 {
+		t.Fatalf("statements %s: %v", stmts, err)
+	}
+	if string(stmts[0]) != `{"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"arn:aws:dynamodb:us-east-1:111122223333:table/payments-a"}` {
+		t.Errorf("not compact: %s", stmts[0])
+	}
+}
+
 func TestComposeDurationCap(t *testing.T) {
 	g := ledgerRW()
 	g.DurationSeconds = 7200
