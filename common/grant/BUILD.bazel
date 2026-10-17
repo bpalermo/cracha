@@ -1,0 +1,57 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "grant",
+    srcs = [
+        "analyzer.go",
+        "arnmatch.go",
+        "bundle.go",
+        "doc.go",
+        "lint.go",
+        "load.go",
+        "pipeline.go",
+        "publish.go",
+        "sign.go",
+        "template.go",
+        "types.go",
+        "validate.go",
+    ],
+    importpath = "github.com/bpalermo/cracha/common/grant",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_aws_aws_sdk_go_v2//aws",
+        "@com_github_aws_aws_sdk_go_v2_service_accessanalyzer//:accessanalyzer",
+        "@com_github_aws_aws_sdk_go_v2_service_accessanalyzer//types",
+        "@com_github_aws_aws_sdk_go_v2_service_kms//:kms",
+        "@com_github_aws_aws_sdk_go_v2_service_kms//types",
+        "@com_github_aws_aws_sdk_go_v2_service_s3//:s3",
+        "@com_github_aws_aws_sdk_go_v2_service_s3//types",
+        "@io_k8s_sigs_yaml//:yaml",
+    ],
+)
+
+go_test(
+    name = "grant_test",
+    srcs = [
+        "analyzer_test.go",
+        "arnmatch_test.go",
+        "bundle_test.go",
+        "lint_test.go",
+        "load_test.go",
+        "publish_test.go",
+        "sign_test.go",
+        "template_test.go",
+        "validate_test.go",
+    ],
+    data = glob(["testdata/**"]),
+    embed = [":grant"],
+    deps = [
+        "@com_github_aws_aws_sdk_go_v2//aws",
+        "@com_github_aws_aws_sdk_go_v2_service_accessanalyzer//:accessanalyzer",
+        "@com_github_aws_aws_sdk_go_v2_service_accessanalyzer//types",
+        "@com_github_aws_aws_sdk_go_v2_service_kms//:kms",
+        "@com_github_aws_aws_sdk_go_v2_service_kms//types",
+        "@com_github_aws_aws_sdk_go_v2_service_s3//:s3",
+        "@com_github_aws_aws_sdk_go_v2_service_s3//types",
+    ],
+)

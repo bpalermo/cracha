@@ -1,0 +1,6 @@
+kind: Assignment
+metadata:
+  name: a
+spec:
+  subject: prod/payments/ledger
+  grants: [payments-ledger-rw, payments-ledger-other]

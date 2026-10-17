@@ -1,0 +1,34 @@
+{
+  "params": {
+    "tables": {
+      "type": "list",
+      "description": "DynamoDB table names"
+    }
+  },
+  "policy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:GetItem",
+          "dynamodb:Query",
+          "dynamodb:BatchGetItem"
+        ],
+        "Resource": [
+          "arn:aws:dynamodb:*:${account}:table/${tables}"
+        ],
+        "Condition": {
+          "StringEquals": {
+            "aws:ResourceTag/team": "$${aws:PrincipalTag/team}"
+          }
+        }
+      },
+      {
+        "Effect": "Deny",
+        "Action": "dynamodb:DeleteTable",
+        "Resource": "*"
+      }
+    ]
+  }
+}

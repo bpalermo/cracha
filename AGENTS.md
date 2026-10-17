@@ -48,9 +48,13 @@ hand-editing what Gazelle owns.
 ## Layout
 
 - No `cmd/`. Each binary lives in a root-level directory with its `main.go`:
-  `broker/`, `csi/`, `webhook/`.
+  `broker/`, `csi/`, `webhook/`, `grantc/`.
 - Code private to a binary goes under its `internal/`.
 - Code shared between binaries goes under `common/`.
+- `common/grant` is the grant bundle model and compiler (design 6.2): loading,
+  validation, templates, lints, the compiled bundle, signing and publishing.
+- `grantc/` is the grant compiler CLI over `common/grant` (lint, compile,
+  sign, verify, publish); it runs in CI and has no container image.
 - `bazel/` holds build rules; `docs/` the design.
 
 ## Images and versions
