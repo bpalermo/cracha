@@ -1,0 +1,16 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "spicedb",
+    srcs = ["spicedb.go"],
+    embedsrcs = ["schema.zed"],
+    importpath = "github.com/bpalermo/cracha/common/spicedb",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "spicedb_test",
+    srcs = ["spicedb_test.go"],
+    embed = [":spicedb"],
+    deps = ["//common/idenc"],
+)

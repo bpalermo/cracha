@@ -1,0 +1,40 @@
+definition team {}
+
+definition service {
+  relation owner: team
+  relation member: workload
+}
+
+definition workload {
+  relation suspended: team
+  permission is_suspended = suspended
+}
+
+definition aws_account {}
+
+caveat within_window(expires_at timestamp, now timestamp) {
+  now < expires_at
+}
+
+caveat in_clusters(allowed list<string>, cluster string) {
+  cluster in allowed
+}
+
+caveat bounded(expires_at timestamp, now timestamp, allowed list<string>, cluster string) {
+  now < expires_at && cluster in allowed
+}
+
+definition grant {
+  relation account: aws_account
+  relation assignee_service: service | service with within_window | service with in_clusters | service with bounded
+  relation assignee_workload: workload | workload with within_window | workload with in_clusters | workload with bounded
+  permission assume = assignee_service->member + assignee_workload
+}
+
+definition dynamodb_table {
+  relation account: aws_account
+  relation writer: service
+  relation reader: service
+  permission write = writer->member
+  permission read  = write + reader->member
+}
