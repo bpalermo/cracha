@@ -50,7 +50,9 @@ hand-editing what Gazelle owns.
 - No `cmd/`. Each binary lives in a root-level directory with its `main.go`:
   `broker/`, `csi/`, `webhook/`, `grantc/`.
 - Code private to a binary goes under its `internal/`.
-- Code shared between binaries goes under `common/`.
+- Code shared between binaries goes under `common/`. `common/idenc` is the
+  single identity-encoding library (design 4.3): nothing else formats a
+  SourceIdentity or an authorization subject ID.
 - `common/grant` is the grant bundle model and compiler (design 6.2): loading,
   validation, templates, lints, the compiled bundle, signing and publishing.
 - `grantc/` is the grant compiler CLI over `common/grant` (lint, compile,

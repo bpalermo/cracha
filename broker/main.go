@@ -1,24 +1,129 @@
-// Command cracha-broker issues AWS credentials to workloads: it verifies a pod's JWT-SVID, consults the authorization store and assumes a shape role on the workload's behalf (docs/design.md, section 6).
+// Command cracha-broker issues AWS credentials to workloads: it verifies a
+// pod's JWT-SVID, consults the authorization store, composes the session
+// policy from the workload's grants and assumes a shape role on the
+// workload's behalf (docs/design.md, section 6).
 //
-// Nothing is implemented yet; the binary reports its version and exits.
+// This slice wires the static authorization backend and a resolved-grants
+// fixture file; the compiled bundle loader, the cache and revocation come
+// later. Configuration is by flags, each with a CRACHA_* environment
+// fallback (see config.go).
 package main
 
 import (
-	"flag"
+	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/bpalermo/cracha/broker/internal/api"
+	"github.com/bpalermo/cracha/broker/internal/authn"
+	"github.com/bpalermo/cracha/broker/internal/authz/static"
+	"github.com/bpalermo/cracha/broker/internal/grants"
+	"github.com/bpalermo/cracha/broker/internal/issuer"
+	"github.com/bpalermo/cracha/broker/internal/sts"
 	"github.com/bpalermo/cracha/common/version"
 )
 
 func main() {
-	showVersion := flag.Bool("version", false, "print the version and exit")
-	flag.Parse()
-
-	if *showVersion {
+	cfg, err := parseConfig(os.Args[1:], os.LookupEnv, os.Stderr)
+	switch {
+	case errors.Is(err, errVersion):
 		fmt.Printf("cracha-broker %s\n", version.Version)
 		return
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "cracha-broker: %v\n", err)
+		os.Exit(2)
 	}
-	fmt.Fprintln(os.Stderr, "cracha-broker: not implemented")
-	os.Exit(1)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "cracha-broker: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context, cfg config) error {
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(cfg.logLevel)); err != nil {
+		return err
+	}
+	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	slog.SetDefault(log)
+	log.Info("starting", "version", version.Version, "cluster", cfg.cluster, "listen", cfg.listen,
+		"trust_domain_labels", cfg.labels.String(), "plaintext", cfg.insecurePlaintext)
+
+	store, err := static.Load(cfg.assignments)
+	if err != nil {
+		return err
+	}
+	log.Info("loaded assignments", "path", cfg.assignments, "consistency_token", string(store.Token()))
+
+	src, err := grants.LoadFixture(cfg.grantsFixture)
+	if err != nil {
+		return err
+	}
+	log.Info("loaded grants fixture", "path", cfg.grantsFixture, "bundle_version", src.Version(), "grants", src.Names())
+
+	var awsOpts []func(*awsconfig.LoadOptions) error
+	if cfg.awsRegion != "" {
+		awsOpts = append(awsOpts, awsconfig.WithRegion(cfg.awsRegion))
+	}
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsOpts...)
+	if err != nil {
+		return fmt.Errorf("aws config: %w", err)
+	}
+
+	bundles, err := authn.NewWorkloadAPISource(ctx, cfg.workloadAPISocket)
+	if err != nil {
+		return fmt.Errorf("workload api %s: %w", cfg.workloadAPISocket, err)
+	}
+	defer bundles.Close()
+	log.Info("connected to the workload api", "socket", cfg.workloadAPISocket)
+
+	direct := &issuer.Direct{
+		Store:   store,
+		Grants:  src,
+		STS:     sts.NewFromConfig(awsCfg),
+		Labels:  cfg.labels,
+		Cluster: cfg.cluster,
+		Log:     log,
+	}
+	srv := &http.Server{
+		Addr:              cfg.listen,
+		Handler:           api.New(authn.New(bundles), direct, log),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
+		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+
+	errc := make(chan error, 1)
+	go func() {
+		if cfg.insecurePlaintext {
+			log.Warn("serving plaintext HTTP; JWT-SVIDs travel in the clear")
+			errc <- srv.ListenAndServe()
+			return
+		}
+		errc <- srv.ListenAndServeTLS(cfg.tlsCert, cfg.tlsKey)
+	}()
+
+	select {
+	case err := <-errc:
+		return fmt.Errorf("serve: %w", err)
+	case <-ctx.Done():
+	}
+	log.Info("shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return srv.Shutdown(shutdownCtx)
 }

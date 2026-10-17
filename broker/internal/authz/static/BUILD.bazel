@@ -1,0 +1,19 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "static",
+    srcs = ["static.go"],
+    importpath = "github.com/bpalermo/cracha/broker/internal/authz/static",
+    visibility = ["//broker:__subpackages__"],
+    deps = [
+        "//broker/internal/authz",
+        "@in_gopkg_yaml_v3//:yaml_v3",
+    ],
+)
+
+go_test(
+    name = "static_test",
+    srcs = ["static_test.go"],
+    embed = [":static"],
+    deps = ["//broker/internal/authz"],
+)

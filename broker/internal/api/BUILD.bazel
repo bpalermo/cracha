@@ -1,0 +1,28 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "api",
+    srcs = ["api.go"],
+    importpath = "github.com/bpalermo/cracha/broker/internal/api",
+    visibility = ["//broker:__subpackages__"],
+    deps = [
+        "//broker/internal/grants",
+        "//broker/internal/issuer",
+        "//common/idenc",
+    ],
+)
+
+go_test(
+    name = "api_test",
+    srcs = ["api_test.go"],
+    embed = [":api"],
+    deps = [
+        "//broker/internal/authn",
+        "//broker/internal/authn/authntest",
+        "//broker/internal/authz",
+        "//broker/internal/grants",
+        "//broker/internal/issuer",
+        "//broker/internal/sts",
+        "//common/idenc",
+    ],
+)
