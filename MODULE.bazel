@@ -30,8 +30,19 @@ register_toolchains("@helm_toolchains//:all")
 # rules_img and rules_go; declared so a bump of those cannot drop it.
 bazel_dep(name = "bazel_skylib", version = "1.9.2")
 
-# sh_library and sh_test for the scripts under //bazel.
+# sh_library, sh_binary and sh_test for the scripts under //bazel and the
+# tool wrappers in //bazel/cosign.
 bazel_dep(name = "rules_shell", version = "0.8.0")
+
+# The cosign CLI -- only the CLI. @rules_img_signer_cosign//cosign is the
+# official prebuilt release binary, selected per platform, with its sha256
+# pinned in the module's own lock (v3.1.2 at 0.0.1, the only version in the
+# Bazel Central Registry). //bazel/cosign wraps it so the publish workflow and
+# a workstation run the same checksummed cosign; bumping cosign is bumping
+# this bazel_dep (and EXPECTED in //bazel/cosign:version_test). The module's
+# signer plugin for `img deploy` is not used: publishing keeps image_push and
+# a separate `cosign sign`.
+bazel_dep(name = "rules_img_signer_cosign", version = "0.0.1")
 
 # Formatting and the linters that are not part of compiling: //bazel/format
 # formats and checks Starlark (buildifier, with its lint warnings), Go and
