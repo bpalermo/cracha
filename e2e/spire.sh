@@ -55,8 +55,8 @@ for sa in cracha-csi cracha-broker; do
 		-selector "k8s:sa:${sa}"
 done
 
-# The test workloads: client holds a grant (e2e/manifests/cracha-system.yaml,
-# the assignments ConfigMap), unassigned holds none.
+# The test workloads: client holds a grant (e2e/values.yaml, the chart's
+# assignments document), unassigned holds none.
 for sa in client unassigned; do
 	register "spiffe://${trust_domain}/ns/e2e/sa/${sa}" \
 		-parentID "spiffe://${trust_domain}/node" \

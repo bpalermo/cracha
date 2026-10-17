@@ -1,0 +1,52 @@
+# The STS stand-in the broker talks to (e2e/stsstub): a test fixture, not a
+# part of the product, so it is a plain manifest beside the chart. It records
+# every AssumeRole for the tests to read back. The image is the one
+# e2e/run.sh builds from this checkout and loads into the kind node.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cracha-stsstub
+  namespace: cracha-system
+  labels:
+    app.kubernetes.io/name: cracha-stsstub
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cracha-stsstub
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cracha-stsstub
+    spec:
+      containers:
+        - name: stsstub
+          image: localhost/cracha-e2e-stsstub:e2e
+          # Never pull an image loaded from this build: it must be that one.
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cracha-stsstub
+  namespace: cracha-system
+spec:
+  selector:
+    app.kubernetes.io/name: cracha-stsstub
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
