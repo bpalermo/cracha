@@ -96,6 +96,8 @@ Rules:
 - Per-pod JWT-SVID fetch: `FetchJWTSVID` on the **SPIFFE Broker API** served by the SPIRE agent (≥ 1.15.2, `experimental { broker { … } }`). The request carries a `KubernetesObjectReference` with namespace, name and UID. The agent's k8s workload attestor resolves and attests the pod itself, so every selector it can produce works in entries, and sending the UID makes it reject a recycled pod name. Not the Delegated Identity API: that needs hand-built selectors and `hostPID`.
   - cracha-csi is the configured broker: its own workload SVID is the mTLS client certificate the endpoint authorises against the broker `idTemplate`; `allowed_reference_types` = `KubernetesObjectReference` over the Unix socket only; `pod_reference_scope: agent_node`.
   - Access policy `enforced`: the agent runs a SubjectAccessReview with verb `impersonate-via-spire` on the pod, username = cracha-csi's SPIFFE ID, so RBAC bounds which pods it may fetch for. `permissive` only for bring-up.
+  - Verified on SPIRE 1.15 (2026-10-17): `FetchJWTSVID` succeeds for a pod that kubelet has accepted but whose sandbox, IP and containers do not exist yet, which is the state at NodePublishVolume time, and a reference whose UID does not match the pod is refused with `NotFound`. The pod's entry must have reached the agent first: with the controller manager this is the entry-cache reload plus the agent sync interval (seconds), so the first fetch for a new pod is retried.
+  - The JWT-SVID TTL is set by the issuer, not by Crachá: the SPIRE entry's `jwt_svid_ttl` (controller manager `ClusterSPIFFEID.spec.jwtSVIDTTL`) must be at most 5 minutes for the entries cracha-csi fetches, or the token on disk outlives the invariant in section 11. SPIRE's default is 1 hour.
   - Behaviour the adapter must handle: every call needs the `broker.spiffe.io: true` metadata; `NotFound` while the pod is not yet in kubelet's view is benign and retried with backoff; `Unavailable` during agent restarts and before cracha-csi's own SVID lands is retried quietly; JWT fetch is unary, so rotation is cracha-csi's job.
 
 ### 4.3 Identity encodings
@@ -348,12 +350,12 @@ One file, one audience.
 
 1. Read pod UID, namespace, SA from the volume context (kubelet-supplied).
 2. Verify the kubelet-provided bound SA token. Its pod-binding claims must match the volume-context pod UID.
-3. Register the pod. Fetch its JWT-SVID (`aud=cracha-broker`) through the issuer adapter (SPIRE: Broker API `FetchJWTSVID` with a Kubernetes object reference of namespace, name and UID). The issuer refuses pods it cannot resolve and attest on this node. Containers have not started at this point, so only pod-level selectors (namespace, service account, labels) are available; the ID scheme (4) keys on exactly those.
-4. Write the token atomically (write temp + rename).
+3. Register the pod. Fetch its JWT-SVID (`aud=cracha-broker`) through the issuer adapter (SPIRE: Broker API `FetchJWTSVID` with a Kubernetes object reference of namespace, name and UID). The issuer refuses pods it cannot resolve and attest on this node. Containers have not started at this point, so only pod-level selectors (namespace, service account, labels) are available; the ID scheme (4) keys on exactly those. (Verified against SPIRE, see 4.2.)
+4. Write the token atomically (write temp + rename) into the target directory kubelet created. No filesystem is mounted: a tmpfs would need `CAP_SYS_ADMIN`, which 7.7 forbids, so the file lives on the kubelet's volume directory like the SPIFFE CSI driver's does.
 
 Kubelet doesn't start containers until publish succeeds, so a valid token is present before app start.
 
-`requiresRepublish`: on every republish, re-validate the pod and replace the token once less than half its TTL remains. With a 5-minute TTL the file is never older than 2.5 minutes, and the SDK re-reads it at each credential refresh.
+`requiresRepublish`: on every republish, re-validate the pod and replace the token once less than half its TTL remains. The context check is repeated against the API server only when kubelet has rotated the bound SA token; an unchanged token keeps its verdict, so republishing costs no API call in the steady state. With a 5-minute TTL the file is never older than 2.5 minutes, and the SDK re-reads it at each credential refresh.
 
 `NodeUnpublishVolume`: drop the registry entry. No subscriptions or caches exist to clean up.
 
@@ -454,7 +456,6 @@ sequenceDiagram
   - Where the request and approval are recorded, so the decision log can point at an attributable approval, and how break-glass (pre-approved, short expiry, loud audit) differs from planned access.
   - Options: (a) a Git change carrying `expiresAt`, approved through CODEOWNERS and applied by the reconciler. Reuses existing review tooling, no new service, minutes of latency. (b) Integration with an existing access-request or just-in-time tool that calls the `access-approver` writer. Fastest for users, one more integration to secure. (c) A small purpose-built approver (CLI or chat bot). Most flexible, most to build and to harden, since it holds write access to the authorization store.
   - Constraints whichever is chosen: the writer is the only path to a temporary relationship, every relationship carries an expiry, and revocation (6.8) must be able to end it early.
-- Q2: Confirm that the Broker API attests a pod at NodePublishVolume time, before any container has started, with pod-level selectors. Aether only uses it after CNI ADD with running containers.
 
 ## 11. Invariants
 
