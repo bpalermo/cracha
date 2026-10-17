@@ -1,0 +1,37 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "mutate",
+    srcs = [
+        "doc.go",
+        "mutate.go",
+        "plan.go",
+    ],
+    importpath = "github.com/bpalermo/cracha/webhook/internal/mutate",
+    visibility = ["//webhook:__subpackages__"],
+    deps = [
+        "@io_k8s_api//admission/v1:admission",
+        "@io_k8s_api//core/v1:core",
+        "@io_k8s_apimachinery//pkg/api/errors",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_apimachinery//pkg/types",
+    ],
+)
+
+go_test(
+    name = "mutate_test",
+    srcs = ["mutate_test.go"],
+    embed = [":mutate"],
+    deps = [
+        "@com_github_google_go_cmp//cmp",
+        "@in_gopkg_evanphx_json_patch_v4//:json-patch_v4",
+        "@io_k8s_api//admission/v1:admission",
+        "@io_k8s_api//core/v1:core",
+        "@io_k8s_apimachinery//pkg/api/errors",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_apimachinery//pkg/runtime",
+        "@io_k8s_apimachinery//pkg/types",
+        "@io_k8s_client_go//kubernetes/fake",
+        "@io_k8s_client_go//testing",
+    ],
+)

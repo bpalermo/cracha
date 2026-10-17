@@ -7,7 +7,17 @@ go_library(
     srcs = ["main.go"],
     importpath = "github.com/bpalermo/cracha/webhook",
     visibility = ["//visibility:private"],
-    deps = ["//common/version"],
+    deps = [
+        "//common/version",
+        "//webhook/internal/mutate",
+        "//webhook/internal/sacache",
+        "//webhook/internal/server",
+        "@com_github_go_logr_logr//:logr",
+        "@io_k8s_client_go//kubernetes",
+        "@io_k8s_client_go//rest",
+        "@io_k8s_client_go//tools/clientcmd",
+        "@io_k8s_klog_v2//:klog",
+    ],
 )
 
 go_binary(
