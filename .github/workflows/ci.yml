@@ -73,16 +73,26 @@ jobs:
             exit 1
           fi
 
-      # The image targets are built by `build` whenever they are impacted;
-      # naming them here keeps a rename or a removal from passing CI and
-      # failing on the first publish. A query, not a build: it fails on a
-      # label that does not exist and costs nothing else.
-      - name: the image targets exist
+      # The registry is one setting, bazel/registry.bzl; a literal anywhere
+      # else would survive a move and keep pointing at the old registry. A
+      # `git grep` over the tracked tree, which no Bazel test can see, so it
+      # runs here and //bazel:check_registry_config_test covers its decision.
+      - name: The registry is spelled out in one place
+        run: bazel/check-registry-config.sh
+
+      # Everything publish.yml builds is built by `build` whenever it is
+      # impacted; naming it here keeps a rename or a removal from passing CI
+      # and failing on the first publish. A query, not a build: it fails on a
+      # label that does not exist and costs nothing else. Keep this list equal
+      # to the build step of publish.yml.
+      - name: the publish targets exist
         run: |
           bazel query --config=ci --noshow_progress 'set(
             //broker:image_push //broker:image_index
             //csi:image_push //csi:image_index
-            //webhook:image_push //webhook:image_index)'
+            //webhook:image_push //webhook:image_index
+            //charts/cracha:cracha //charts/cracha:cracha.push_registry
+            //bazel/cosign:cosign //bazel/cosign:verify_image)'
 
   # Target determination. bazel-diff hashes the build graph at the base and at
   # the head of the range under test and reports the targets whose hash

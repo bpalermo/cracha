@@ -15,9 +15,13 @@ load("//bazel:registry.bzl", "chart_push_url", "chart_registry_url", "image_refe
 # chart_push_url() lands it in chart_registry_url("cracha"), since helm
 # appends the chart's `name:` and the chart is named after its repository.
 # Run it with HELM_REGISTRY_USERNAME and HELM_REGISTRY_PASSWORD set
-# (rules_helm logs in with them), after the images it pins have been pushed.
-# Never use :cracha.push, which pushes the images too. There is no publish
-# workflow yet.
+# (rules_helm logs in with them), after the images it pins have been pushed,
+# which is what .github/workflows/publish.yml does. Never use :cracha.push,
+# which pushes the images too.
+
+# values.yaml is read by //bazel:check_registry_config_test, which asserts
+# that every image default in it is derived from its image_push target.
+exports_files(["values.yaml"])
 
 # The components whose images the chart deploys, as bazel/registry.bzl names
 # them. Keep in step with `images` below.
