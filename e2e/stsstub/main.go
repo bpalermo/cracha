@@ -115,91 +115,25 @@ type errorResponse struct {
 }
 
 func main() {
-	listen := flag.String("listen", ":8080", "address to listen on")
-	flag.Parse()
-
-	rec := &recorder{}
-	var seq uint64
-	var seqMu sync.Mutex
-	next := func() uint64 {
-		seqMu.Lock()
-		defer seqMu.Unlock()
-		seq++
-		return seq
+	listen := parseFlags()
+	srv := &http.Server{Addr: listen, Handler: newStub().handler(), ReadHeaderTimeout: 5 * time.Second}
+	log.Printf("stsstub listening on %s", listen)
+	if err := serve(srv); err != nil {
+		fmt.Fprintf(os.Stderr, "stsstub: %v\n", err)
+		os.Exit(1)
 	}
+}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("ok\n"))
-	})
-	mux.HandleFunc("GET /requests", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(rec.list())
-	})
-	mux.HandleFunc("DELETE /requests", func(w http.ResponseWriter, _ *http.Request) {
-		rec.reset()
-		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("POST /", func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
-			writeError(w, http.StatusBadRequest, "MalformedInput", err.Error())
-			return
-		}
-		form := map[string]string{}
-		for k, v := range r.PostForm {
-			form[k] = strings.Join(v, ",")
-		}
-		action := form["Action"]
-		if action != "AssumeRole" {
-			writeError(w, http.StatusBadRequest, "InvalidAction", fmt.Sprintf("the stub only serves AssumeRole, not %q", action))
-			return
-		}
-		req := Request{
-			Received:        time.Now().UTC(),
-			Action:          action,
-			RoleArn:         form["RoleArn"],
-			RoleSessionName: form["RoleSessionName"],
-			SourceIdentity:  form["SourceIdentity"],
-			Policy:          form["Policy"],
-			PolicyArns:      members(form, "PolicyArns", "arn"),
-			Tags:            tags(form),
-			Form:            form,
-		}
-		req.TransitiveTagKeys = members(form, "TransitiveTagKeys", "")
-		req.DurationSeconds = 3600
-		if d := form["DurationSeconds"]; d != "" {
-			n, err := strconv.Atoi(d)
-			if err != nil {
-				writeError(w, http.StatusBadRequest, "ValidationError", "DurationSeconds: "+err.Error())
-				return
-			}
-			req.DurationSeconds = n
-		}
-		if req.RoleArn == "" || req.RoleSessionName == "" {
-			writeError(w, http.StatusBadRequest, "ValidationError", "RoleArn and RoleSessionName are required")
-			return
-		}
-		rec.add(req)
-		n := next()
-		log.Printf("AssumeRole #%d role=%s session=%s source_identity=%s tags=%v policy_bytes=%d",
-			n, req.RoleArn, req.RoleSessionName, req.SourceIdentity, req.Tags, len(req.Policy))
+// parseFlags reads the command line: the address to listen on.
+func parseFlags() (listen string) {
+	flag.StringVar(&listen, "listen", ":8080", "address to listen on")
+	flag.Parse()
+	return listen
+}
 
-		var resp AssumeRoleResponse
-		resp.Result.Credentials.AccessKeyID = AccessKeyID
-		resp.Result.Credentials.SecretAccessKey = SecretAccessKey
-		resp.Result.Credentials.SessionToken = fmt.Sprintf("%s-%d", SessionToken, n)
-		resp.Result.Credentials.Expiration = req.Received.Add(time.Duration(req.DurationSeconds) * time.Second).Format(time.RFC3339)
-		resp.Result.AssumedRoleUser.AssumedRoleID = "AROACRACHAE2ESTUB000:" + req.RoleSessionName
-		resp.Result.AssumedRoleUser.Arn = assumedRoleArn(req.RoleArn, req.RoleSessionName)
-		resp.Result.SourceIdentity = req.SourceIdentity
-		resp.Result.PackedPolicySize = len(req.Policy) / 32
-		resp.ResponseMetadata.RequestID = fmt.Sprintf("stub-%d", n)
-		w.Header().Set("Content-Type", "text/xml")
-		_, _ = w.Write([]byte(xml.Header))
-		_ = xml.NewEncoder(w).Encode(resp)
-	})
-
-	srv := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+// serve runs srv until SIGINT or SIGTERM, then gives it 5 seconds to drain.
+// A server that was stopped this way is not an error.
+func serve(srv *http.Server) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go func() {
@@ -208,11 +142,140 @@ func main() {
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
-	log.Printf("stsstub listening on %s", *listen)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		fmt.Fprintf(os.Stderr, "stsstub: %v\n", err)
-		os.Exit(1)
+		return err
 	}
+	return nil
+}
+
+// stub is the server's state: the recording, and the sequence that numbers
+// each AssumeRole in its session token and request ID.
+type stub struct {
+	rec   recorder
+	seqMu sync.Mutex
+	seq   uint64
+}
+
+func newStub() *stub {
+	return &stub{}
+}
+
+// next numbers an AssumeRole, from 1.
+func (s *stub) next() uint64 {
+	s.seqMu.Lock()
+	defer s.seqMu.Unlock()
+	s.seq++
+	return s.seq
+}
+
+// handler routes the stub's endpoints: the health check, the recording's
+// read and reset, and the STS query API itself.
+func (s *stub) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", healthz)
+	mux.HandleFunc("GET /requests", s.listRequests)
+	mux.HandleFunc("DELETE /requests", s.resetRequests)
+	mux.HandleFunc("POST /", s.assumeRole)
+	return mux
+}
+
+func healthz(w http.ResponseWriter, _ *http.Request) {
+	_, _ = w.Write([]byte("ok\n"))
+}
+
+func (s *stub) listRequests(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.rec.list())
+}
+
+func (s *stub) resetRequests(w http.ResponseWriter, _ *http.Request) {
+	s.rec.reset()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// assumeRole serves the STS query API: an AssumeRole is recorded, numbered
+// and answered with the fixed credentials; anything else is refused the way
+// STS refuses it.
+func (s *stub) assumeRole(w http.ResponseWriter, r *http.Request) {
+	req, refusal := parseAssumeRole(r)
+	if refusal != nil {
+		writeError(w, refusal.status, refusal.code, refusal.message)
+		return
+	}
+	s.rec.add(req)
+	n := s.next()
+	log.Printf("AssumeRole #%d role=%s session=%s source_identity=%s tags=%v policy_bytes=%d",
+		n, req.RoleArn, req.RoleSessionName, req.SourceIdentity, req.Tags, len(req.Policy))
+	w.Header().Set("Content-Type", "text/xml")
+	_, _ = w.Write([]byte(xml.Header))
+	_ = xml.NewEncoder(w).Encode(assumeRoleResponse(req, n))
+}
+
+// refusal is a query-protocol error answer: the HTTP status and the Sender
+// error's code and message.
+type refusal struct {
+	status  int
+	code    string
+	message string
+}
+
+// parseAssumeRole decodes the form of an AssumeRole as the broker sends it.
+// It refuses a form that does not parse, an action other than AssumeRole, a
+// DurationSeconds that is not a number, and a request without RoleArn or
+// RoleSessionName, in that order.
+func parseAssumeRole(r *http.Request) (Request, *refusal) {
+	if err := r.ParseForm(); err != nil {
+		return Request{}, &refusal{http.StatusBadRequest, "MalformedInput", err.Error()}
+	}
+	form := map[string]string{}
+	for k, v := range r.PostForm {
+		form[k] = strings.Join(v, ",")
+	}
+	action := form["Action"]
+	if action != "AssumeRole" {
+		return Request{}, &refusal{http.StatusBadRequest, "InvalidAction", fmt.Sprintf("the stub only serves AssumeRole, not %q", action)}
+	}
+	req := Request{
+		Received:        time.Now().UTC(),
+		Action:          action,
+		RoleArn:         form["RoleArn"],
+		RoleSessionName: form["RoleSessionName"],
+		SourceIdentity:  form["SourceIdentity"],
+		Policy:          form["Policy"],
+		PolicyArns:      members(form, "PolicyArns", "arn"),
+		Tags:            tags(form),
+		Form:            form,
+	}
+	req.TransitiveTagKeys = members(form, "TransitiveTagKeys", "")
+	req.DurationSeconds = 3600
+	if d := form["DurationSeconds"]; d != "" {
+		n, err := strconv.Atoi(d)
+		if err != nil {
+			return Request{}, &refusal{http.StatusBadRequest, "ValidationError", "DurationSeconds: " + err.Error()}
+		}
+		req.DurationSeconds = n
+	}
+	if req.RoleArn == "" || req.RoleSessionName == "" {
+		return Request{}, &refusal{http.StatusBadRequest, "ValidationError", "RoleArn and RoleSessionName are required"}
+	}
+	return req, nil
+}
+
+// assumeRoleResponse is the answer to req, the n-th AssumeRole served: the
+// fixed credentials, expiring DurationSeconds after the request was
+// received, under a session token and request ID that carry n.
+func assumeRoleResponse(req Request, n uint64) AssumeRoleResponse {
+	var resp AssumeRoleResponse
+	resp.Result.Credentials.AccessKeyID = AccessKeyID
+	resp.Result.Credentials.SecretAccessKey = SecretAccessKey
+	resp.Result.Credentials.SessionToken = fmt.Sprintf("%s-%d", SessionToken, n)
+	resp.Result.Credentials.Expiration = req.Received.Add(time.Duration(req.DurationSeconds) * time.Second).Format(time.RFC3339)
+	resp.Result.AssumedRoleUser.AssumedRoleID = "AROACRACHAE2ESTUB000:" + req.RoleSessionName
+	resp.Result.AssumedRoleUser.Arn = assumedRoleArn(req.RoleArn, req.RoleSessionName)
+	resp.Result.SourceIdentity = req.SourceIdentity
+	resp.Result.PackedPolicySize = len(req.Policy) / 32
+	resp.ResponseMetadata.RequestID = fmt.Sprintf("stub-%d", n)
+	return resp
 }
 
 // assumedRoleArn turns arn:aws:iam::ACCOUNT:role/PATH/NAME into

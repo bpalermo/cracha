@@ -83,57 +83,87 @@ func Parse(token string) (*Claims, error) {
 	if len(parts) != 3 {
 		return nil, errors.New("the token is not a JWS compact serialization")
 	}
+	if err := checkHeader(parts[0]); err != nil {
+		return nil, err
+	}
+	var payload rawClaims
+	if err := decodeSegment(parts[1], &payload); err != nil {
+		return nil, fmt.Errorf("the token's claims: %w", err)
+	}
+	return payload.claims()
+}
+
+// checkHeader decodes the JOSE header and checks that it announces a signed
+// JWT: an algorithm that is not none and, when it names one, a type of JWT
+// or JOSE.
+func checkHeader(segment string) error {
 	var header struct {
 		Alg string `json:"alg"`
 		Typ string `json:"typ"`
 	}
-	if err := decodeSegment(parts[0], &header); err != nil {
-		return nil, fmt.Errorf("the token's header: %w", err)
+	if err := decodeSegment(segment, &header); err != nil {
+		return fmt.Errorf("the token's header: %w", err)
 	}
 	if header.Alg == "" || strings.EqualFold(header.Alg, "none") {
-		return nil, fmt.Errorf("the token's algorithm %q is not a signature", header.Alg)
+		return fmt.Errorf("the token's algorithm %q is not a signature", header.Alg)
 	}
 	if header.Typ != "" && header.Typ != "JWT" && header.Typ != "JOSE" {
-		return nil, fmt.Errorf("the token's type %q is neither JWT nor JOSE", header.Typ)
+		return fmt.Errorf("the token's type %q is neither JWT nor JOSE", header.Typ)
 	}
-	var payload struct {
-		Sub string          `json:"sub"`
-		Aud json.RawMessage `json:"aud"`
-		Exp json.Number     `json:"exp"`
-		Iat json.Number     `json:"iat"`
-	}
-	if err := decodeSegment(parts[1], &payload); err != nil {
-		return nil, fmt.Errorf("the token's claims: %w", err)
-	}
-	if payload.Sub == "" {
+	return nil
+}
+
+// rawClaims is the payload as decoded, before any claim is checked.
+type rawClaims struct {
+	Sub string          `json:"sub"`
+	Aud json.RawMessage `json:"aud"`
+	Exp json.Number     `json:"exp"`
+	Iat json.Number     `json:"iat"`
+}
+
+// claims checks the claims Parse requires and reads the rest: the subject,
+// then the times, then the audience.
+func (r *rawClaims) claims() (*Claims, error) {
+	if r.Sub == "" {
 		return nil, errors.New("the token has no sub claim")
 	}
-	id, err := spiffeid.FromString(payload.Sub)
+	id, err := spiffeid.FromString(r.Sub)
 	if err != nil {
 		return nil, fmt.Errorf("the token's sub claim is not a SPIFFE ID: %w", err)
 	}
-	if payload.Exp == "" {
+	if r.Exp == "" {
 		return nil, errors.New("the token has no exp claim")
 	}
 	c := &Claims{ID: id}
-	if c.Expiry, err = claimTime(payload.Exp); err != nil {
+	if c.Expiry, err = claimTime(r.Exp); err != nil {
 		return nil, fmt.Errorf("the token's exp claim: %w", err)
 	}
-	if payload.Iat != "" {
-		if c.IssuedAt, err = claimTime(payload.Iat); err != nil {
+	if r.Iat != "" {
+		if c.IssuedAt, err = claimTime(r.Iat); err != nil {
 			return nil, fmt.Errorf("the token's iat claim: %w", err)
 		}
 	}
-	if len(payload.Aud) > 0 {
-		// RFC 7519: a string, or an array of strings.
-		var one string
-		if err := json.Unmarshal(payload.Aud, &one); err == nil {
-			c.Audience = []string{one}
-		} else if err := json.Unmarshal(payload.Aud, &c.Audience); err != nil {
-			return nil, errors.New("the token's aud claim is neither a string nor an array of strings")
-		}
+	if c.Audience, err = audience(r.Aud); err != nil {
+		return nil, err
 	}
 	return c, nil
+}
+
+// audience reads an aud claim, which RFC 7519 allows to be a string or an
+// array of strings. A token without one has no audience.
+func audience(raw json.RawMessage) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var one string
+	if err := json.Unmarshal(raw, &one); err == nil {
+		return []string{one}, nil
+	}
+	var many []string
+	if err := json.Unmarshal(raw, &many); err != nil {
+		return nil, errors.New("the token's aud claim is neither a string nor an array of strings")
+	}
+	return many, nil
 }
 
 // decodeSegment base64url-decodes a JWS segment into a JSON value.

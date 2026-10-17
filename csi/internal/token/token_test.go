@@ -1,9 +1,12 @@
 package token
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +47,9 @@ func TestValidateAccepts(t *testing.T) {
 }
 
 func TestValidateRejects(t *testing.T) {
+	// A TTL rejection must name the fix (jwtSVIDTTL), which the ttl cases
+	// assert through want.
+	const namesFix = "jwtSVIDTTL"
 	cases := []struct {
 		name   string
 		mutate func(*jwttest.Claims)
@@ -58,10 +64,10 @@ func TestValidateRejects(t *testing.T) {
 		{name: "other service account", mutate: func(c *jwttest.Claims) { c.Subject = "spiffe://example.org/ns/team-a/sa/db" }, exp: want, want: "subject"},
 		{name: "not the scheme", mutate: func(c *jwttest.Claims) { c.Subject = "spiffe://example.org/team-a/web" }, exp: want, want: "subject"},
 		{name: "expired", mutate: func(c *jwttest.Claims) { c.Expiry = now.Add(-time.Second) }, exp: want, want: "expired"},
-		{name: "one hour TTL", mutate: func(c *jwttest.Claims) { c.Expiry = c.IssuedAt.Add(time.Hour) }, exp: want, ttl: true},
-		{name: "a second over", mutate: func(c *jwttest.Claims) { c.Expiry = c.IssuedAt.Add(5*time.Minute + time.Second) }, exp: want, ttl: true},
-		{name: "no iat, long exp", mutate: func(c *jwttest.Claims) { c.IssuedAt = time.Time{}; c.Expiry = now.Add(6 * time.Minute) }, exp: want, ttl: true},
-		{name: "lower max TTL", mutate: func(*jwttest.Claims) {}, exp: func() Expectation { e := want; e.MaxTTL = time.Minute; return e }(), ttl: true},
+		{name: "one hour TTL", mutate: func(c *jwttest.Claims) { c.Expiry = c.IssuedAt.Add(time.Hour) }, exp: want, ttl: true, want: namesFix},
+		{name: "a second over", mutate: func(c *jwttest.Claims) { c.Expiry = c.IssuedAt.Add(5*time.Minute + time.Second) }, exp: want, ttl: true, want: namesFix},
+		{name: "no iat, long exp", mutate: func(c *jwttest.Claims) { c.IssuedAt = time.Time{}; c.Expiry = now.Add(6 * time.Minute) }, exp: want, ttl: true, want: namesFix},
+		{name: "lower max TTL", mutate: func(*jwttest.Claims) {}, exp: func() Expectation { e := want; e.MaxTTL = time.Minute; return e }(), ttl: true, want: namesFix},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -74,12 +80,6 @@ func TestValidateRejects(t *testing.T) {
 			var ttlErr *TTLError
 			if isTTL := errors.As(err, &ttlErr); isTTL != tc.ttl {
 				t.Fatalf("TTLError=%v, want %v: %v", isTTL, tc.ttl, err)
-			}
-			if tc.ttl {
-				if !strings.Contains(err.Error(), "jwtSVIDTTL") {
-					t.Errorf("a TTL rejection must name the fix, got: %v", err)
-				}
-				return
 			}
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("error %q does not mention %q", err, tc.want)
@@ -115,6 +115,94 @@ func TestParseRejectsGarbage(t *testing.T) {
 		if _, err := Parse(tok); err == nil {
 			t.Errorf("Parse(%q) accepted", tok)
 		}
+	}
+}
+
+// segment is a JWS segment: v as JSON, base64url without padding.
+func segment(v any) string {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// mint is jwttest.MintRaw with the header given, for the header checks.
+func mint(header, payload map[string]any) string {
+	return segment(header) + "." + segment(payload) + "." + base64.RawURLEncoding.EncodeToString([]byte("not a signature"))
+}
+
+func TestParseRejects(t *testing.T) {
+	exp := now.Add(time.Minute).Unix()
+	claims := map[string]any{"sub": subject, "aud": []string{"cracha-broker"}, "exp": exp}
+	signed := map[string]any{"alg": "ES256", "typ": "JWT"}
+	cases := []struct {
+		name  string
+		token string
+		want  string // a substring of the rejection
+	}{
+		{name: "four segments", token: mint(signed, claims) + ".extra", want: "JWS compact serialization"},
+		{name: "header not base64url", token: "!!!." + segment(claims) + ".sig", want: "the token's header: not base64url"},
+		{name: "header not JSON", token: segment("nope") + "." + segment(claims) + ".sig", want: "the token's header: not JSON"},
+		{name: "alg none", token: mint(map[string]any{"alg": "none", "typ": "JWT"}, claims), want: `algorithm "none" is not a signature`},
+		{name: "alg None", token: mint(map[string]any{"alg": "None", "typ": "JWT"}, claims), want: `algorithm "None" is not a signature`},
+		{name: "no alg", token: mint(map[string]any{"typ": "JWT"}, claims), want: `algorithm "" is not a signature`},
+		{name: "typ neither JWT nor JOSE", token: mint(map[string]any{"alg": "ES256", "typ": "at+jwt"}, claims), want: `type "at+jwt" is neither JWT nor JOSE`},
+		{name: "claims not base64url", token: segment(signed) + ".!!!.sig", want: "the token's claims: not base64url"},
+		{name: "claims not JSON", token: segment(signed) + "." + segment("nope") + ".sig", want: "the token's claims: not JSON"},
+		{name: "aud neither string nor array", token: jwttest.MintRaw(map[string]any{"sub": subject, "aud": 42, "exp": exp}), want: "aud claim is neither a string nor an array of strings"},
+		{name: "aud array of numbers", token: jwttest.MintRaw(map[string]any{"sub": subject, "aud": []int{1}, "exp": exp}), want: "aud claim is neither a string nor an array of strings"},
+		{name: "exp out of range", token: jwttest.MintRaw(map[string]any{"sub": subject, "exp": json.Number("1e999")}), want: "the token's exp claim"},
+		{name: "iat out of range", token: jwttest.MintRaw(map[string]any{"sub": subject, "exp": exp, "iat": json.Number("1e999")}), want: "the token's iat claim"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(tc.token)
+			if err == nil {
+				t.Fatal("accepted")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseHeaderTypes(t *testing.T) {
+	claims := map[string]any{"sub": subject, "aud": []string{"cracha-broker"}, "exp": now.Add(time.Minute).Unix()}
+	for _, header := range []map[string]any{
+		{"alg": "ES256", "typ": "JWT"},
+		{"alg": "ES256", "typ": "JOSE"},
+		{"alg": "RS256"},
+	} {
+		if _, err := Parse(mint(header, claims)); err != nil {
+			t.Errorf("Parse with the header %v: %v", header, err)
+		}
+	}
+}
+
+func TestParseAudience(t *testing.T) {
+	exp := now.Add(time.Minute).Unix()
+	cases := []struct {
+		name    string
+		payload map[string]any
+		want    []string
+	}{
+		{name: "a string", payload: map[string]any{"sub": subject, "aud": "cracha-broker", "exp": exp}, want: []string{"cracha-broker"}},
+		{name: "an array", payload: map[string]any{"sub": subject, "aud": []string{"cracha-broker", "other"}, "exp": exp}, want: []string{"cracha-broker", "other"}},
+		{name: "an empty array", payload: map[string]any{"sub": subject, "aud": []string{}, "exp": exp}, want: nil},
+		{name: "absent", payload: map[string]any{"sub": subject, "exp": exp}, want: nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := Parse(jwttest.MintRaw(tc.payload))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(c.Audience, tc.want) {
+				t.Errorf("Audience %q, want %q", c.Audience, tc.want)
+			}
+		})
 	}
 }
 

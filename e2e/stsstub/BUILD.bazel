@@ -1,4 +1,4 @@
-load("@rules_go//go:def.bzl", "go_binary", "go_library")
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 load("//bazel/image:defs.bzl", "go_image")
 
 go_library(
@@ -25,4 +25,10 @@ go_image(
     binary = ":stsstub",
     load_tag = "localhost/cracha-e2e-stsstub:e2e",
     path = "/stsstub",
+)
+
+go_test(
+    name = "stsstub_test",
+    srcs = ["main_test.go"],
+    embed = [":stsstub_lib"],
 )
