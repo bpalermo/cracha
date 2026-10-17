@@ -231,26 +231,30 @@ func TestForbidden(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			token := f.issuer.ValidToken(t, "spiffe://example.org/ns/payments/sa/"+tt.sa)
 			for _, path := range []string{"/v1/credentials", "/v1/grants"} {
-				rec := f.get(t, path, token)
-				if rec.Code != http.StatusForbidden {
-					t.Errorf("%s: status %d: %s", path, rec.Code, rec.Body.String())
-				}
-				if r := reason(t, rec); r != tt.reason {
-					t.Errorf("%s: reason %q, want %q", path, r, tt.reason)
-				}
+				f.expectForbidden(t, path, token, tt.reason)
 			}
 		})
 	}
 	t.Run("subject_suspended", func(t *testing.T) {
 		f.store.err = authz.ErrSubjectSuspended
 		defer func() { f.store.err = nil }()
-		rec := f.get(t, "/v1/credentials", f.issuer.ValidToken(t, subject))
-		if rec.Code != http.StatusForbidden || reason(t, rec) != "subject_suspended" {
-			t.Errorf("status %d: %s", rec.Code, rec.Body.String())
-		}
+		f.expectForbidden(t, "/v1/credentials", f.issuer.ValidToken(t, subject), "subject_suspended")
 	})
 	if f.sts.calls != 0 {
 		t.Errorf("sts called %d times on denials", f.sts.calls)
+	}
+}
+
+// expectForbidden gets path with the token and checks for a 403 with the
+// reason.
+func (f *fixture) expectForbidden(t *testing.T, path, token, want string) {
+	t.Helper()
+	rec := f.get(t, path, token)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("%s: status %d: %s", path, rec.Code, rec.Body.String())
+	}
+	if r := reason(t, rec); r != want {
+		t.Errorf("%s: reason %q, want %q", path, r, want)
 	}
 }
 

@@ -112,19 +112,26 @@ func TestListGrants(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !reflect.DeepEqual(d.Grants, tt.grants) {
-				t.Errorf("grants %v, want %v", d.Grants, tt.grants)
-			}
-			if !reflect.DeepEqual(d.Tags, tt.tags) {
-				t.Errorf("tags %v, want %v", d.Tags, tt.tags)
-			}
-			if d.Token != s.Token() || d.Token == "" {
-				t.Errorf("token %q, store %q", d.Token, s.Token())
-			}
-			if len(d.Trace) == 0 {
-				t.Error("no trace")
-			}
+			checkDecision(t, s, d, tt.grants, tt.tags)
 		})
+	}
+}
+
+// checkDecision checks a decision's grants and tags, that it carries the
+// store's token, and that it explains itself.
+func checkDecision(t *testing.T, s *Store, d authz.Decision, grants []string, tags map[string]string) {
+	t.Helper()
+	if !reflect.DeepEqual(d.Grants, grants) {
+		t.Errorf("grants %v, want %v", d.Grants, grants)
+	}
+	if !reflect.DeepEqual(d.Tags, tags) {
+		t.Errorf("tags %v, want %v", d.Tags, tags)
+	}
+	if d.Token != s.Token() || d.Token == "" {
+		t.Errorf("token %q, store %q", d.Token, s.Token())
+	}
+	if len(d.Trace) == 0 {
+		t.Error("no trace")
 	}
 }
 

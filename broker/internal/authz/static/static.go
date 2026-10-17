@@ -131,44 +131,71 @@ func New(f File, token authz.Token, opts ...Option) (*Store, error) {
 	for _, o := range opts {
 		o(s)
 	}
-	for i, svc := range f.Services {
+	if err := s.addServices(f.Services); err != nil {
+		return nil, err
+	}
+	if err := s.addWorkloads(f.Workloads); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// addServices loads the services section: every member of a service takes
+// its name and team as tags and its grants as assignments.
+func (s *Store) addServices(services []Service) error {
+	for i, svc := range services {
 		if svc.Name == "" {
-			return nil, fmt.Errorf("services[%d]: name is required", i)
+			return fmt.Errorf("services[%d]: name is required", i)
 		}
 		as, err := convert(svc.Grants, "service "+svc.Name)
 		if err != nil {
-			return nil, fmt.Errorf("service %q: %w", svc.Name, err)
+			return fmt.Errorf("service %q: %w", svc.Name, err)
 		}
 		for _, member := range svc.Members {
-			if member == "" {
-				return nil, fmt.Errorf("service %q: empty member", svc.Name)
+			if err := s.addMember(svc, member, as); err != nil {
+				return err
 			}
-			w := s.workload(member)
-			if w.service != "" {
-				return nil, fmt.Errorf("workload %q is a member of services %q and %q; at most one is allowed", member, w.service, svc.Name)
-			}
-			w.service, w.team = svc.Name, svc.Team
-			w.assignments = append(w.assignments, as...)
 		}
 	}
+	return nil
+}
+
+// addMember enrols one member in a service. A workload is a member of at
+// most one service.
+func (s *Store) addMember(svc Service, member string, as []assignment) error {
+	if member == "" {
+		return fmt.Errorf("service %q: empty member", svc.Name)
+	}
+	w := s.workload(member)
+	if w.service != "" {
+		return fmt.Errorf("workload %q is a member of services %q and %q; at most one is allowed", member, w.service, svc.Name)
+	}
+	w.service, w.team = svc.Name, svc.Team
+	w.assignments = append(w.assignments, as...)
+	return nil
+}
+
+// addWorkloads loads the workloads section: direct assignments and the
+// suspension flag, each subject listed at most once.
+func (s *Store) addWorkloads(workloads []Workload) error {
 	seen := map[string]bool{}
-	for i, wl := range f.Workloads {
+	for i, wl := range workloads {
 		if wl.Subject == "" {
-			return nil, fmt.Errorf("workloads[%d]: subject is required", i)
+			return fmt.Errorf("workloads[%d]: subject is required", i)
 		}
 		if seen[wl.Subject] {
-			return nil, fmt.Errorf("workload %q listed twice", wl.Subject)
+			return fmt.Errorf("workload %q listed twice", wl.Subject)
 		}
 		seen[wl.Subject] = true
 		as, err := convert(wl.Grants, "workload")
 		if err != nil {
-			return nil, fmt.Errorf("workload %q: %w", wl.Subject, err)
+			return fmt.Errorf("workload %q: %w", wl.Subject, err)
 		}
 		w := s.workload(wl.Subject)
 		w.suspended = wl.Suspended
 		w.assignments = append(w.assignments, as...)
 	}
-	return s, nil
+	return nil
 }
 
 func (s *Store) workload(subject string) *workload {
