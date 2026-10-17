@@ -273,9 +273,11 @@ csi:
   # retries the mount itself after that).
   publishDeadline: 30s
 
-  # The owner of the token file in each pod's volume. The file is 0640, so a
-  # container that does not run as this uid or gid cannot read it. 0 is root;
-  # -1 keeps the plugin's own.
+  # The owner of the token file in each pod's volume. The file is 0640, and
+  # its group is the pod's fsGroup whenever the pod sets one: that is how a
+  # non-root workload reads it, so set securityContext.fsGroup on pods. These
+  # two are the fallback for a pod without an fsGroup, which then reads the
+  # file only as this uid or gid. 0 is root; -1 keeps the plugin's own.
   tokenUid: 0
   tokenGid: 0
 

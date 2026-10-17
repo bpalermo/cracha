@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -213,18 +214,18 @@ func TestWriteAtomic(t *testing.T) {
 	if err := Write(dir, "first", owner); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	checkToken(t, dir, "first")
+	checkToken(t, dir, "first", owner)
 
 	if err := Write(dir, "second", owner); err != nil {
 		t.Fatalf("Write over an existing token: %v", err)
 	}
-	checkToken(t, dir, "second")
+	checkToken(t, dir, "second", owner)
 
 	// Leave the owner alone: the process's own IDs result either way.
 	if err := Write(dir, "third", Owner{UID: -1, GID: -1}); err != nil {
 		t.Fatalf("Write without chown: %v", err)
 	}
-	checkToken(t, dir, "third")
+	checkToken(t, dir, "third", owner)
 
 	if err := Remove(dir); err != nil {
 		t.Fatalf("Remove: %v", err)
@@ -237,7 +238,56 @@ func TestWriteAtomic(t *testing.T) {
 	}
 }
 
-func checkToken(t *testing.T, dir, want string) {
+// The group of the file and of its directory follow the owner given: a
+// pod's fsGroup on the node. A later write with another group moves both.
+func TestWriteGroup(t *testing.T) {
+	gid := otherGroup(t)
+	dir := filepath.Join(t.TempDir(), "mount")
+
+	// The group alone: the uid stays the process's.
+	if err := Write(dir, "first", Owner{UID: -1, GID: gid}); err != nil {
+		t.Fatalf("Write with group %d: %v", gid, err)
+	}
+	checkToken(t, dir, "first", Owner{UID: os.Getuid(), GID: gid})
+
+	// Back to the primary group: the directory follows.
+	own := Owner{UID: os.Getuid(), GID: os.Getgid()}
+	if err := Write(dir, "second", own); err != nil {
+		t.Fatalf("Write back to the primary group: %v", err)
+	}
+	checkToken(t, dir, "second", own)
+}
+
+// otherGroup returns a group the process is a member of other than its
+// primary one, which it may give a file without CAP_CHOWN. It skips the test
+// when there is none it can use: a sandbox with a user namespace maps the
+// supplementary groups to the overflow group, which cannot own a file.
+func otherGroup(t *testing.T) int {
+	t.Helper()
+	groups, err := os.Getgroups()
+	if err != nil {
+		t.Fatalf("Getgroups: %v", err)
+	}
+	probe := filepath.Join(t.TempDir(), "probe")
+	if err := os.WriteFile(probe, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var refused []string
+	for _, g := range groups {
+		if g == os.Getgid() {
+			continue
+		}
+		if err := os.Chown(probe, -1, g); err != nil {
+			refused = append(refused, err.Error())
+			continue
+		}
+		return g
+	}
+	t.Skipf("skipping the group change: no group of this process but its primary one (%d) may own a file here: %v", os.Getgid(), refused)
+	return -1
+}
+
+func checkToken(t *testing.T, dir, want string, owner Owner) {
 	t.Helper()
 	got, err := os.ReadFile(filepath.Join(dir, FileName))
 	if err != nil {
@@ -246,18 +296,32 @@ func checkToken(t *testing.T, dir, want string) {
 	if string(got) != want {
 		t.Errorf("token %q, want %q", got, want)
 	}
-	fi, err := os.Stat(filepath.Join(dir, FileName))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fi.Mode().Perm() != Mode {
-		t.Errorf("mode %o, want %o", fi.Mode().Perm(), Mode)
-	}
+	checkOwner(t, filepath.Join(dir, FileName), Mode, owner)
+	checkOwner(t, dir, DirMode, owner)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(entries) != 1 {
 		t.Errorf("the directory holds %d entries, want only the token", len(entries))
+	}
+}
+
+// checkOwner asserts the mode and the owner of path.
+func checkOwner(t *testing.T, path string, mode os.FileMode, owner Owner) {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != mode {
+		t.Errorf("%s: mode %o, want %o", path, fi.Mode().Perm(), mode)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("%s: no stat", path)
+	}
+	if int(st.Uid) != owner.UID || int(st.Gid) != owner.GID {
+		t.Errorf("%s: owner %d:%d, want %d:%d", path, st.Uid, st.Gid, owner.UID, owner.GID)
 	}
 }

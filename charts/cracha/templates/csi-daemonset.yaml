@@ -25,9 +25,9 @@ spec:
       priorityClassName: {{ . }}
       {{- end }}
       serviceAccountName: {{ include "cracha.name" . }}-csi
-      # Design 7.7: no host networking, no host PID namespace, no
-      # capabilities. Its host access is the kubelet plugin directories and
-      # the identity issuer's sockets.
+      # Design 7.7: no host networking, no host PID namespace, and no
+      # capability but CAP_CHOWN. Its host access is the kubelet plugin
+      # directories and the identity issuer's sockets.
       hostNetwork: false
       hostPID: false
       {{- with .Values.imagePullSecrets }}
@@ -74,13 +74,19 @@ spec:
             periodSeconds: 10
           securityContext:
             # Root, because it writes into kubelet's pod directories.
-            # Nothing more: no capabilities, no writable image.
+            # Nothing more: one capability, no writable image.
             runAsUser: 0
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
+              add:
+                # To give the token file the pod's fsGroup (design 7.3). A
+                # process may only hand a file to a group it is a member of,
+                # root included: with every capability dropped, uid 0 gets
+                # EPERM on chown to any other group.
+                - CHOWN
           {{- with .Values.csi.resources }}
           resources:
             {{- toYaml . | nindent 12 }}

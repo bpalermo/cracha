@@ -99,35 +99,48 @@ type stsRequest struct {
 	TransitiveTagKeys []string          `json:"transitiveTagKeys"`
 }
 
+// The workload's identity in its pod: a non-root user whose primary group is
+// not the fsGroup, so the token is readable only through the group the CSI
+// plugin gives it, the pod's fsGroup (section 7.3).
+const (
+	workloadUID     = int64(1000)
+	workloadGID     = int64(1000)
+	workloadFSGroup = int64(2000)
+)
+
 // workloadPod is the suite's workload (e2e/client) running as the given
-// ServiceAccount. An init container checks that the token exists before any
-// container starts (section 7, "Ordering"); the container trusts the
-// suite's CA through SSL_CERT_FILE, which Go honours, and nothing else about
-// AWS is configured: the environment the webhook injects is all it has.
-//
-// It runs as root because the CSI plugin writes the token 0640 root:root by
-// default, and the plugin is deployed without the capability --token-gid
-// would need to hand the file to another group (section 7.7).
+// ServiceAccount, as a non-root user with an fsGroup, the way a hardened pod
+// does. An init container, non-root too, checks that it can read the token
+// before any container starts (section 7, "Ordering"); the container trusts
+// the suite's CA through SSL_CERT_FILE, which Go honours, and nothing else
+// about AWS is configured: the environment the webhook injects is all it
+// has.
 func workloadPod(name, serviceAccount string) *corev1.Pod {
 	grace := int64(0)
-	root := int64(0)
+	uid, gid, fsGroup := workloadUID, workloadGID, workloadFSGroup
+	nonRoot := true
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: corev1.PodSpec{
 			ServiceAccountName:            serviceAccount,
 			RestartPolicy:                 corev1.RestartPolicyNever,
 			TerminationGracePeriodSeconds: &grace,
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsUser: &uid, RunAsGroup: &gid, RunAsNonRoot: &nonRoot, FSGroup: &fsGroup,
+			},
 			InitContainers: []corev1.Container{{
-				Name:    "token-present",
-				Image:   busybox,
-				Command: []string{"sh", "-c", "test -f " + tokenPath + " && test -s " + tokenPath},
+				Name:  "token-readable",
+				Image: busybox,
+				// Not root, the file is there, not empty, and readable: cat
+				// fails on a token the init container's user may not open.
+				Command: []string{"sh", "-c", fmt.Sprintf(
+					`[ "$(id -u)" = %d ] && test -s %s && cat %s >/dev/null`, workloadUID, tokenPath, tokenPath)},
 			}},
 			Containers: []corev1.Container{{
 				Name:            "client",
 				Image:           image("cracha-e2e-client"),
 				ImagePullPolicy: corev1.PullNever,
 				Env:             []corev1.EnvVar{{Name: "SSL_CERT_FILE", Value: "/etc/cracha-ca/ca.crt"}},
-				SecurityContext: &corev1.SecurityContext{RunAsUser: &root, RunAsGroup: &root},
 				VolumeMounts:    []corev1.VolumeMount{{Name: "ca", MountPath: "/etc/cracha-ca", ReadOnly: true}},
 			}},
 			Volumes: []corev1.Volume{{
@@ -230,10 +243,11 @@ func TestWorkloadObtainsCredentials(t *testing.T) {
 	pod, rep := assignedWorkload(ctx, t)
 
 	t.Run("token file", func(t *testing.T) {
-		// The init container only ran if the token was there.
+		// The init container only succeeded if its non-root user read the
+		// token.
 		for _, s := range pod.Status.InitContainerStatuses {
-			if s.Name == "token-present" && (s.State.Terminated == nil || s.State.Terminated.ExitCode != 0) {
-				t.Errorf("the init container that checks for the token did not succeed: %+v", s.State)
+			if s.Name == "token-readable" && (s.State.Terminated == nil || s.State.Terminated.ExitCode != 0) {
+				t.Errorf("the init container that reads the token as uid %d did not succeed: %+v", workloadUID, s.State)
 			}
 		}
 		tok := rep.Token

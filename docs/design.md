@@ -316,7 +316,7 @@ Its role:
 What it is not:
 - Not on the request path. The SDK talks to the broker directly; a cracha-csi restart is invisible to running pods until their next rotation.
 - Not a credential holder. It caches nothing and never sees AWS credentials.
-- Not privileged. No host networking, no host PID namespace, no capabilities. Its host access is the kubelet plugin socket and the issuer agent's socket.
+- Not privileged. No host networking, no host PID namespace, no capability but `CAP_CHOWN`, which hands each token to its pod's group (7.3). Its host access is the kubelet plugin socket and the issuer agent's socket.
 
 Its blast radius equals the node's: a compromised cracha-csi can obtain JWT-SVIDs for pods on that node, which a compromised node could already do through the issuer agent. It therefore shares the node's blast radius without widening it.
 
@@ -332,10 +332,13 @@ spec:
   podInfoOnMount: true
   volumeLifecycleModes: [Ephemeral]
   requiresRepublish: true
+  fsGroupPolicy: File
   tokenRequests:
     - audience: cracha-csi
       expirationSeconds: 600
 ```
+
+`fsGroupPolicy: File` with the plugin's `VOLUME_MOUNT_GROUP` node capability: kubelet passes the pod's `fsGroup` to NodePublishVolume as the volume mount group and leaves the ownership to the plugin, which writes the token for that group (7.3).
 
 ### 7.2 Volume contents (read-only to the container, plugin-owned)
 
@@ -351,11 +354,11 @@ One file, one audience.
 1. Read pod UID, namespace, SA from the volume context (kubelet-supplied).
 2. Verify the kubelet-provided bound SA token. Its pod-binding claims must match the volume-context pod UID.
 3. Register the pod. Fetch its JWT-SVID (`aud=cracha-broker`) through the issuer adapter (SPIRE: Broker API `FetchJWTSVID` with a Kubernetes object reference of namespace, name and UID). The issuer refuses pods it cannot resolve and attest on this node. Containers have not started at this point, so only pod-level selectors (namespace, service account, labels) are available; the ID scheme (4) keys on exactly those. (Verified against SPIRE, see 4.2.)
-4. Write the token atomically (write temp + rename) into the target directory kubelet created. No filesystem is mounted: a tmpfs would need `CAP_SYS_ADMIN`, which 7.7 forbids, so the file lives on the kubelet's volume directory like the SPIFFE CSI driver's does.
+4. Write the token atomically (write temp, set its mode and owner, rename) into the target directory kubelet created. The file is mode 0640, owned by root and the pod's `fsGroup`, the volume mount group kubelet passes (7.1); the directory is 0750 with the same group. A pod that runs as any user therefore reads the token by setting an `fsGroup`, and nothing else on the node but root does. A pod without an `fsGroup` gets the plugin's configured group (`--token-gid`, root by default). Giving the file a group of its own needs `CAP_CHOWN`, the one capability 7.7 grants. No filesystem is mounted: a tmpfs would need `CAP_SYS_ADMIN`, which 7.7 forbids, so the file lives on the kubelet's volume directory like the SPIFFE CSI driver's does.
 
 Kubelet doesn't start containers until publish succeeds, so a valid token is present before app start.
 
-`requiresRepublish`: on every republish, re-validate the pod and replace the token once less than half its TTL remains. The context check is repeated against the API server only when kubelet has rotated the bound SA token; an unchanged token keeps its verdict, so republishing costs no API call in the steady state. With a 5-minute TTL the file is never older than 2.5 minutes, and the SDK re-reads it at each credential refresh.
+`requiresRepublish`: on every republish, re-validate the pod and replace the token once less than half its TTL remains, or when it is gone, or when the republish asks for another group than the one on disk (it cannot for one pod, whose `fsGroup` is in its spec; the plugin is defensive about it). The context check is repeated against the API server only when kubelet has rotated the bound SA token; an unchanged token keeps its verdict, so republishing costs no API call in the steady state. With a 5-minute TTL the file is never older than 2.5 minutes, and the SDK re-reads it at each credential refresh.
 
 `NodeUnpublishVolume`: drop the registry entry. No subscriptions or caches exist to clean up.
 
@@ -421,7 +424,7 @@ sequenceDiagram
 
 ### 7.7 cracha-csi hardening
 
-- Distroless, read-only rootfs, dedicated namespace. No host networking, no host PID namespace, no capabilities. The only host access is the kubelet plugin socket and the issuer agent's socket.
+- Distroless, read-only rootfs, dedicated namespace. No host networking, no host PID namespace. Every capability dropped but `CAP_CHOWN`, which the token's group (7.3) needs: a process, root included, may only hand a file to a group it is a member of without it. The only host access is the kubelet plugin socket and the issuer agent's socket.
 - Issuer agent: the per-pod fetch is restricted to cracha-csi's identity (SPIRE: cracha-csi's SPIFFE ID is the only configured broker, access policy `enforced`, reference scope `agent_node`). The Broker socket is mounted read-only. Registration entry restricted to the cracha-csi SA/namespace.
 - Alert on per-pod JWT fetches for pod UIDs absent from the node's kubelet view.
 

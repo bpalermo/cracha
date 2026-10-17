@@ -247,8 +247,10 @@ func (c *Claims) Lifetime(issued time.Time) time.Duration {
 	return c.Expiry.Sub(issued)
 }
 
-// Owner is the owner of the written file. A negative ID leaves that ID as the
-// process created it.
+// Owner is the owner of the written file and of its directory. A negative ID
+// leaves that ID as the process created it. The driver takes the group from
+// the pod's fsGroup, which kubelet passes as the volume mount group, and
+// falls back to the plugin's --token-gid.
 type Owner struct {
 	UID int
 	GID int
@@ -257,13 +259,22 @@ type Owner struct {
 // Mode is the token file's mode: the owner and group read it, nobody else.
 const Mode = 0o640
 
+// DirMode is the volume directory's mode: the owner and group enter it. The
+// directory is the volume's mount point in the container, so a pod's
+// processes have to traverse it to reach the token.
+const DirMode = 0o750
+
 // Write puts token at <dir>/token atomically: a temporary file in dir, set to
-// Mode and owner, then renamed over the name, so a reader sees either the
-// previous token or the new one, never a partial file. dir is created if it
-// does not exist.
+// Mode and owner before it holds the token, then renamed over the name, so a
+// reader sees either the previous token or the new one, never a partial file
+// and never one with the wrong owner. dir is created if it does not exist,
+// and gets DirMode and the same owner, so that the group can enter it.
+//
+// Giving the file a group the process is not a member of needs CAP_CHOWN,
+// which the DaemonSet grants for exactly this.
 func Write(dir, token string, owner Owner) (err error) {
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return fmt.Errorf("creating %s: %w", dir, err)
+	if err := prepareDir(dir, owner); err != nil {
+		return err
 	}
 	f, err := os.CreateTemp(dir, "."+FileName+".*")
 	if err != nil {
@@ -279,7 +290,7 @@ func Write(dir, token string, owner Owner) (err error) {
 	if err := f.Chmod(Mode); err != nil {
 		return fmt.Errorf("setting the mode of %s: %w", tmp, err)
 	}
-	if owner.UID >= 0 || owner.GID >= 0 {
+	if owner.wanted() {
 		if err := f.Chown(owner.UID, owner.GID); err != nil {
 			return fmt.Errorf("setting the owner of %s to %d:%d: %w", tmp, owner.UID, owner.GID, err)
 		}
@@ -296,6 +307,27 @@ func Write(dir, token string, owner Owner) (err error) {
 	final := filepath.Join(dir, FileName)
 	if err := os.Rename(tmp, final); err != nil {
 		return fmt.Errorf("renaming %s to %s: %w", tmp, final, err)
+	}
+	return nil
+}
+
+// wanted reports whether owner asks for any ID to be set.
+func (o Owner) wanted() bool { return o.UID >= 0 || o.GID >= 0 }
+
+// prepareDir creates dir and gives it DirMode and owner. An existing
+// directory is brought to the same state: on a republish with another group
+// the directory must follow the file.
+func prepareDir(dir string, owner Owner) error {
+	if err := os.MkdirAll(dir, DirMode); err != nil {
+		return fmt.Errorf("creating %s: %w", dir, err)
+	}
+	if err := os.Chmod(dir, DirMode); err != nil {
+		return fmt.Errorf("setting the mode of %s: %w", dir, err)
+	}
+	if owner.wanted() {
+		if err := os.Chown(dir, owner.UID, owner.GID); err != nil {
+			return fmt.Errorf("setting the owner of %s to %d:%d: %w", dir, owner.UID, owner.GID, err)
+		}
 	}
 	return nil
 }

@@ -16,6 +16,11 @@ spec:
   # Kubelet publishes the volume again periodically, which is when the token
   # is rotated.
   requiresRepublish: true
+  # The pod's fsGroup reaches the plugin as the volume mount group, and the
+  # token is written with that group, so a pod running as any user reads it.
+  # (The plugin advertises VOLUME_MOUNT_GROUP, so kubelet delegates the
+  # ownership to it rather than walking the volume itself.)
+  fsGroupPolicy: File
   # And proof of the pod: a token for its service account that only the
   # plugin accepts, checked against the pod it was given.
   tokenRequests:
