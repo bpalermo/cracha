@@ -99,6 +99,21 @@ helm_lint_test(
     values = ["test/overrides.yaml"],
 )
 
+# The bundle source's other two verification keys: KMS, and a Secret the
+# install keeps (test/overrides.yaml renders the inline key).
+[
+    helm_template_test(
+        name = "cracha_%s_template_test" % name,
+        size = "small",
+        chart = ":cracha",
+        values = REQUIRED_VALUES + ["test/%s.yaml" % name],
+    )
+    for name in [
+        "bundle-kms",
+        "bundle-secret",
+    ]
+]
+
 # The third TLS mode, which renders cert-manager resources instead of
 # Secrets.
 helm_template_test(

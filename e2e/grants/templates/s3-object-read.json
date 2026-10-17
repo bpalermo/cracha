@@ -1,0 +1,18 @@
+{
+  "params": {
+    "bucket": {
+      "type": "string",
+      "description": "the bucket whose objects may be read"
+    }
+  },
+  "policy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": ["s3:GetObject"],
+        "Resource": "arn:aws:s3:::${bucket}/*"
+      }
+    ]
+  }
+}

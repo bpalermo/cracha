@@ -2,7 +2,9 @@
 //
 //	GET /v1/credentials   Authorization: <JWT-SVID>  → container-credentials JSON
 //	GET /v1/grants        same authorization         → shape, grants, composed policy
-//	GET /healthz
+//	GET /healthz          liveness: the process serves
+//	GET /readyz           readiness: every registered check passes (the
+//	                      grant bundle has loaded, say)
 //
 // The identity in the token selects everything. Nothing else in the request
 // is trusted: no proxy-asserted identity header is read, and nothing
@@ -16,6 +18,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bpalermo/cracha/broker/internal/grants"
@@ -42,12 +45,21 @@ const (
 	ReasonUnavailable     = "unavailable"
 )
 
+// Readiness is a dependency /readyz consults: an error means the broker
+// must not take traffic yet, and says why.
+type Readiness interface {
+	Ready() error
+}
+
 // Handler serves the API.
 type Handler struct {
 	auth   Authenticator
 	issuer issuer.Issuer
 	log    *slog.Logger
 	mux    *http.ServeMux
+
+	mu    sync.RWMutex
+	ready []Readiness
 }
 
 // New returns the API handler. Methods other than GET on the API paths get
@@ -60,11 +72,33 @@ func New(auth Authenticator, iss issuer.Issuer, log *slog.Logger) *Handler {
 	h.mux.HandleFunc("/v1/credentials", getOnly(h.credentials))
 	h.mux.HandleFunc("/v1/grants", getOnly(h.grants))
 	h.mux.HandleFunc("/healthz", getOnly(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		_, _ = w.Write([]byte("ok\n"))
+		writeText(w, http.StatusOK, "ok\n")
 	}))
+	h.mux.HandleFunc("/readyz", getOnly(h.readyz))
 	return h
+}
+
+// AddReadiness registers a check /readyz consults. Until every registered
+// check passes the handler reports not ready; with none registered it is
+// ready as soon as it serves.
+func (h *Handler) AddReadiness(r Readiness) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.ready = append(h.ready, r)
+}
+
+func (h *Handler) readyz(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	checks := h.ready
+	h.mu.RUnlock()
+	for _, c := range checks {
+		if err := c.Ready(); err != nil {
+			h.log.LogAttrs(r.Context(), slog.LevelWarn, "not ready", slog.String("error", err.Error()))
+			writeText(w, http.StatusServiceUnavailable, "not ready: "+err.Error()+"\n")
+			return
+		}
+	}
+	writeText(w, http.StatusOK, "ok\n")
 }
 
 // getOnly answers 405 to every method but GET. (A ServeMux "GET" pattern
@@ -204,6 +238,13 @@ func setDecisionHeaders(w http.ResponseWriter, res issuer.Resolution) {
 	h.Set(HeaderGrants, strings.Join(res.Composed.Grants, ", "))
 	h.Set(HeaderBundleVersion, res.BundleVersion)
 	h.Set(HeaderConsistencyToken, string(res.Decision.Token))
+}
+
+func writeText(w http.ResponseWriter, status int, body string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(body))
 }
 
 func writeReason(w http.ResponseWriter, status int, reason string) {

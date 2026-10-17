@@ -1,0 +1,10 @@
+# What the authorization store (the chart's assignments in e2e/values.yaml)
+# gives the assigned workload, recorded here so the composition lint checks
+# it against the grant at compile time. Subjects are the authz encoding
+# <trust-domain label>/<ns>/<sa>.
+kind: Assignment
+metadata:
+  name: e2e-client
+spec:
+  subject: cracha/e2e/client
+  grants: [e2e-s3-reader]

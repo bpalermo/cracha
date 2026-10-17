@@ -65,7 +65,7 @@ func Compile(ctx context.Context, src *Source, opts CompileOptions) (*Bundle, *R
 		}
 		b.Version = v
 	}
-	if !versionRE.MatchString(b.Version) {
+	if !ValidVersion(b.Version) {
 		return nil, nil, fmt.Errorf("version %q: must match %s", b.Version, versionRE)
 	}
 	at := opts.GeneratedAt
@@ -75,6 +75,10 @@ func Compile(ctx context.Context, src *Source, opts CompileOptions) (*Bundle, *R
 	b.GeneratedAt = at.UTC().Format(time.RFC3339)
 	return b, report, nil
 }
+
+// ValidVersion reports whether v is a well-formed bundle version: it names
+// a directory and an S3 key, so a reader following a pointer can require it.
+func ValidVersion(v string) bool { return versionRE.MatchString(v) }
 
 // ContentVersion is the SHA-256, in hex, of the canonical JSON of the
 // grants: the version of a bundle whose sources carry no version of their
@@ -106,7 +110,7 @@ func ParseBundle(data []byte) (*Bundle, error) {
 	if dec.More() {
 		return nil, errors.New("bundle: trailing data")
 	}
-	if !versionRE.MatchString(b.Version) {
+	if !ValidVersion(b.Version) {
 		return nil, fmt.Errorf("bundle: version %q: must match %s", b.Version, versionRE)
 	}
 	return &b, nil

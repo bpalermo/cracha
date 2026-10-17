@@ -35,6 +35,26 @@ broker:
   grants:
     existingConfigMap: my-grants
     key: my-grants.yaml
+  # A local bundle source with the chart-made key Secret; test/bundle-kms.yaml
+  # and test/bundle-secret.yaml render the S3 source with the other two keys.
+  bundle:
+    source: local:/var/lib/cracha/bundle
+    verifyKey: |
+      -----BEGIN PUBLIC KEY-----
+      MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0000000000000000000000000000
+      0000000000000000000000000000000000000000000000000000000000000000
+      -----END PUBLIC KEY-----
+    pollInterval: 5m
+    volume:
+      configMap:
+        name: grant-bundle
+        items:
+          - key: latest
+            path: latest
+          - key: bundle.json
+            path: bundles/abc123/bundle.json
+          - key: bundle.json.sig
+            path: bundles/abc123/bundle.json.sig
   serviceAccount:
     annotations:
       eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/cracha-broker

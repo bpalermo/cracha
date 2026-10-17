@@ -76,7 +76,7 @@ type fixture struct {
 	issuer  *authntest.Issuer
 	store   *fakeStore
 	sts     *fakeSTS
-	handler http.Handler
+	handler *Handler
 	exp     time.Time
 }
 
@@ -345,5 +345,39 @@ func TestMethodsAndPaths(t *testing.T) {
 	}
 	if f.sts.calls != 0 {
 		t.Error("sts called")
+	}
+}
+
+// readiness is a Readiness check with a settable answer.
+type readiness struct{ err error }
+
+func (r *readiness) Ready() error { return r.err }
+
+func TestReadyz(t *testing.T) {
+	f := newFixture(t)
+	// Nothing registered: ready as soon as it serves.
+	if rec := f.get(t, "/readyz", ""); rec.Code != http.StatusOK || rec.Body.String() != "ok\n" {
+		t.Errorf("readyz with no checks: %d %q", rec.Code, rec.Body.String())
+	}
+	bundle := &readiness{err: errors.New("no grant bundle loaded yet")}
+	f.handler.AddReadiness(bundle)
+	f.handler.AddReadiness(&readiness{})
+	rec := f.get(t, "/readyz", "")
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "no grant bundle loaded yet") {
+		t.Errorf("readyz while not ready: %d %q", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Cache-Control") != "no-store" {
+		t.Error("readiness answer is cacheable")
+	}
+	// Liveness is unaffected.
+	if rec := f.get(t, "/healthz", ""); rec.Code != http.StatusOK {
+		t.Errorf("healthz while not ready: %d", rec.Code)
+	}
+	bundle.err = nil
+	if rec := f.get(t, "/readyz", ""); rec.Code != http.StatusOK {
+		t.Errorf("readyz once ready: %d %q", rec.Code, rec.Body.String())
+	}
+	if rec := f.do(t, http.MethodHead, "/readyz", ""); rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("HEAD /readyz: %d", rec.Code)
 	}
 }

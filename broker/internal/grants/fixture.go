@@ -11,7 +11,8 @@ import (
 
 // Fixture is a development file of already resolved grants. It is not the
 // compiled bundle of common/grant: no templates, no signature, no shapes
-// section; the compiled bundle loader replaces it in a later slice. Shape:
+// section; production brokers read the bundle through broker/internal/bundle
+// instead. Shape:
 //
 //	version: dev-1
 //	grants:

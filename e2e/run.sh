@@ -2,14 +2,16 @@
 # Runs the end-to-end suite against a kind cluster.
 #
 # Builds the images from this checkout, loads them into the kind node, deploys
-# SPIRE (e2e/spire.sh), installs the chart Bazel builds from this checkout
-# (charts/cracha, with e2e/values.yaml) and the STS stand-in (e2e/manifests)
-# and runs the tests tagged e2e. Creates the cluster if it does not exist; a
-# cluster this script created is deleted on exit unless E2E_KEEP_CLUSTER=1.
+# SPIRE (e2e/spire.sh), compiles, signs and publishes the grant bundle from
+# e2e/grants with the grantc Bazel builds, installs the chart Bazel builds
+# from this checkout (charts/cracha, with e2e/values.yaml) and the STS
+# stand-in (e2e/manifests) and runs the tests tagged e2e. Creates the cluster
+# if it does not exist; a cluster this script created is deleted on exit
+# unless E2E_KEEP_CLUSTER=1.
 #
-# Needs docker, kind and kubectl on PATH; helm comes from Bazel (@helm//:helm,
-# the version MODULE.bazel pins). Extra arguments are passed to every bazel
-# invocation, e.g. --config=ci.
+# Needs docker, kind, kubectl and openssl on PATH; helm and grantc come from
+# Bazel (@helm//:helm, the version MODULE.bazel pins, and //grantc). Extra
+# arguments are passed to every bazel invocation, e.g. --config=ci.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -29,8 +31,9 @@ images=(
 created=0
 kubeconfig="$(mktemp)"
 certs="$(mktemp -d)"
+bundle="$(mktemp -d)"
 cleanup() {
-	rm -rf "${kubeconfig}" "${certs}"
+	rm -rf "${kubeconfig}" "${certs}" "${bundle}"
 	if [[ "${created}" == 1 && "${E2E_KEEP_CLUSTER:-0}" != 1 ]]; then
 		kind delete cluster --name "${cluster}"
 	fi
@@ -67,14 +70,58 @@ e2e/spire.sh
 # issues the broker's and the webhook's certificates from it, and the test
 # workloads are handed that CA below (SSL_CERT_FILE, not AWS_CA_BUNDLE:
 # design 6.5). The CA lives in the Secret cracha-ca, which an upgrade keeps.
-bazel build "$@" //charts/cracha:cracha @helm//:helm
+bazel build "$@" //charts/cracha:cracha @helm//:helm //grantc
 bin="$(bazel info "$@" bazel-bin)"
-helm="$(bazel cquery "$@" @helm//:helm --output=files 2>/dev/null)"
-helm="$(bazel info "$@" execution_root)/${helm}"
+execroot="$(bazel info "$@" execution_root)"
+helm="${execroot}/$(bazel cquery "$@" @helm//:helm --output=files 2>/dev/null)"
+grantc="${execroot}/$(bazel cquery "$@" //grantc --output=files 2>/dev/null)"
 chart="${bin}/charts/cracha/cracha.tgz"
+
+# The grants, the production way (design 6.2): the bundle is compiled from
+# e2e/grants, signed with a throwaway P-256 key, published in the layout the
+# broker polls (latest, bundles/<version>/bundle.json and .sig) and handed
+# to the broker as a ConfigMap mounted at broker.bundle.source, with the
+# public key in the chart's Secret. The version is the content hash grantc
+# gives a bundle, which the test reads back from the ConfigMap's latest
+# pointer and expects in Cracha-Bundle-Version.
+openssl ecparam -name prime256v1 -genkey -noout -out "${bundle}/key.pem"
+openssl ec -in "${bundle}/key.pem" -pubout -out "${bundle}/pub.pem" 2>/dev/null
+"${grantc}" compile -o "${bundle}/bundle.json" e2e/grants
+"${grantc}" sign -key "${bundle}/key.pem" "${bundle}/bundle.json"
+"${grantc}" verify -pub "${bundle}/pub.pem" "${bundle}/bundle.json"
+"${grantc}" publish -dir "${bundle}/published" "${bundle}/bundle.json"
+version="$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "${bundle}/published/latest")"
+[[ -n "${version}" ]] || {
+	echo "e2e: no version in ${bundle}/published/latest" >&2
+	exit 1
+}
+kubectl create namespace cracha-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl create configmap cracha-e2e-bundle -n cracha-system \
+	--from-file=latest="${bundle}/published/latest" \
+	--from-file=bundle.json="${bundle}/published/bundles/${version}/bundle.json" \
+	--from-file=bundle.json.sig="${bundle}/published/bundles/${version}/bundle.json.sig" \
+	--dry-run=client -o yaml | kubectl apply -f -
+cat >"${bundle}/values.yaml" <<EOF
+# Written by e2e/run.sh: the published bundle's layout in the ConfigMap and
+# the key it was signed with. See broker.bundle in e2e/values.yaml.
+broker:
+  bundle:
+    volume:
+      configMap:
+        name: cracha-e2e-bundle
+        items:
+          - key: latest
+            path: latest
+          - key: bundle.json
+            path: bundles/${version}/bundle.json
+          - key: bundle.json.sig
+            path: bundles/${version}/bundle.json.sig
+EOF
+
 "${helm}" upgrade --install cracha "${chart}" \
 	--namespace cracha-system --create-namespace \
 	--values e2e/values.yaml --values e2e/values-local.yaml \
+	--values "${bundle}/values.yaml" --set-file broker.bundle.verifyKey="${bundle}/pub.pem" \
 	--wait --timeout 300s
 
 # The STS stand-in the broker talks to: a fixture of the suite, not part of

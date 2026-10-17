@@ -150,10 +150,45 @@ broker:
     document:
       services: []
 
-  # The resolved-grants fixture (broker/internal/grants/fixture.go), the
-  # same way: the document or an existing ConfigMap. It stands in for the
-  # compiled grant bundle until the bundle loader lands; a broker with no
-  # grants denies every request.
+  # The compiled grant bundle (design 6.2; common/grant, grantc), the
+  # production source of grants: the broker polls it, verifies its signature
+  # over the published bytes, swaps it in atomically and keeps the last good
+  # one on any failure. Until a bundle has verified the broker is not ready.
+  # With `source` empty the broker reads the fixture in `grants` instead.
+  #   source        local:<dir>, a directory in the pod with the layout
+  #                 `grantc publish` writes (latest, bundles/<version>/
+  #                 bundle.json and .sig), mounted there from `volume`; or
+  #                 s3://bucket[/prefix], read with the broker's own AWS
+  #                 credentials (s3:GetObject on the prefix).
+  #   verifyKey     the PEM public key of the signing key (the one
+  #                 `grantc verify -pub` takes), which the chart keeps in a
+  #                 Secret; or
+  #   existingSecret  a Secret you keep, with the PEM under `public.pem`; or
+  #   kmsKey        the ARN of the KMS signing key, verified through
+  #                 kms:Verify with the broker's credentials.
+  #                 Exactly one of the three.
+  #   pollInterval  how often the broker looks for a new version.
+  #   volume        for a local source, the Kubernetes volume source mounted
+  #                 at the directory `source` names, such as a ConfigMap
+  #                 whose items lay the files out:
+  #                   configMap:
+  #                     name: grant-bundle
+  #                     items:
+  #                       - {key: latest, path: latest}
+  #                       - {key: bundle.json, path: bundles/<version>/bundle.json}
+  #                       - {key: bundle.json.sig, path: bundles/<version>/bundle.json.sig}
+  bundle:
+    source: ""
+    verifyKey: ""
+    existingSecret: ""
+    kmsKey: ""
+    pollInterval: 60s
+    volume: {}
+
+  # The resolved-grants fixture (broker/internal/grants/fixture.go), for
+  # development, the same way as the assignments: the document or an
+  # existing ConfigMap. Used only while `bundle.source` is empty; a broker
+  # with no grants denies every request.
   #   document:
   #     version: "2026-01-01"
   #     grants:

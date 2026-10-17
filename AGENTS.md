@@ -34,8 +34,10 @@ Needs docker, kind and kubectl; helm comes from Bazel. The suite in `e2e/` is
 tagged `e2e` and excluded from `bazel test //...`; `e2e/run.sh` creates or
 reuses the kind cluster `cracha-e2e`, loads the images built from the
 checkout, deploys SPIRE (`e2e/spire.sh`), installs the chart built from the
-checkout with `e2e/values.yaml` (the suite's assignments, grants, SPIRE socket
-paths and STS endpoint) and `e2e/values-local.yaml` (the images just loaded),
+checkout with `e2e/values.yaml` (the suite's assignments, SPIRE socket paths
+and STS endpoint), `e2e/values-local.yaml` (the images just loaded) and a
+values file it writes for the grant bundle it compiled from `e2e/grants`,
+signed with a throwaway key and published into a ConfigMap,
 deploys the STS stand-in (`e2e/manifests/stsstub.yaml`, `e2e/stsstub`) and
 runs the tests against the ambient kubeconfig. The chart's generated CA is
 what the test workloads trust: run.sh copies it from the `cracha-ca` Secret
@@ -108,6 +110,18 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   validation, templates, lints, the compiled bundle, signing and publishing.
 - `grantc/` is the grant compiler CLI over `common/grant` (lint, compile,
   sign, verify, publish); it runs in CI and has no container image.
+- The broker gets its grants from one of two sources, exactly one of which
+  is configured. In production it is the compiled bundle `grantc` publishes
+  (`--bundle-source local:<dir>` or `s3://bucket/prefix`,
+  `broker/internal/bundle`): polled, its signature verified over the
+  published bytes with a public key PEM (`--bundle-verify-key`) or a KMS
+  key (`--bundle-kms-key`), swapped atomically when the version changes,
+  and kept at the last good version on any failure; `/readyz` reports not
+  ready until a bundle has verified. For development it is the
+  resolved-grants fixture (`--grants-fixture`,
+  `broker/internal/grants/fixture.go`), which the chart's default
+  `broker.grants` renders; `broker.bundle` switches an install to the
+  bundle. The e2e installs the bundle path.
 - `bazel/` holds build rules; `docs/` the design; `charts/cracha` the Helm
   chart; `e2e/` the end-to-end suite with its values files, the fixtures it
   deploys beside the chart and the two images only it uses.

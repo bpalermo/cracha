@@ -3,6 +3,8 @@
 {{- range $domain, $label := .Values.broker.trustDomainLabels -}}
 {{- $labels = append $labels (printf "%s=%s" $domain $label) -}}
 {{- end -}}
+{{- $bundleKey := include "cracha.bundleKey" . -}}
+{{- $bundleDir := include "cracha.bundleDir" . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -59,7 +61,17 @@ spec:
             - --trust-domain-labels={{ join "," $labels }}
             {{- end }}
             - --assignments=/etc/cracha/assignments/{{ .Values.broker.assignments.key }}
+            {{- if .Values.broker.bundle.source }}
+            - --bundle-source={{ .Values.broker.bundle.source }}
+            {{- if eq $bundleKey "kms" }}
+            - --bundle-kms-key={{ .Values.broker.bundle.kmsKey }}
+            {{- else }}
+            - --bundle-verify-key=/etc/cracha/bundle-key/public.pem
+            {{- end }}
+            - --bundle-poll-interval={{ .Values.broker.bundle.pollInterval }}
+            {{- else }}
             - --grants-fixture=/etc/cracha/grants/{{ .Values.broker.grants.key }}
+            {{- end }}
             {{- with .Values.broker.awsRegion }}
             - --aws-region={{ . }}
             {{- end }}
@@ -75,9 +87,11 @@ spec:
           ports:
             - name: https
               containerPort: {{ .Values.broker.port }}
+          # Ready once the grant bundle has verified (/readyz); alive while
+          # the process serves (/healthz).
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: https
               scheme: HTTPS
             periodSeconds: 2
@@ -98,9 +112,21 @@ spec:
             - name: assignments
               mountPath: /etc/cracha/assignments
               readOnly: true
+            {{- if $bundleDir }}
+            - name: bundle
+              mountPath: {{ $bundleDir }}
+              readOnly: true
+            {{- end }}
+            {{- if has $bundleKey (list "inline" "secret") }}
+            - name: bundle-key
+              mountPath: /etc/cracha/bundle-key
+              readOnly: true
+            {{- end }}
+            {{- if not .Values.broker.bundle.source }}
             - name: grants
               mountPath: /etc/cracha/grants
               readOnly: true
+            {{- end }}
             - name: spire-workload-api
               mountPath: /spiffe-workload-api
               readOnly: true
@@ -126,9 +152,21 @@ spec:
         - name: assignments
           configMap:
             name: {{ .Values.broker.assignments.existingConfigMap | default (printf "%s-assignments" (include "cracha.name" .)) }}
+        {{- if $bundleDir }}
+        # The published bundle, laid out as grantc publish writes it.
+        - name: bundle
+          {{- toYaml .Values.broker.bundle.volume | nindent 10 }}
+        {{- end }}
+        {{- if has $bundleKey (list "inline" "secret") }}
+        - name: bundle-key
+          secret:
+            secretName: {{ .Values.broker.bundle.existingSecret | default (printf "%s-bundle-key" (include "cracha.name" .)) }}
+        {{- end }}
+        {{- if not .Values.broker.bundle.source }}
         - name: grants
           configMap:
             name: {{ .Values.broker.grants.existingConfigMap | default (printf "%s-grants" (include "cracha.name" .)) }}
+        {{- end }}
         # The trust bundle the JWT-SVIDs are verified against comes from the
         # broker's own Workload API connection (design 6.5).
         - name: spire-workload-api
