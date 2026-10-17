@@ -162,6 +162,18 @@ func TestApplyWriteFails(t *testing.T) {
 	}
 }
 
+func TestApplyDiverged(t *testing.T) {
+	c := fakespicedb.New()
+	c.Intruder = mustProto(t, stale)[0]
+	res, err := newReconciler(c, 0).Apply(context.Background(), []Relationship{owner}, false)
+	if !errors.Is(err, ErrDiverged) || !strings.Contains(err.Error(), "by 1 relationships, such as extra "+stale.Key()) {
+		t.Fatalf("error = %v", err)
+	}
+	if res == nil || res.Written != 1 {
+		t.Errorf("result = %+v", res)
+	}
+}
+
 func TestApplyReadFails(t *testing.T) {
 	c := fakespicedb.New()
 	c.ReadErr = errors.New("unavailable")

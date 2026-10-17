@@ -66,7 +66,6 @@ func main() {
 
 var (
 	errRejected  = errors.New("source tree rejected")
-	errDiverged  = errors.New("SpiceDB differs from the source after the write")
 	errDialFlags = errors.New("-endpoint and -token-file are required")
 )
 
@@ -99,7 +98,7 @@ func run(args []string, stdout, stderr io.Writer, dial dialer) int {
 		return 0
 	case errors.Is(err, flag.ErrHelp):
 		return 0
-	case errors.Is(err, errRejected), errors.Is(err, errDiverged):
+	case errors.Is(err, errRejected), errors.Is(err, reconcile.ErrDiverged):
 		fmt.Fprintf(stderr, "cracha-reconciler: %v\n", err)
 		return 1
 	default:
@@ -255,13 +254,7 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer, log 
 	if res != nil {
 		printResult(stdout, res, cf.dryRun)
 	}
-	if err != nil {
-		if res != nil && res.Written == res.Diff.Len() {
-			return fmt.Errorf("%w: %v", errDiverged, err)
-		}
-		return err
-	}
-	return nil
+	return err
 }
 
 // loadDesired loads and lints the tree, printing the lints' problems to

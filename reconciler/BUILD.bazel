@@ -36,5 +36,6 @@ go_test(
     deps = [
         "//common/spicedb",
         "//reconciler/internal/fakespicedb",
+        "@com_github_authzed_authzed_go//proto/authzed/api/v1:api",
     ],
 )

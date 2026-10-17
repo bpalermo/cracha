@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+
 	"github.com/bpalermo/cracha/common/spicedb"
 	"github.com/bpalermo/cracha/reconciler/internal/fakespicedb"
 )
@@ -156,6 +158,24 @@ func TestApplyWriteFails(t *testing.T) {
 		t.Errorf("exit %d, want 2", code)
 	}
 	if !strings.Contains(stdout.String(), "wrote 0 of 7 updates") || !strings.Contains(stderr.String(), "write batch 1 (7 updates) failed after 0 of 7") {
+		t.Errorf("stdout = %q, stderr = %q", stdout.String(), stderr.String())
+	}
+}
+
+func TestApplyDiverged(t *testing.T) {
+	c := fakespicedb.New()
+	c.Intruder = &v1.Relationship{
+		Resource: &v1.ObjectReference{ObjectType: spicedb.TypeGrant, ObjectId: "ghost"},
+		Relation: spicedb.RelationAccount,
+		Subject:  &v1.SubjectReference{Object: &v1.ObjectReference{ObjectType: spicedb.TypeAWSAccount, ObjectId: "111122223333"}},
+	}
+	dial, _ := fakeDial(c)
+	var stdout, stderr bytes.Buffer
+	args := []string{"apply", "-source", "testdata/good", "-endpoint", "e", "-token-file", "t"}
+	if code := run(args, &stdout, &stderr, dial); code != 1 {
+		t.Errorf("exit %d, want 1; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "wrote 7 of 7 updates") || !strings.Contains(stderr.String(), "SpiceDB differs from the source after the write: by 1 relationships, such as extra grant:ghost#account@aws_account:111122223333") {
 		t.Errorf("stdout = %q, stderr = %q", stdout.String(), stderr.String())
 	}
 }

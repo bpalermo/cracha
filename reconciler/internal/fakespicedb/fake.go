@@ -41,6 +41,9 @@ type Client struct {
 	// FailWrite, when positive, fails the FailWrite-th WriteRelationships
 	// (counting from 1) without applying it.
 	FailWrite int
+	// Intruder, when set, is written after every WriteRelationships, as a
+	// concurrent writer would.
+	Intruder *v1.Relationship
 }
 
 // New makes a client holding the given relationships.
@@ -154,6 +157,9 @@ func (c *Client) WriteRelationships(_ context.Context, in *v1.WriteRelationships
 		default:
 			return nil, fmt.Errorf("fakespicedb: unknown operation %v", u.GetOperation())
 		}
+	}
+	if c.Intruder != nil {
+		c.rels[key(c.Intruder)] = proto.Clone(c.Intruder).(*v1.Relationship)
 	}
 	c.revision++
 	return &v1.WriteRelationshipsResponse{WrittenAt: &v1.ZedToken{Token: c.token()}}, nil

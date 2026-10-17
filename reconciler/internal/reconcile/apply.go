@@ -17,6 +17,11 @@ import (
 // default limit.
 const MaxBatch = 1000
 
+// ErrDiverged is returned by Apply when, after every batch was written,
+// SpiceDB read back at least as fresh as the last write still differs from
+// the desired set: something else writes the owned types.
+var ErrDiverged = errors.New("SpiceDB differs from the source after the write")
+
 // OwnedTypes are the resource types whose every relationship the
 // reconciler owns: what it reads to diff, and what it deletes when the
 // tree no longer calls for it.
@@ -115,9 +120,17 @@ func (r *Reconciler) Apply(ctx context.Context, desired []Relationship, dryRun b
 		return res, fmt.Errorf("confirming the write: %w", err)
 	}
 	if left := ComputeDiff(after, desired); !left.Empty() {
-		return res, fmt.Errorf("after the write SpiceDB still differs from the source by %d relationships, such as %s", left.Len(), firstOf(left))
+		return res, fmt.Errorf("%w: by %d relationships, such as %s", ErrDiverged, left.Len(), firstOf(left))
 	}
 	return res, nil
+}
+
+// log is the logger, or the default one.
+func (r *Reconciler) log() *slog.Logger {
+	if r.Log == nil {
+		return slog.Default()
+	}
+	return r.Log
 }
 
 // write sends the diff in batches, recording progress in res.
@@ -139,20 +152,21 @@ func (r *Reconciler) write(ctx context.Context, res *Result) error {
 		res.Written += len(batch)
 		res.Batches++
 		res.Token = resp.GetWrittenAt().GetToken()
-		r.Log.Info("wrote batch", "batch", res.Batches, "updates", len(batch), "written", res.Written, "of", len(updates))
+		r.log().Info("wrote batch", "batch", res.Batches, "updates", len(batch), "written", res.Written, "of", len(updates))
 	}
 	return nil
 }
 
 // logDiff logs every change at info, and the counts.
 func (r *Reconciler) logDiff(d Diff, current, desired int) {
+	log := r.log()
 	for _, rel := range d.Touch {
-		r.Log.Info("touch", "relationship", rel.String())
+		log.Info("touch", "relationship", rel.String())
 	}
 	for _, rel := range d.Delete {
-		r.Log.Info("delete", "relationship", rel.String())
+		log.Info("delete", "relationship", rel.String())
 	}
-	r.Log.Info("diff", "current", current, "desired", desired, "touch", len(d.Touch), "delete", len(d.Delete))
+	log.Info("diff", "current", current, "desired", desired, "touch", len(d.Touch), "delete", len(d.Delete))
 }
 
 // firstOf names the first relationship of a diff, for an error.
