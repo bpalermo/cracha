@@ -1,0 +1,26 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "issuer",
+    srcs = ["issuer.go"],
+    importpath = "github.com/bpalermo/cracha/broker/internal/issuer",
+    visibility = ["//broker:__subpackages__"],
+    deps = [
+        "//broker/internal/authz",
+        "//broker/internal/grants",
+        "//broker/internal/sts",
+        "//common/idenc",
+    ],
+)
+
+go_test(
+    name = "issuer_test",
+    srcs = ["issuer_test.go"],
+    embed = [":issuer"],
+    deps = [
+        "//broker/internal/authz",
+        "//broker/internal/grants",
+        "//broker/internal/sts",
+        "//common/idenc",
+    ],
+)

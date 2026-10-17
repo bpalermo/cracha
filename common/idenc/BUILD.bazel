@@ -1,0 +1,16 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "idenc",
+    srcs = ["idenc.go"],
+    importpath = "github.com/bpalermo/cracha/common/idenc",
+    visibility = ["//visibility:public"],
+    deps = ["@com_github_spiffe_go_spiffe_v2//spiffeid"],
+)
+
+go_test(
+    name = "idenc_test",
+    srcs = ["idenc_test.go"],
+    embed = [":idenc"],
+    deps = ["@com_github_spiffe_go_spiffe_v2//spiffeid"],
+)

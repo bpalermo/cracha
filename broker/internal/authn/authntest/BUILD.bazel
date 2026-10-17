@@ -1,0 +1,12 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "authntest",
+    srcs = ["authntest.go"],
+    importpath = "github.com/bpalermo/cracha/broker/internal/authn/authntest",
+    visibility = ["//broker:__subpackages__"],
+    deps = [
+        "@com_github_spiffe_go_spiffe_v2//bundle/jwtbundle",
+        "@com_github_spiffe_go_spiffe_v2//spiffeid",
+    ],
+)

@@ -1,0 +1,80 @@
+package main
+
+import (
+	"errors"
+	"io"
+	"strings"
+	"testing"
+)
+
+func envOf(m map[string]string) func(string) (string, bool) {
+	return func(k string) (string, bool) {
+		v, ok := m[k]
+		return v, ok
+	}
+}
+
+func TestParseConfig(t *testing.T) {
+	c, err := parseConfig([]string{
+		"--cluster", "prod-a", "--assignments", "a.yaml", "--grants-fixture", "g.yaml",
+		"--tls-cert", "c.pem", "--tls-key", "k.pem", "--trust-domain-labels", "example.org=prod",
+	}, envOf(nil), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.listen != ":8443" || c.cluster != "prod-a" || c.labels.Short("example.org") != "prod" || c.logLevel != "info" {
+		t.Errorf("config %+v", c)
+	}
+}
+
+func TestParseConfigEnvFallback(t *testing.T) {
+	env := envOf(map[string]string{
+		"CRACHA_CLUSTER":             "prod-b",
+		"CRACHA_ASSIGNMENTS":         "a.yaml",
+		"CRACHA_GRANTS_FIXTURE":      "g.yaml",
+		"CRACHA_INSECURE_PLAINTEXT":  "true",
+		"CRACHA_LISTEN":              ":8080",
+		"CRACHA_TRUST_DOMAIN_LABELS": "example.org=prod",
+		"CRACHA_LOG_LEVEL":           "debug",
+	})
+	c, err := parseConfig([]string{"--listen", ":9090"}, env, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.cluster != "prod-b" || !c.insecurePlaintext || c.logLevel != "debug" {
+		t.Errorf("config %+v", c)
+	}
+	if c.listen != ":9090" {
+		t.Errorf("flag did not win over env: %q", c.listen)
+	}
+}
+
+func TestParseConfigVersion(t *testing.T) {
+	if _, err := parseConfig([]string{"--version"}, envOf(nil), io.Discard); !errors.Is(err, errVersion) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestParseConfigRejects(t *testing.T) {
+	base := []string{"--cluster", "c", "--assignments", "a", "--grants-fixture", "g", "--tls-cert", "c.pem", "--tls-key", "k.pem"}
+	tests := map[string][]string{
+		"no cluster":          {"--assignments", "a", "--grants-fixture", "g", "--insecure-plaintext"},
+		"no assignments":      {"--cluster", "c", "--grants-fixture", "g", "--insecure-plaintext"},
+		"no tls":              {"--cluster", "c", "--assignments", "a", "--grants-fixture", "g"},
+		"half tls":            {"--cluster", "c", "--assignments", "a", "--grants-fixture", "g", "--tls-cert", "c.pem"},
+		"plaintext with tls":  append(append([]string{}, base...), "--insecure-plaintext"),
+		"bad labels":          append(append([]string{}, base...), "--trust-domain-labels", "example.org"),
+		"reserved label":      append(append([]string{}, base...), "--trust-domain-labels", "example.org=h"),
+		"bad log level":       append(append([]string{}, base...), "--log-level", "loud"),
+		"positional argument": append(append([]string{}, base...), "extra"),
+		"unknown flag":        append(append([]string{}, base...), "--nope"),
+	}
+	for name, args := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseConfig(args, envOf(nil), io.Discard)
+			if err == nil || errors.Is(err, errVersion) {
+				t.Fatalf("accepted %q", strings.Join(args, " "))
+			}
+		})
+	}
+}
