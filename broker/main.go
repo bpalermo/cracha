@@ -3,10 +3,10 @@
 // policy from the workload's grants and assumes a shape role on the
 // workload's behalf (docs/design.md, section 6).
 //
-// This slice wires the static authorization backend and a resolved-grants
-// fixture file; the compiled bundle loader, the cache and revocation come
-// later. Configuration is by flags, each with a CRACHA_* environment
-// fallback (see config.go).
+// This slice wires the static authorization backend, a resolved-grants
+// fixture file and the credential cache; the compiled bundle loader and
+// revocation come later. Configuration is by flags, each with a CRACHA_*
+// environment fallback (see config.go).
 package main
 
 import (
@@ -24,7 +24,9 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/bpalermo/cracha/broker/internal/api"
 	"github.com/bpalermo/cracha/broker/internal/authn"
+	"github.com/bpalermo/cracha/broker/internal/authz"
 	"github.com/bpalermo/cracha/broker/internal/authz/static"
+	"github.com/bpalermo/cracha/broker/internal/cache"
 	"github.com/bpalermo/cracha/broker/internal/grants"
 	"github.com/bpalermo/cracha/broker/internal/issuer"
 	"github.com/bpalermo/cracha/broker/internal/sts"
@@ -96,9 +98,10 @@ func run(ctx context.Context, cfg config) error {
 		Cluster: cfg.cluster,
 		Log:     log,
 	}
+	iss := newIssuer(ctx, cfg, direct, store, log)
 	srv := &http.Server{
 		Addr:              cfg.listen,
-		Handler:           api.New(authn.New(bundles), direct, log),
+		Handler:           api.New(authn.New(bundles), iss, log),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -126,4 +129,24 @@ func run(ctx context.Context, cfg config) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
+}
+
+// newIssuer wraps the direct issuer in the credential cache of design 6.7,
+// unless --cache=false keeps every request on the direct path.
+func newIssuer(ctx context.Context, cfg config, direct *issuer.Direct, store authz.Store, log *slog.Logger) issuer.Issuer {
+	if !cfg.cache {
+		log.Warn("credential cache off; every request calls STS")
+		return direct
+	}
+	c := cache.New(direct, store, cache.Options{
+		MinRemaining:  cfg.cacheMinRemaining,
+		RefreshAt:     cfg.cacheRefreshAt,
+		MaxEntries:    cfg.cacheMaxEntries,
+		StaleCheckMax: cfg.cacheStaleCheckMax,
+		Log:           log,
+	})
+	go c.Run(ctx)
+	log.Info("credential cache on", "mode", string(c.Mode()), "min_remaining", cfg.cacheMinRemaining,
+		"refresh_at", cfg.cacheRefreshAt, "max_entries", cfg.cacheMaxEntries, "stale_check_max", cfg.cacheStaleCheckMax)
+	return c
 }

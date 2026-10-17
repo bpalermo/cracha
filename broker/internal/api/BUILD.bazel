@@ -20,6 +20,7 @@ go_test(
         "//broker/internal/authn",
         "//broker/internal/authn/authntest",
         "//broker/internal/authz",
+        "//broker/internal/cache",
         "//broker/internal/grants",
         "//broker/internal/issuer",
         "//broker/internal/sts",

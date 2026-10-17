@@ -15,6 +15,7 @@ import (
 	"github.com/bpalermo/cracha/broker/internal/authn"
 	"github.com/bpalermo/cracha/broker/internal/authn/authntest"
 	"github.com/bpalermo/cracha/broker/internal/authz"
+	"github.com/bpalermo/cracha/broker/internal/cache"
 	"github.com/bpalermo/cracha/broker/internal/grants"
 	"github.com/bpalermo/cracha/broker/internal/issuer"
 	"github.com/bpalermo/cracha/broker/internal/sts"
@@ -76,6 +77,7 @@ type fixture struct {
 	issuer  *authntest.Issuer
 	store   *fakeStore
 	sts     *fakeSTS
+	direct  *issuer.Direct
 	handler http.Handler
 	exp     time.Time
 }
@@ -108,7 +110,7 @@ func newFixture(t *testing.T) *fixture {
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	h := New(authn.New(ti.Bundle(t)), direct, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	return &fixture{issuer: ti, store: store, sts: assumer, handler: h, exp: exp}
+	return &fixture{issuer: ti, store: store, sts: assumer, direct: direct, handler: h, exp: exp}
 }
 
 func (f *fixture) get(t *testing.T, path, token string, headers ...string) *httptest.ResponseRecorder {
@@ -170,6 +172,9 @@ func TestCredentials(t *testing.T) {
 	if h.Get("Cache-Control") != "no-store" || !strings.HasPrefix(h.Get("Content-Type"), "application/json") {
 		t.Errorf("headers %v", h)
 	}
+	if _, ok := h[HeaderCache]; ok {
+		t.Errorf("%s set on the direct path: %v", HeaderCache, h)
+	}
 	if f.sts.calls != 1 {
 		t.Errorf("sts calls %d", f.sts.calls)
 	}
@@ -178,6 +183,37 @@ func TestCredentials(t *testing.T) {
 	if rec := f.get(t, "/v1/credentials", "Bearer "+f.issuer.ValidToken(t, subject)); rec.Code != http.StatusOK {
 		t.Errorf("bearer: %d", rec.Code)
 	}
+}
+
+// Through the credential cache, the response says how it was served.
+func TestCredentialsCacheHeader(t *testing.T) {
+	f := newFixture(t)
+	f.handler = New(authn.New(f.issuer.Bundle(t)), cache.New(f.direct, f.store, cache.Options{}), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	for i, want := range []string{"miss", "hit", "hit"} {
+		rec := f.get(t, "/v1/credentials", f.issuer.ValidToken(t, subject))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("fetch %d: status %d: %s", i, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get(HeaderCache); got != want {
+			t.Errorf("fetch %d: %s = %q, want %q", i, HeaderCache, got, want)
+		}
+		if rec.Header().Get(HeaderConsistencyToken) != "tok-9" || rec.Header().Get(HeaderShape) != "shape-dynamo-rw" {
+			t.Errorf("fetch %d: headers %v", i, rec.Header())
+		}
+	}
+	if f.sts.calls != 1 {
+		t.Errorf("sts calls %d, want 1", f.sts.calls)
+	}
+	// The hit re-checks the store: a store that cannot answer, with the
+	// session checked moments ago, is served as degraded; a revoked grant
+	// is a denial.
+	f.store.err = errors.New("store down")
+	if rec := f.get(t, "/v1/credentials", f.issuer.ValidToken(t, subject)); rec.Code != http.StatusOK || rec.Header().Get(HeaderCache) != "hit" {
+		t.Errorf("degraded hit: %d %v %s", rec.Code, rec.Header(), rec.Body.String())
+	}
+	f.store.err = nil
+	delete(f.store.decisions, "prod/payments/ledger")
+	f.expectForbidden(t, "/v1/credentials", f.issuer.ValidToken(t, subject), "no_grant")
 }
 
 func TestUnauthenticated(t *testing.T) {

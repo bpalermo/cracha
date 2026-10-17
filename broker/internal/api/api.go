@@ -34,6 +34,9 @@ const (
 	HeaderGrants           = "Cracha-Grants"
 	HeaderBundleVersion    = "Cracha-Bundle-Version"
 	HeaderConsistencyToken = "Cracha-Consistency-Token"
+	// HeaderCache says how the credential cache served the credentials:
+	// hit, miss or refresh (section 6.7). Absent when the cache is off.
+	HeaderCache = "Cracha-Cache"
 )
 
 // Reasons beyond the five of section 6.5, for 401 and 503.
@@ -105,6 +108,9 @@ func (h *Handler) credentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setDecisionHeaders(w, iss.Resolution)
+	if iss.Cache != "" {
+		w.Header().Set(HeaderCache, string(iss.Cache))
+	}
 	writeJSON(w, http.StatusOK, credentialsResponse{
 		AccessKeyID:     iss.Credentials.AccessKeyID,
 		SecretAccessKey: iss.Credentials.SecretAccessKey,
