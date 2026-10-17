@@ -204,17 +204,7 @@ func TestAdmit(t *testing.T) {
 
 	alreadyInjected := injectedPod("enabled", pod("enabled", injected(plainApp)))
 
-	tests := []struct {
-		name   string
-		policy ConflictPolicy
-		pod    *corev1.Pod
-		// setup can turn the request into something else or break the
-		// client.
-		request func(*admissionv1.AdmissionRequest)
-		client  func(*fake.Clientset)
-		regions Regions
-		want    want
-	}{
+	tests := []admitCase{
 		{
 			name: "unannotated service account is left alone",
 			pod:  pod("plain", plainApp),
@@ -301,6 +291,12 @@ func TestAdmit(t *testing.T) {
 				c.Env[len(c.Env)-1].Value = "sa-east-1"
 				return injectedPod("enabled", pod("enabled", c))
 			}()},
+		},
+		{
+			name:    "the region hook declining keeps the default",
+			pod:     pod("enabled", plainApp),
+			regions: regionsFunc(func(context.Context, string) (string, error) { return "", nil }),
+			want:    want{pod: injectedPod("enabled", pod("enabled", injected(plainApp)))},
 		},
 		{
 			name:    "the region hook failing denies",
@@ -444,16 +440,7 @@ func TestAdmit(t *testing.T) {
 	}
 
 	for _, c := range conflicting {
-		c := c
-		tests = append(tests, struct {
-			name    string
-			policy  ConflictPolicy
-			pod     *corev1.Pod
-			request func(*admissionv1.AdmissionRequest)
-			client  func(*fake.Clientset)
-			regions Regions
-			want    want
-		}{
+		tests = append(tests, admitCase{
 			name: "conflict " + c.Name + " is rejected",
 			pod:  pod("enabled", container("app", env("FOO", "bar"), c)),
 			want: want{denied: []string{`container "app" sets ` + c.Name}, code: 422},
@@ -462,22 +449,7 @@ func TestAdmit(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			client := fakeClient()
-			if tc.client != nil {
-				tc.client(client)
-			}
-			var opts []Option
-			if tc.regions != nil {
-				opts = append(opts, WithRegions(tc.regions))
-			}
-			m, err := New(Config{
-				BrokerURL:      "https://broker.cracha.svc",
-				DefaultRegion:  region,
-				ConflictingEnv: tc.policy,
-			}, clientLookup{client}, opts...)
-			if err != nil {
-				t.Fatal(err)
-			}
+			m := tc.mutator(t)
 			req := createRequest(t, tc.pod)
 			if tc.request != nil {
 				tc.request(req)
@@ -492,51 +464,144 @@ func TestAdmit(t *testing.T) {
 			if d := diff(t, original, tc.pod); d != "" {
 				t.Errorf("Admit modified its input (-before +after):\n%s", d)
 			}
-			switch {
-			case tc.want.denied != nil:
-				if resp.Allowed {
-					t.Fatalf("allowed, want denied with %q; patch %s", tc.want.denied, resp.Patch)
-				}
-				if resp.Result == nil {
-					t.Fatal("denied without a result")
-				}
-				for _, want := range tc.want.denied {
-					if !strings.Contains(resp.Result.Message, want) {
-						t.Errorf("denial message %q does not contain %q", resp.Result.Message, want)
-					}
-				}
-				if resp.Result.Code != tc.want.code {
-					t.Errorf("denial code %d, want %d", resp.Result.Code, tc.want.code)
-				}
-			case tc.want.unchanged:
-				if !resp.Allowed {
-					t.Fatalf("denied: %v", resp.Result)
-				}
-				if resp.Patch != nil || resp.PatchType != nil {
-					t.Fatalf("patched: %s", resp.Patch)
-				}
-			default:
-				if !resp.Allowed {
-					t.Fatalf("denied: %v", resp.Result)
-				}
-				got := apply(t, tc.pod, resp)
-				if d := diff(t, tc.want.pod, got); d != "" {
-					t.Errorf("patched pod (-want +got):\n%s\npatch: %s", d, resp.Patch)
-				}
-				// Once more on the result: nothing is left to do.
-				again := m.Admit(context.Background(), createRequest(t, got))
-				if !again.Allowed || again.Patch != nil {
-					t.Errorf("admitting the patched pod again: allowed=%v patch=%s", again.Allowed, again.Patch)
-				}
-			}
-			if len(resp.Warnings) != len(tc.want.warnings) {
-				t.Errorf("warnings %q, want %d matching %q", resp.Warnings, len(tc.want.warnings), tc.want.warnings)
-			} else {
-				for i, want := range tc.want.warnings {
-					if !strings.Contains(resp.Warnings[i], want) {
-						t.Errorf("warning %d %q does not contain %q", i, resp.Warnings[i], want)
-					}
-				}
+			tc.want.check(t, m, tc.pod, resp)
+		})
+	}
+}
+
+// admitCase is one TestAdmit case.
+type admitCase struct {
+	name   string
+	policy ConflictPolicy
+	pod    *corev1.Pod
+	// request can turn the request into something else; client can break
+	// the client.
+	request func(*admissionv1.AdmissionRequest)
+	client  func(*fake.Clientset)
+	regions Regions
+	want    want
+}
+
+// mutator builds the Mutator under test, over a fake client the case may
+// have broken and with its region hook, if any.
+func (tc admitCase) mutator(t *testing.T) *Mutator {
+	t.Helper()
+	client := fakeClient()
+	if tc.client != nil {
+		tc.client(client)
+	}
+	var opts []Option
+	if tc.regions != nil {
+		opts = append(opts, WithRegions(tc.regions))
+	}
+	m, err := New(Config{
+		BrokerURL:      "https://broker.cracha.svc",
+		DefaultRegion:  region,
+		ConflictingEnv: tc.policy,
+	}, clientLookup{client}, opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// check asserts that resp, the decision on p, is the one wanted.
+func (w want) check(t *testing.T, m *Mutator, p *corev1.Pod, resp *admissionv1.AdmissionResponse) {
+	t.Helper()
+	switch {
+	case w.denied != nil:
+		w.checkDenied(t, resp)
+	case w.unchanged:
+		checkUnchanged(t, resp)
+	default:
+		w.checkPatched(t, m, p, resp)
+	}
+	w.checkWarnings(t, resp.Warnings)
+}
+
+func (w want) checkDenied(t *testing.T, resp *admissionv1.AdmissionResponse) {
+	t.Helper()
+	if resp.Allowed {
+		t.Fatalf("allowed, want denied with %q; patch %s", w.denied, resp.Patch)
+	}
+	if resp.Result == nil {
+		t.Fatal("denied without a result")
+	}
+	for _, want := range w.denied {
+		if !strings.Contains(resp.Result.Message, want) {
+			t.Errorf("denial message %q does not contain %q", resp.Result.Message, want)
+		}
+	}
+	if resp.Result.Code != w.code {
+		t.Errorf("denial code %d, want %d", resp.Result.Code, w.code)
+	}
+}
+
+func checkUnchanged(t *testing.T, resp *admissionv1.AdmissionResponse) {
+	t.Helper()
+	if !resp.Allowed {
+		t.Fatalf("denied: %v", resp.Result)
+	}
+	if resp.Patch != nil || resp.PatchType != nil {
+		t.Fatalf("patched: %s", resp.Patch)
+	}
+}
+
+// checkPatched applies the patch to p and compares the result with the pod
+// wanted, then admits that result once more: nothing must be left to do.
+func (w want) checkPatched(t *testing.T, m *Mutator, p *corev1.Pod, resp *admissionv1.AdmissionResponse) {
+	t.Helper()
+	if !resp.Allowed {
+		t.Fatalf("denied: %v", resp.Result)
+	}
+	got := apply(t, p, resp)
+	if d := diff(t, w.pod, got); d != "" {
+		t.Errorf("patched pod (-want +got):\n%s\npatch: %s", d, resp.Patch)
+	}
+	again := m.Admit(context.Background(), createRequest(t, got))
+	if !again.Allowed || again.Patch != nil {
+		t.Errorf("admitting the patched pod again: allowed=%v patch=%s", again.Allowed, again.Patch)
+	}
+}
+
+func (w want) checkWarnings(t *testing.T, warnings []string) {
+	t.Helper()
+	if len(warnings) != len(w.warnings) {
+		t.Errorf("warnings %q, want %d matching %q", warnings, len(w.warnings), w.warnings)
+		return
+	}
+	for i, want := range w.warnings {
+		if !strings.Contains(warnings[i], want) {
+			t.Errorf("warning %d %q does not contain %q", i, warnings[i], want)
+		}
+	}
+}
+
+func TestIsPodCreate(t *testing.T) {
+	podCreate := func() *admissionv1.AdmissionRequest {
+		return &admissionv1.AdmissionRequest{
+			Operation: admissionv1.Create,
+			Kind:      metav1.GroupVersionKind{Version: "v1", Kind: "Pod"},
+		}
+	}
+	cases := []struct {
+		name   string
+		change func(*admissionv1.AdmissionRequest)
+		want   bool
+	}{
+		{name: "a pod create", change: func(*admissionv1.AdmissionRequest) {}, want: true},
+		{name: "an update", change: func(r *admissionv1.AdmissionRequest) { r.Operation = admissionv1.Update }},
+		{name: "a subresource", change: func(r *admissionv1.AdmissionRequest) { r.SubResource = "status" }},
+		{name: "another group", change: func(r *admissionv1.AdmissionRequest) { r.Kind.Group = "apps" }},
+		{name: "another version", change: func(r *admissionv1.AdmissionRequest) { r.Kind.Version = "v1beta1" }},
+		{name: "another kind", change: func(r *admissionv1.AdmissionRequest) { r.Kind.Kind = "PodTemplate" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := podCreate()
+			tc.change(req)
+			if got := isPodCreate(req); got != tc.want {
+				t.Errorf("isPodCreate = %v, want %v", got, tc.want)
 			}
 		})
 	}

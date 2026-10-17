@@ -215,67 +215,104 @@ func Conflicts(name string) bool {
 // failure to decide, and otherwise answers with the patch, or without one
 // when the pod needs nothing.
 func (m *Mutator) Admit(ctx context.Context, req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
-	if req.Operation != admissionv1.Create || req.SubResource != "" ||
-		req.Kind.Group != "" || req.Kind.Version != "v1" || req.Kind.Kind != "Pod" {
+	if !isPodCreate(req) {
 		return allowed(req.UID)
 	}
-
 	var pod corev1.Pod
 	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
 		return denied(req.UID, http.StatusBadRequest, metav1.StatusReasonBadRequest,
 			fmt.Sprintf("cracha: decoding the pod: %v", err))
 	}
-
-	namespace := req.Namespace
-	if namespace == "" {
-		namespace = pod.Namespace
-	}
-	saName := pod.Spec.ServiceAccountName
-	if saName == "" {
-		saName = "default"
-	}
-	sa, err := m.sas.Get(ctx, namespace, saName)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return denied(req.UID, http.StatusUnprocessableEntity, metav1.StatusReasonInvalid,
-				fmt.Sprintf("cracha: service account %s/%s not found", namespace, saName))
-		}
-		return denied(req.UID, http.StatusServiceUnavailable, metav1.StatusReasonServiceUnavailable,
-			fmt.Sprintf("cracha: looking up service account %s/%s: %v", namespace, saName, err))
+	namespace, saName := subject(req, &pod)
+	sa, deny := m.serviceAccount(ctx, req.UID, namespace, saName)
+	if deny != nil {
+		return deny
 	}
 	if sa.Annotations[AnnotationEnabled] != "true" {
 		return allowed(req.UID)
 	}
-
-	region := m.cfg.DefaultRegion
-	if m.regions != nil {
-		override, err := m.regions.Region(ctx, namespace)
-		if err != nil {
-			return denied(req.UID, http.StatusServiceUnavailable, metav1.StatusReasonServiceUnavailable,
-				fmt.Sprintf("cracha: resolving the region of namespace %s: %v", namespace, err))
-		}
-		if override != "" {
-			region = override
-		}
+	region, deny := m.region(ctx, req.UID, namespace)
+	if deny != nil {
+		return deny
 	}
-
 	p := planner{cfg: m.cfg, region: region}
 	p.plan(&pod)
+	return p.response(req.UID)
+}
+
+// isPodCreate reports whether req is the creation of a core/v1 Pod itself,
+// the one operation the webhook acts on.
+func isPodCreate(req *admissionv1.AdmissionRequest) bool {
+	return req.Operation == admissionv1.Create && req.SubResource == "" &&
+		req.Kind.Group == "" && req.Kind.Version == "v1" && req.Kind.Kind == "Pod"
+}
+
+// subject names the ServiceAccount the pod runs as: in the request's
+// namespace, or the pod's own when the request names none, and the pod's
+// service account name, default when it sets none.
+func subject(req *admissionv1.AdmissionRequest, pod *corev1.Pod) (namespace, name string) {
+	namespace = req.Namespace
+	if namespace == "" {
+		namespace = pod.Namespace
+	}
+	name = pod.Spec.ServiceAccountName
+	if name == "" {
+		name = "default"
+	}
+	return namespace, name
+}
+
+// serviceAccount looks the ServiceAccount up, or returns the denial: a
+// missing one is the pod's fault, any other failure is the API server's.
+func (m *Mutator) serviceAccount(ctx context.Context, uid types.UID, namespace, name string) (*corev1.ServiceAccount, *admissionv1.AdmissionResponse) {
+	sa, err := m.sas.Get(ctx, namespace, name)
+	if err == nil {
+		return sa, nil
+	}
+	if apierrors.IsNotFound(err) {
+		return nil, denied(uid, http.StatusUnprocessableEntity, metav1.StatusReasonInvalid,
+			fmt.Sprintf("cracha: service account %s/%s not found", namespace, name))
+	}
+	return nil, denied(uid, http.StatusServiceUnavailable, metav1.StatusReasonServiceUnavailable,
+		fmt.Sprintf("cracha: looking up service account %s/%s: %v", namespace, name, err))
+}
+
+// region is the AWS_REGION to inject in namespace: the Regions hook's
+// override when there is one, otherwise the default. A failing hook denies.
+func (m *Mutator) region(ctx context.Context, uid types.UID, namespace string) (string, *admissionv1.AdmissionResponse) {
+	if m.regions == nil {
+		return m.cfg.DefaultRegion, nil
+	}
+	override, err := m.regions.Region(ctx, namespace)
+	if err != nil {
+		return "", denied(uid, http.StatusServiceUnavailable, metav1.StatusReasonServiceUnavailable,
+			fmt.Sprintf("cracha: resolving the region of namespace %s: %v", namespace, err))
+	}
+	if override == "" {
+		return m.cfg.DefaultRegion, nil
+	}
+	return override, nil
+}
+
+// response turns the plan into the decision: a denial naming every problem,
+// an unchanged admission when the pod needs nothing, or the patch with the
+// warnings collected along the way.
+func (p *planner) response(uid types.UID) *admissionv1.AdmissionResponse {
 	if len(p.problems) > 0 {
-		return denied(req.UID, http.StatusUnprocessableEntity, metav1.StatusReasonInvalid,
+		return denied(uid, http.StatusUnprocessableEntity, metav1.StatusReasonInvalid,
 			"cracha: "+strings.Join(p.problems, "; "))
 	}
 	if len(p.ops) == 0 {
-		return allowed(req.UID)
+		return allowed(uid)
 	}
 	patch, err := json.Marshal(p.ops)
 	if err != nil {
-		return denied(req.UID, http.StatusInternalServerError, metav1.StatusReasonInternalError,
+		return denied(uid, http.StatusInternalServerError, metav1.StatusReasonInternalError,
 			fmt.Sprintf("cracha: encoding the patch: %v", err))
 	}
 	patchType := admissionv1.PatchTypeJSONPatch
 	return &admissionv1.AdmissionResponse{
-		UID:       req.UID,
+		UID:       uid,
 		Allowed:   true,
 		PatchType: &patchType,
 		Patch:     patch,
