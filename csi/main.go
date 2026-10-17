@@ -44,7 +44,7 @@ func main() {
 		maxTokenTTL     = flag.Duration("max-token-ttl", token.DefaultMaxTTL, "longest JWT-SVID lifetime written to disk; a longer token is refused")
 		publishDeadline = flag.Duration("publish-deadline", issuer.DefaultDeadline, "how long one NodePublishVolume retries a not-yet-known pod or an unavailable issuer")
 		tokenUID        = flag.Int("token-uid", 0, "owner of the token file (-1 keeps the plugin's own)")
-		tokenGID        = flag.Int("token-gid", 0, "group of the token file (-1 keeps the plugin's own)")
+		tokenGID        = flag.Int("token-gid", 0, "group of the token file for a pod without an fsGroup; a pod's fsGroup is the group otherwise (-1 keeps the plugin's own)")
 		healthz         = flag.String("healthz", ":9808", "address of the /healthz endpoint (empty disables it)")
 		logLevel        = flag.String("log-level", "info", "log level: debug, info, warn or error")
 	)

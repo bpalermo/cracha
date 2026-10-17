@@ -12,7 +12,12 @@
 //     TokenReview and requires it to be bound to that very pod UID;
 //  3. fetches the pod's JWT-SVID through the issuer adapter, checks its
 //     claims (audience, subject, TTL) and writes it atomically to
-//     <target_path>/token.
+//     <target_path>/token, mode 0640, owned by the pod's fsGroup.
+//
+// The group is the CSI spec's volume mount group: the plugin advertises
+// VOLUME_MOUNT_GROUP, kubelet passes the pod's fsGroup in the mount
+// capability, and the token is given that group so that a pod running as any
+// user reads it. A pod without an fsGroup gets the plugin's --token-gid.
 //
 // Nothing is mounted. The token is written straight into the target path
 // kubelet created, as a plain file on the kubelet's volume directory, and the
@@ -20,9 +25,9 @@
 // the volume says so, which the webhook does). The SPIFFE CSI driver takes
 // the same approach for its socket directory. The trade-off: a tmpfs mount
 // would keep the token off the node's disk, but mounting needs CAP_SYS_ADMIN,
-// and section 7.7 keeps the plugin unprivileged; what would be on disk is a
+// and section 7.7 keeps the plugin to CAP_CHOWN; what would be on disk is a
 // token that lives at most five minutes, bound to one audience, in a directory
-// only root reads on the host.
+// only root and the pod's group read on the host.
 package driver
 
 import (
@@ -32,9 +37,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -177,9 +184,18 @@ func (d *Driver) NodeGetInfo(context.Context, *csi.NodeGetInfoRequest) (*csi.Nod
 	return &csi.NodeGetInfoResponse{NodeId: d.cfg.NodeID}, nil
 }
 
-// NodeGetCapabilities advertises none: no staging, no stats, no expansion.
+// NodeGetCapabilities advertises VOLUME_MOUNT_GROUP: kubelet then passes the
+// pod's fsGroup to NodePublishVolume as the volume mount group, and the
+// plugin gives the token that group rather than kubelet walking the volume
+// after the fact. No staging, no stats, no expansion.
 func (d *Driver) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
-	return &csi.NodeGetCapabilitiesResponse{}, nil
+	return &csi.NodeGetCapabilitiesResponse{
+		Capabilities: []*csi.NodeServiceCapability{{
+			Type: &csi.NodeServiceCapability_Rpc{
+				Rpc: &csi.NodeServiceCapability_RPC{Type: csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP},
+			},
+		}},
+	}, nil
 }
 
 // publishRequest is a validated NodePublishVolume.
@@ -188,6 +204,9 @@ type publishRequest struct {
 	target   string
 	pod      issuer.PodRef
 	sa       string
+	// mountGroup is the pod's fsGroup, from the volume capability's mount
+	// group; -1 when the pod sets none.
+	mountGroup int
 	// saToken is the bound service account token kubelet issued for the
 	// plugin's audience, and saTokenExpiry when kubelet says it expires.
 	saToken       string
@@ -203,7 +222,8 @@ type saTokens map[string]struct {
 
 // NodePublishVolume writes the pod's JWT-SVID into target_path. On a
 // republish of a volume it knows, it re-runs the context check and replaces
-// the token only when less than half its lifetime remains.
+// the token only when less than half its lifetime remains, when it is gone,
+// or when its owner is no longer the one the request asks for.
 func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 	pr, err := d.validatePublish(req)
 	if err != nil {
@@ -240,13 +260,44 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 		return nil, status.Errorf(codes.PermissionDenied, "service account token check failed: %v", err)
 	}
 
-	if known && entry.fresh(now) && tokenExists(pr.target) {
+	owner := d.owner(pr)
+	if known && entry.serves(now, owner) {
 		d.registry.Put(entry)
 		log.Debug("republish: the token is fresh", "expires", entry.TokenExpiry)
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
-	// Fetch (step 3) and write (step 4).
+	claims, err := d.fetchAndWrite(ctx, log, pr, owner, now)
+	if err != nil {
+		return nil, err
+	}
+	entry.TokenIssued = claims.IssuedAt
+	if entry.TokenIssued.IsZero() {
+		entry.TokenIssued = now
+	}
+	entry.TokenExpiry = claims.Expiry
+	entry.TokenOwner = owner
+	d.registry.Put(entry)
+
+	log.Info("token written", "spiffe_id", claims.ID.String(), "expires", claims.Expiry,
+		"uid", owner.UID, "gid", owner.GID, "republish", known)
+	return &csi.NodePublishVolumeResponse{}, nil
+}
+
+// owner is the owner the token gets: the configured one, with the pod's
+// fsGroup as the group when kubelet passed one.
+func (d *Driver) owner(pr *publishRequest) token.Owner {
+	o := d.cfg.Owner
+	if pr.mountGroup >= 0 {
+		o.GID = pr.mountGroup
+	}
+	return o
+}
+
+// fetchAndWrite fetches the pod's JWT-SVID, checks it and writes it for
+// owner (design 7.3, steps 3 and 4). The error is the status the publish
+// returns.
+func (d *Driver) fetchAndWrite(ctx context.Context, log *slog.Logger, pr *publishRequest, owner token.Owner, now time.Time) (*token.Claims, error) {
 	tok, _, err := d.issuer.FetchJWTSVID(ctx, pr.pod, d.cfg.Audience)
 	if err != nil {
 		log.Error("cannot fetch the pod's JWT-SVID", "kind", issuer.Classify(err).String(), "error", err)
@@ -269,21 +320,11 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 		}
 		return nil, status.Errorf(codes.FailedPrecondition, "the issuer's JWT-SVID was refused: %v", err)
 	}
-	if err := token.Write(pr.target, tok, d.cfg.Owner); err != nil {
+	if err := token.Write(pr.target, tok, owner); err != nil {
 		log.Error("cannot write the token", "error", err)
 		return nil, status.Errorf(codes.Internal, "writing the token: %v", err)
 	}
-
-	entry.TokenIssued = claims.IssuedAt
-	if entry.TokenIssued.IsZero() {
-		entry.TokenIssued = now
-	}
-	entry.TokenExpiry = claims.Expiry
-	d.registry.Put(entry)
-
-	log.Info("token written", "spiffe_id", claims.ID.String(), "expires", claims.Expiry,
-		"republish", known)
-	return &csi.NodePublishVolumeResponse{}, nil
+	return claims, nil
 }
 
 // checkContext verifies the bound service account token of pr against the
@@ -330,18 +371,16 @@ func tokenExists(target string) bool {
 }
 
 func (d *Driver) validatePublish(req *csi.NodePublishVolumeRequest) (*publishRequest, error) {
-	if req.GetVolumeId() == "" {
-		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
-	}
-	if req.GetTargetPath() == "" {
-		return nil, status.Error(codes.InvalidArgument, "target_path is required")
-	}
-	target := filepath.Clean(req.GetTargetPath())
-	if !filepath.IsAbs(target) {
-		return nil, status.Errorf(codes.InvalidArgument, "target_path %q is not absolute", req.GetTargetPath())
+	target, err := validateTarget(req.GetVolumeId(), req.GetTargetPath())
+	if err != nil {
+		return nil, err
 	}
 	if req.GetVolumeCapability().GetBlock() != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%s only serves filesystem (mount) volumes", DriverName)
+	}
+	group, err := mountGroup(req.GetVolumeCapability().GetMount())
+	if err != nil {
+		return nil, err
 	}
 	vc := req.GetVolumeContext()
 	if vc[ctxEphemeral] != "true" {
@@ -360,41 +399,81 @@ func (d *Driver) validatePublish(req *csi.NodePublishVolumeRequest) (*publishReq
 				"volume_context %s is missing (is podInfoOnMount enabled on the CSIDriver?)", key)
 		}
 	}
-	var tokens saTokens
-	if raw := vc[ctxSATokens]; raw == "" {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"volume_context %s is missing (does the CSIDriver request a token for audience %q?)", ctxSATokens, d.cfg.SATokenAudience)
-	} else if err := json.Unmarshal([]byte(raw), &tokens); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "volume_context %s is not valid JSON: %v", ctxSATokens, err)
-	}
-	sa, ok := tokens[d.cfg.SATokenAudience]
-	if !ok || sa.Token == "" {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"volume_context %s has no token for audience %q (the CSIDriver's tokenRequests must request it)", ctxSATokens, d.cfg.SATokenAudience)
+	saToken, saTokenExpiry, err := d.saToken(vc)
+	if err != nil {
+		return nil, err
 	}
 	return &publishRequest{
 		volumeID:      req.GetVolumeId(),
 		target:        target,
 		pod:           issuer.PodRef{Namespace: vc[ctxPodNamespace], Name: vc[ctxPodName], UID: podUID},
 		sa:            vc[ctxSAName],
-		saToken:       sa.Token,
-		saTokenExpiry: sa.ExpirationTimestamp,
+		mountGroup:    group,
+		saToken:       saToken,
+		saTokenExpiry: saTokenExpiry,
 	}, nil
+}
+
+// validateTarget checks the volume ID and the target path every Node call
+// carries and returns the cleaned path.
+func validateTarget(volumeID, targetPath string) (string, error) {
+	if volumeID == "" {
+		return "", status.Error(codes.InvalidArgument, "volume_id is required")
+	}
+	if targetPath == "" {
+		return "", status.Error(codes.InvalidArgument, "target_path is required")
+	}
+	target := filepath.Clean(targetPath)
+	if !filepath.IsAbs(target) {
+		return "", status.Errorf(codes.InvalidArgument, "target_path %q is not absolute", targetPath)
+	}
+	return target, nil
+}
+
+// mountGroup reads the volume mount group of a mount capability: the pod's
+// fsGroup, which kubelet passes because the plugin advertises
+// VOLUME_MOUNT_GROUP. -1 when the pod sets none. The spec allows any string,
+// so a value that is not a group ID is refused.
+func mountGroup(m *csi.VolumeCapability_MountVolume) (int, error) {
+	raw := m.GetVolumeMountGroup()
+	if raw == "" {
+		return -1, nil
+	}
+	gid, err := strconv.ParseUint(raw, 10, 32)
+	if err != nil || gid == math.MaxUint32 {
+		return -1, status.Errorf(codes.InvalidArgument,
+			"volume_capability.mount.volume_mount_group %q is not a numeric group ID", raw)
+	}
+	return int(gid), nil
+}
+
+// saToken takes the bound service account token for the plugin's audience
+// out of the volume context.
+func (d *Driver) saToken(vc map[string]string) (string, time.Time, error) {
+	raw := vc[ctxSATokens]
+	if raw == "" {
+		return "", time.Time{}, status.Errorf(codes.InvalidArgument,
+			"volume_context %s is missing (does the CSIDriver request a token for audience %q?)", ctxSATokens, d.cfg.SATokenAudience)
+	}
+	var tokens saTokens
+	if err := json.Unmarshal([]byte(raw), &tokens); err != nil {
+		return "", time.Time{}, status.Errorf(codes.InvalidArgument, "volume_context %s is not valid JSON: %v", ctxSATokens, err)
+	}
+	sa, ok := tokens[d.cfg.SATokenAudience]
+	if !ok || sa.Token == "" {
+		return "", time.Time{}, status.Errorf(codes.InvalidArgument,
+			"volume_context %s has no token for audience %q (the CSIDriver's tokenRequests must request it)", ctxSATokens, d.cfg.SATokenAudience)
+	}
+	return sa.Token, sa.ExpirationTimestamp, nil
 }
 
 // NodeUnpublishVolume removes the token and the target directory and drops
 // the registry entry. Every step tolerates "already done", so an unpublish of
 // something never published, or a retry after a partial failure, is OK.
 func (d *Driver) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-	if req.GetVolumeId() == "" {
-		return nil, status.Error(codes.InvalidArgument, "volume_id is required")
-	}
-	if req.GetTargetPath() == "" {
-		return nil, status.Error(codes.InvalidArgument, "target_path is required")
-	}
-	target := filepath.Clean(req.GetTargetPath())
-	if !filepath.IsAbs(target) {
-		return nil, status.Errorf(codes.InvalidArgument, "target_path %q is not absolute", req.GetTargetPath())
+	target, err := validateTarget(req.GetVolumeId(), req.GetTargetPath())
+	if err != nil {
+		return nil, err
 	}
 	log := d.log.With("volume_id", req.GetVolumeId(), "target_path", target)
 

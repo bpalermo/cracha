@@ -6,7 +6,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -489,9 +491,12 @@ func TestIdentityAndNodeInfo(t *testing.T) {
 	if err != nil || node.GetNodeId() != "node-1" {
 		t.Errorf("NodeGetInfo: %v, %v", node, err)
 	}
+	// VOLUME_MOUNT_GROUP and nothing else: kubelet hands the pod's fsGroup
+	// to NodePublishVolume only when the plugin advertises it.
 	ncaps, err := h.d.NodeGetCapabilities(ctx, &csi.NodeGetCapabilitiesRequest{})
-	if err != nil || len(ncaps.GetCapabilities()) != 0 {
-		t.Errorf("NodeGetCapabilities: %v, %v", ncaps, err)
+	if err != nil || len(ncaps.GetCapabilities()) != 1 ||
+		ncaps.GetCapabilities()[0].GetRpc().GetType() != csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP {
+		t.Errorf("NodeGetCapabilities: %v, %v; want VOLUME_MOUNT_GROUP alone", ncaps, err)
 	}
 	if _, err := h.d.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{}); status.Code(err) != codes.Unimplemented {
 		t.Errorf("NodeStageVolume: %v", err)
@@ -501,5 +506,172 @@ func TestIdentityAndNodeInfo(t *testing.T) {
 func TestNewRequiresNodeID(t *testing.T) {
 	if _, err := New(Config{}, issuer.NewFake(), goodReviewer(), nil); err == nil {
 		t.Error("New without a node ID succeeded")
+	}
+}
+
+// withMountGroup sets the volume mount group of a publish request: what
+// kubelet passes for a pod with an fsGroup.
+func withMountGroup(req *csi.NodePublishVolumeRequest, group string) *csi.NodePublishVolumeRequest {
+	req.VolumeCapability.GetMount().VolumeMountGroup = group
+	return req
+}
+
+// usableGroup returns a group other than the process's primary one that it
+// may give a file without CAP_CHOWN, and skips the test when there is none:
+// a sandbox with a user namespace maps the supplementary groups to the
+// overflow group, which cannot own a file.
+func usableGroup(t *testing.T) int {
+	t.Helper()
+	groups, err := os.Getgroups()
+	if err != nil {
+		t.Fatalf("Getgroups: %v", err)
+	}
+	probe := filepath.Join(t.TempDir(), "probe")
+	if err := os.WriteFile(probe, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var refused []string
+	for _, g := range groups {
+		if g == os.Getgid() {
+			continue
+		}
+		if err := os.Chown(probe, -1, g); err != nil {
+			refused = append(refused, err.Error())
+			continue
+		}
+		return g
+	}
+	t.Skipf("skipping: no group of this process but its primary one (%d) may own a file here: %v", os.Getgid(), refused)
+	return -1
+}
+
+// checkOwner asserts the owner and mode of the token and of its directory.
+func (h *harness) checkOwner(t *testing.T, uid, gid int) {
+	t.Helper()
+	for _, c := range []struct {
+		path string
+		mode os.FileMode
+	}{
+		{filepath.Join(h.target, token.FileName), token.Mode},
+		{h.target, token.DirMode},
+	} {
+		fi, err := os.Stat(c.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != c.mode {
+			t.Errorf("%s: mode %o, want %o", c.path, fi.Mode().Perm(), c.mode)
+		}
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok {
+			t.Fatalf("%s: no stat", c.path)
+		}
+		if int(st.Uid) != uid || int(st.Gid) != gid {
+			t.Errorf("%s: owner %d:%d, want %d:%d", c.path, st.Uid, st.Gid, uid, gid)
+		}
+	}
+}
+
+// A pod with an fsGroup: kubelet passes it as the volume mount group and the
+// token is written with that group, 0640, in a directory of that group.
+func TestPublishMountGroup(t *testing.T) {
+	gid := usableGroup(t)
+	iss := issuer.NewFake()
+	h := newHarness(t, iss, goodReviewer())
+	*iss = *issuer.NewFake(mint(h.clock, 5*time.Minute))
+
+	if err := h.publish(t, withMountGroup(h.publishRequest(t, saToken1), strconv.Itoa(gid))); err != nil {
+		t.Fatalf("NodePublishVolume with a mount group: %v", err)
+	}
+	h.checkOwner(t, os.Getuid(), gid)
+	entry, _ := h.d.Registry().Get(volumeID)
+	if entry.TokenOwner != (token.Owner{UID: os.Getuid(), GID: gid}) {
+		t.Errorf("registry owner %+v, want uid %d gid %d", entry.TokenOwner, os.Getuid(), gid)
+	}
+}
+
+// A pod without an fsGroup: the token gets the configured owner, the
+// plugin's --token-uid and --token-gid.
+func TestPublishWithoutMountGroup(t *testing.T) {
+	iss := issuer.NewFake()
+	h := newHarness(t, iss, goodReviewer())
+	*iss = *issuer.NewFake(mint(h.clock, 5*time.Minute))
+
+	req := h.publishRequest(t, saToken1)
+	if got := req.VolumeCapability.GetMount().GetVolumeMountGroup(); got != "" {
+		t.Fatalf("the request carries a mount group %q", got)
+	}
+	if err := h.publish(t, req); err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+	h.checkOwner(t, os.Getuid(), os.Getgid())
+}
+
+// A mount group that is not a group ID is refused before anything is
+// fetched or written.
+func TestPublishRejectsInvalidMountGroup(t *testing.T) {
+	iss := issuer.NewFake()
+	h := newHarness(t, iss, goodReviewer())
+	*iss = *issuer.NewFake(mint(h.clock, 5*time.Minute))
+
+	for _, group := range []string{"nobody", "-1", "1.5", "4294967295", "1e3", " 1"} {
+		t.Run(group, func(t *testing.T) {
+			err := h.publish(t, withMountGroup(h.publishRequest(t, saToken1), group))
+			wantCode(t, err, codes.InvalidArgument)
+			if !strings.Contains(err.Error(), "volume_mount_group") {
+				t.Errorf("the rejection does not name the field: %v", err)
+			}
+		})
+	}
+	if n := len(iss.Calls()); n != 0 {
+		t.Errorf("issuer called %d times for rejected requests", n)
+	}
+	if n := h.reviewer.Calls(); n != 0 {
+		t.Errorf("reviewer called %d times for rejected requests", n)
+	}
+	if _, err := os.Stat(h.target); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the target directory was created: %v", err)
+	}
+}
+
+// A republish that asks for another group (which cannot happen for one pod,
+// since the fsGroup is in the pod spec) rewrites the token for it even though
+// the one on disk is fresh.
+func TestRepublishRewritesForNewMountGroup(t *testing.T) {
+	gid := usableGroup(t)
+	iss := issuer.NewFake()
+	h := newHarness(t, iss, goodReviewer())
+	first := mint(h.clock, 5*time.Minute)
+	*iss = *issuer.NewFake(first)
+
+	if err := h.publish(t, h.publishRequest(t, saToken1)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	h.checkOwner(t, os.Getuid(), os.Getgid())
+
+	h.clock.now = t0.Add(time.Minute)
+	second := mint(h.clock, 5*time.Minute)
+	*iss = *issuer.NewFake(second)
+	if err := h.publish(t, withMountGroup(h.publishRequest(t, saToken1), strconv.Itoa(gid))); err != nil {
+		t.Fatalf("republish with a mount group: %v", err)
+	}
+	if n := len(iss.Calls()); n != 1 {
+		t.Errorf("issuer called %d times on the new fake, want 1: a new group means a rewrite", n)
+	}
+	if h.readToken(t) != second.Token {
+		t.Error("the token was not rewritten for the new group")
+	}
+	h.checkOwner(t, os.Getuid(), gid)
+
+	// The same group again: the fresh token stays.
+	h.clock.now = t0.Add(2 * time.Minute)
+	if err := h.publish(t, withMountGroup(h.publishRequest(t, saToken1), strconv.Itoa(gid))); err != nil {
+		t.Fatalf("republish with the same mount group: %v", err)
+	}
+	if n := len(iss.Calls()); n != 1 {
+		t.Errorf("issuer called %d times, want 1: the same group keeps the fresh token", n)
+	}
+	if h.readToken(t) != second.Token {
+		t.Error("the token was replaced although fresh and owned by the right group")
 	}
 }
