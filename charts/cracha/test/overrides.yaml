@@ -23,6 +23,12 @@ broker:
     partner.example.net: partner
   awsRegion: eu-west-1
   logLevel: debug
+  cache:
+    enabled: false
+    minRemaining: 15m
+    refreshAt: 0.5
+    maxEntries: 500
+    staleCheckMax: 5m
   workloadAPI:
     volume:
       csi:

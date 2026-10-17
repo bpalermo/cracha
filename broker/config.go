@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/bpalermo/cracha/broker/internal/bundle"
+	"github.com/bpalermo/cracha/broker/internal/cache"
+	"github.com/bpalermo/cracha/broker/internal/grants"
 	"github.com/bpalermo/cracha/common/idenc"
 )
 
@@ -37,6 +39,14 @@ type config struct {
 	bundleVerifyKey    string
 	bundleKMSKey       string
 	bundlePollInterval string
+
+	// The credential cache (design 6.7); off keeps every request on the
+	// direct path, for debugging.
+	cache              bool
+	cacheMinRemaining  time.Duration
+	cacheRefreshAt     float64
+	cacheMaxEntries    int
+	cacheStaleCheckMax time.Duration
 
 	labels       idenc.Labels
 	bundle       bundle.Location
@@ -90,6 +100,33 @@ func (env envDefaults) boolean(flag string, def bool) bool {
 	return err == nil && b
 }
 
+// duration is the environment's value for the flag parsed as a duration;
+// def when unset or not a duration.
+func (env envDefaults) duration(flag string, def time.Duration) time.Duration {
+	if d, err := time.ParseDuration(env.str(flag, "")); err == nil {
+		return d
+	}
+	return def
+}
+
+// float is the environment's value for the flag parsed as a float; def when
+// unset or not a float.
+func (env envDefaults) float(flag string, def float64) float64 {
+	if f, err := strconv.ParseFloat(env.str(flag, ""), 64); err == nil {
+		return f
+	}
+	return def
+}
+
+// integer is the environment's value for the flag parsed as an int; def
+// when unset or not an int.
+func (env envDefaults) integer(flag string, def int) int {
+	if i, err := strconv.Atoi(env.str(flag, "")); err == nil {
+		return i
+	}
+	return def
+}
+
 // bindFlags declares the broker's flags on fs with their defaults from env.
 func (c *config) bindFlags(fs *flag.FlagSet, env envDefaults) {
 	fs.StringVar(&c.listen, "listen", env.str("listen", ":8443"), "address to listen on")
@@ -108,6 +145,34 @@ func (c *config) bindFlags(fs *flag.FlagSet, env envDefaults) {
 	fs.StringVar(&c.awsRegion, "aws-region", env.str("aws-region", ""), "AWS region for STS; the SDK's default chain when empty")
 	fs.StringVar(&c.logLevel, "log-level", env.str("log-level", "info"), "log level: debug, info, warn or error")
 	fs.BoolVar(&c.showVersion, "version", false, "print the version and exit")
+	c.bindCacheFlags(fs, env)
+}
+
+// bindCacheFlags declares the credential cache's flags (design 6.7).
+func (c *config) bindCacheFlags(fs *flag.FlagSet, env envDefaults) {
+	fs.BoolVar(&c.cache, "cache", env.boolean("cache", true), "cache issued credentials between the authorization check and STS; off keeps every request on the direct path")
+	fs.DurationVar(&c.cacheMinRemaining, "cache-min-remaining", env.duration("cache-min-remaining", cache.DefaultMinRemaining), "least lifetime cached credentials are served with")
+	fs.Float64Var(&c.cacheRefreshAt, "cache-refresh-at", env.float("cache-refresh-at", cache.DefaultRefreshAt), "fraction of a session's usable lifetime (lifetime less --cache-min-remaining) after which it is refreshed in the background, in (0, 1)")
+	fs.IntVar(&c.cacheMaxEntries, "cache-max-entries", env.integer("cache-max-entries", cache.DefaultMaxEntries), "most sessions cached; the least recently used is evicted beyond it")
+	fs.DurationVar(&c.cacheStaleCheckMax, "cache-stale-check-max", env.duration("cache-stale-check-max", cache.DefaultStaleCheckMax), "how old a session's last successful authorization check may be for it to be served while the store is unavailable")
+}
+
+// cacheProblems is what is wrong with the cache flags.
+func (c *config) cacheProblems() []string {
+	var problems []string
+	if c.cacheMinRemaining <= 0 || c.cacheMinRemaining >= grants.MaxDurationSeconds*time.Second {
+		problems = append(problems, fmt.Sprintf("--cache-min-remaining %v is not between 0 and the session ceiling of %ds", c.cacheMinRemaining, grants.MaxDurationSeconds))
+	}
+	if c.cacheRefreshAt <= 0 || c.cacheRefreshAt >= 1 {
+		problems = append(problems, fmt.Sprintf("--cache-refresh-at %v is not in (0, 1)", c.cacheRefreshAt))
+	}
+	if c.cacheMaxEntries <= 0 {
+		problems = append(problems, fmt.Sprintf("--cache-max-entries %d is not positive", c.cacheMaxEntries))
+	}
+	if c.cacheStaleCheckMax <= 0 {
+		problems = append(problems, fmt.Sprintf("--cache-stale-check-max %v is not positive", c.cacheStaleCheckMax))
+	}
+	return problems
 }
 
 // validate checks the parsed flags against each other and parses the trust
@@ -136,6 +201,7 @@ func (c *config) validate() error {
 	if !validLogLevel(c.logLevel) {
 		problems = append(problems, fmt.Sprintf("--log-level %q is not debug, info, warn or error", c.logLevel))
 	}
+	problems = append(problems, c.cacheProblems()...)
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))
 	}

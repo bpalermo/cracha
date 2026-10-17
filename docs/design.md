@@ -243,6 +243,7 @@ GET /v1/credentials
     Cracha-Grants: payments-ledger-rw, payments-outbox-r
     Cracha-Bundle-Version: ...
     Cracha-Consistency-Token: ...
+    Cracha-Cache: hit | miss | refresh      (6.7: served from the cache, issued by STS now, or served from the cache while a refresh-ahead started; absent with the cache off)
 403 { "reason": "no_grant" | "ambiguous" | "subject_suspended" | "envelope_violation" | "policy_too_large" }
 
 GET /v1/grants                (same authorization) → the caller's shape, grants and composed session policy, for inspection
@@ -283,7 +284,7 @@ Authentication:
 
 ### 6.7 Caching
 
-- Broker cache key: `(shape, sorted grant set, bundleVersion, encoded workload)`. A change in the grant set is a new key, so an added or removed assignment takes effect at the next fetch. In-memory only, singleflight on miss, refresh-ahead at ~70% TTL, never return creds with <20 min left.
+- Broker cache key: `(shape, sorted grant set, bundleVersion, encoded workload)`. A change in the grant set is a new key, so an added or removed assignment takes effect at the next fetch. In-memory only, singleflight on miss, refresh-ahead at ~70% of the usable lifetime (the TTL less the 20-minute floor: 28 minutes into a one-hour session), never return creds with <20 min left.
 - **Re-check the authz store on every issuance, including cache hits** (cheap at refresh frequency).
 - `Store.Watch` invalidates affected cache entries on assignment changes. Backends without Watch degrade to TTL-only invalidation, and the broker exposes which mode is active.
 - Consistency: minimize latency by default; at-least-as-fresh when a caller (approver/revocation tool) supplies a consistency token.

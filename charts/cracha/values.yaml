@@ -115,6 +115,20 @@ broker:
   # The log level: debug, info, warn or error.
   logLevel: info
 
+  # The credential cache (design 6.7), between the authorization check and
+  # STS: every request is still authorized, a session is reused while it
+  # has at least minRemaining left, refreshed in the background after
+  # refreshAt of its usable lifetime (lifetime less minRemaining), and
+  # served for up to staleCheckMax after its last successful authorization
+  # check when the store is unavailable. enabled false keeps every request
+  # on the direct path, for debugging.
+  cache:
+    enabled: true
+    minRemaining: 20m
+    refreshAt: 0.7
+    maxEntries: 10000
+    staleCheckMax: 10m
+
   # The SPIFFE Workload API the broker reads the trust bundles from (design
   # 6.5): the volume holding the socket, as a Kubernetes volume source, and
   # the socket's file name in it. The default is a SPIRE agent sharing its

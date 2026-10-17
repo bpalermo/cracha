@@ -26,6 +26,68 @@ func TestParseConfig(t *testing.T) {
 	if c.listen != ":8443" || c.cluster != "prod-a" || c.labels.Short("example.org") != "prod" || c.logLevel != "info" {
 		t.Errorf("config %+v", c)
 	}
+	if !c.cache || c.cacheMinRemaining != 20*time.Minute || c.cacheRefreshAt != 0.7 || c.cacheMaxEntries != 10000 || c.cacheStaleCheckMax != 10*time.Minute {
+		t.Errorf("cache defaults %+v", c)
+	}
+}
+
+func TestParseConfigCacheFlags(t *testing.T) {
+	env := envOf(map[string]string{
+		"CRACHA_CACHE":                 "false",
+		"CRACHA_CACHE_MIN_REMAINING":   "15m",
+		"CRACHA_CACHE_REFRESH_AT":      "0.5",
+		"CRACHA_CACHE_MAX_ENTRIES":     "500",
+		"CRACHA_CACHE_STALE_CHECK_MAX": "5m",
+	})
+	base := []string{"--cluster", "c", "--assignments", "a", "--grants-fixture", "g", "--insecure-plaintext"}
+	c, err := parseConfig(base, env, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.cache || c.cacheMinRemaining != 15*time.Minute || c.cacheRefreshAt != 0.5 || c.cacheMaxEntries != 500 || c.cacheStaleCheckMax != 5*time.Minute {
+		t.Errorf("env did not set the cache flags: %+v", c)
+	}
+	c, err = parseConfig(append(append([]string{}, base...), "--cache", "--cache-refresh-at", "0.8", "--cache-max-entries", "7"), env, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.cache || c.cacheRefreshAt != 0.8 || c.cacheMaxEntries != 7 || c.cacheMinRemaining != 15*time.Minute {
+		t.Errorf("flags did not win over env: %+v", c)
+	}
+	for name, args := range map[string][]string{
+		"refresh at zero":       {"--cache-refresh-at", "0"},
+		"refresh at one":        {"--cache-refresh-at", "1"},
+		"min remaining zero":    {"--cache-min-remaining", "0s"},
+		"min remaining an hour": {"--cache-min-remaining", "1h"},
+		"no entries":            {"--cache-max-entries", "0"},
+		"stale check zero":      {"--cache-stale-check-max", "0s"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseConfig(append(append([]string{}, base...), args...), envOf(nil), io.Discard); err == nil {
+				t.Fatalf("accepted %q", strings.Join(args, " "))
+			}
+		})
+	}
+}
+
+func TestEnvDefaultsTyped(t *testing.T) {
+	env := envDefaults(envOf(map[string]string{
+		"CRACHA_CACHE_MIN_REMAINING": "soon",
+		"CRACHA_CACHE_REFRESH_AT":    "0.25",
+		"CRACHA_CACHE_MAX_ENTRIES":   "lots",
+	}))
+	if got := env.duration("cache-min-remaining", time.Minute); got != time.Minute {
+		t.Errorf("a value that is not a duration gave %v, want the default", got)
+	}
+	if got := env.duration("cache-stale-check-max", time.Minute); got != time.Minute {
+		t.Errorf("unset duration gave %v, want the default", got)
+	}
+	if got := env.float("cache-refresh-at", 0.7); got != 0.25 {
+		t.Errorf("float %v", got)
+	}
+	if got := env.integer("cache-max-entries", 3); got != 3 {
+		t.Errorf("a value that is not an int gave %d, want the default", got)
+	}
 }
 
 func TestParseConfigEnvFallback(t *testing.T) {
