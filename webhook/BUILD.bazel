@@ -33,7 +33,7 @@ go_image(
     name = "image",
     base = "@distroless_static",
     binary = ":webhook",
-    load_tag = "localhost/cracha-2e",
+    load_tag = "localhost/cracha-webhook:e2e",
     path = "/cracha-webhook",
     registry = IMAGE_REGISTRY,
     repository = image_repository("webhook"),

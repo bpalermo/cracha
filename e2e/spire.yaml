@@ -1,0 +1,342 @@
+# A SPIRE server and agent for the end-to-end suite, as small as they can be:
+# one server with its data in memory, agents that attest with their projected
+# service account token, workloads identified by the pod they run in, and the
+# agent's SPIFFE Broker API endpoint (docs/design.md, section 4.2) open to
+# cracha-csi alone. Not how to run SPIRE in production.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spire
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-server
+  namespace: spire
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-agent
+  namespace: spire
+---
+# The server verifies the agents' tokens and looks up the node they run on.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cracha-e2e-spire-server
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cracha-e2e-spire-server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cracha-e2e-spire-server
+subjects:
+  - kind: ServiceAccount
+    name: spire-server
+    namespace: spire
+---
+# The agent asks kubelet which pod a calling process belongs to, resolves the
+# pods cracha-csi references through the Broker API, and, with the access
+# policy enforced, asks the apiserver whether cracha-csi may reference them.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cracha-e2e-spire-agent
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "nodes/proxy"]
+    verbs: ["get", "list"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cracha-e2e-spire-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cracha-e2e-spire-agent
+subjects:
+  - kind: ServiceAccount
+    name: spire-agent
+    namespace: spire
+---
+# The broker authorization decision (section 4.2, access policy enforced):
+# the agent runs a SubjectAccessReview with cracha-csi's SPIFFE ID as the user
+# and SPIRE's own verb on the referenced pod. This is what bounds which pods
+# cracha-csi may fetch tokens for.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spire-agent-broker-impersonation-cracha-csi
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["impersonate-via-spire"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spire-agent-broker-impersonation-cracha-csi
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: spire-agent-broker-impersonation-cracha-csi
+subjects:
+  - kind: User
+    name: spiffe://cracha.test/ns/cracha-system/sa/cracha-csi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-server
+  namespace: spire
+data:
+  server.conf: |
+    server {
+      bind_address = "0.0.0.0"
+      bind_port = "8081"
+      trust_domain = "cracha.test"
+      data_dir = "/run/spire/data"
+      log_level = "INFO"
+      ca_ttl = "24h"
+      default_x509_svid_ttl = "1h"
+      # The ceiling of docs/design.md, section 11: a JWT-SVID on disk lives
+      # at most 5 minutes. Workload entries set their own, shorter TTL.
+      default_jwt_svid_ttl = "5m"
+      jwt_issuer = "https://spire-server.spire.svc"
+    }
+    plugins {
+      DataStore "sql" {
+        plugin_data {
+          database_type = "sqlite3"
+          connection_string = "/run/spire/data/datastore.sqlite3"
+        }
+      }
+      NodeAttestor "k8s_psat" {
+        plugin_data {
+          clusters = {
+            "cracha-e2e" = {
+              service_account_allow_list = ["spire:spire-agent"]
+            }
+          }
+        }
+      }
+      KeyManager "memory" {
+        plugin_data {}
+      }
+    }
+    health_checks {
+      listener_enabled = true
+      bind_address = "0.0.0.0"
+      bind_port = "8080"
+      live_path = "/live"
+      ready_path = "/ready"
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-agent
+  namespace: spire
+data:
+  agent.conf: |
+    agent {
+      data_dir = "/run/spire/data"
+      log_level = "INFO"
+      server_address = "spire-server.spire.svc"
+      server_port = "8081"
+      socket_path = "/run/spire/sockets/spire-agent.sock"
+      trust_domain = "cracha.test"
+      # For a throwaway cluster: trust the server on first contact rather
+      # than distributing its bundle first.
+      insecure_bootstrap = true
+      experimental {
+        # The SPIFFE Broker API endpoint cracha-csi fetches per-pod JWT-SVIDs
+        # from (docs/design.md, section 4.2). Its socket must not share a
+        # directory with the Workload API socket. cracha-csi, identified by
+        # the X509-SVID it presents, is the only broker, limited to
+        # Kubernetes object references over the Unix socket.
+        broker {
+          socket_path = "/run/spire/broker/broker.sock"
+          brokers = [
+            {
+              id = "spiffe://cracha.test/ns/cracha-system/sa/cracha-csi"
+              allowed_reference_types = [
+                {
+                  type_url = "type.googleapis.com/spiffe.broker.KubernetesObjectReference"
+                  allow_over_tcp = false
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+    plugins {
+      NodeAttestor "k8s_psat" {
+        plugin_data {
+          cluster = "cracha-e2e"
+        }
+      }
+      KeyManager "memory" {
+        plugin_data {}
+      }
+      WorkloadAttestor "k8s" {
+        plugin_data {
+          node_name_env = "MY_NODE_NAME"
+          skip_kubelet_verification = true
+          experimental {
+            # Resolves the pods cracha-csi references and, enforced, lets
+            # Kubernetes RBAC decide whether it may (the ClusterRole above).
+            # The default reference scope, agent_node, limits it to pods
+            # kubelet reports on this node.
+            broker {
+              access_policy = "enforced"
+              brokers = [
+                {
+                  id = "spiffe://cracha.test/ns/cracha-system/sa/cracha-csi"
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-server
+  namespace: spire
+spec:
+  selector:
+    app: spire-server
+  ports:
+    - name: grpc
+      port: 8081
+      targetPort: 8081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spire-server
+  namespace: spire
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spire-server
+  template:
+    metadata:
+      labels:
+        app: spire-server
+    spec:
+      serviceAccountName: spire-server
+      securityContext:
+        # Writes its data and its admin socket; simplest as root, here.
+        runAsUser: 0
+      containers:
+        - name: spire-server
+          # SPIRE 1.15.4, pinned by digest so the suite does not depend on a
+          # moving tag; the Broker API needs 1.15.2 or newer.
+          image: ghcr.io/spiffe/spire-server:1.15.4@sha256:a728418a76e5054e977680a7c70a291f93389294e4bef00e2aaad65324f39357
+          args: ["-config", "/run/spire/config/server.conf"]
+          ports:
+            - containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            periodSeconds: 2
+          volumeMounts:
+            - name: config
+              mountPath: /run/spire/config
+              readOnly: true
+            - name: data
+              mountPath: /run/spire/data
+      volumes:
+        - name: config
+          configMap:
+            name: spire-server
+        - name: data
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: spire-agent
+  namespace: spire
+spec:
+  selector:
+    matchLabels:
+      app: spire-agent
+  template:
+    metadata:
+      labels:
+        app: spire-agent
+    spec:
+      serviceAccountName: spire-agent
+      # To see the processes that call it, and to reach kubelet on the node.
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      securityContext:
+        runAsUser: 0
+      containers:
+        - name: spire-agent
+          # SPIRE 1.15.4, pinned by digest; see the server.
+          image: ghcr.io/spiffe/spire-agent:1.15.4@sha256:adc9e89e171af5764b29f9ffc9d3296b8033ba8c6ca11bcadbb56099170d526e
+          args: ["-config", "/run/spire/config/agent.conf"]
+          env:
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: config
+              mountPath: /run/spire/config
+              readOnly: true
+            - name: sockets
+              mountPath: /run/spire/sockets
+            - name: broker-sockets
+              mountPath: /run/spire/broker
+            - name: token
+              mountPath: /var/run/secrets/tokens
+      volumes:
+        - name: config
+          configMap:
+            name: spire-agent
+        # Where the Workload API socket is shared with the pods of the node:
+        # the broker verifies JWT-SVIDs against the bundle it serves, and
+        # cracha-csi gets its own identity from it.
+        - name: sockets
+          hostPath:
+            path: /run/spire/agent-sockets
+            type: DirectoryOrCreate
+        # Where the Broker API socket is shared with cracha-csi, and with
+        # nothing else.
+        - name: broker-sockets
+          hostPath:
+            path: /run/spire/broker-sockets
+            type: DirectoryOrCreate
+        - name: token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: spire-agent
+                  audience: spire-server
+                  expirationSeconds: 7200

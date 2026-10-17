@@ -1,0 +1,32 @@
+load("@rules_go//go:def.bzl", "go_test")
+load("@rules_shell//shell:sh_library.bzl", "sh_library")
+
+go_test(
+    name = "e2e_test",
+    srcs = [
+        "credentials_test.go",
+        "csi_test.go",
+        "main_test.go",
+        "rotation_test.go",
+        "webhook_test.go",
+    ],
+    # Needs a cluster: excluded from `bazel test //...` by the e2e tag (see
+    # .bazelrc) and run unsandboxed by e2e/run.sh, so it can read the
+    # kubeconfig KUBECONFIG names.
+    tags = [
+        "e2e",
+        "local",
+    ],
+    deps = [
+        "@io_k8s_api//core/v1:core",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_client_go//kubernetes",
+        "@io_k8s_client_go//tools/clientcmd",
+    ],
+)
+
+# For the shellcheck aspect (--config=lint); nothing depends on it.
+sh_library(
+    name = "scripts",
+    srcs = glob(["*.sh"]),
+)

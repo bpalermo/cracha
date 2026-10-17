@@ -1,0 +1,25 @@
+# The namespace the suite runs its workloads in, with the two identities
+# e2e/spire.sh registers: client, which holds a grant (the assignments
+# ConfigMap in cracha-system.yaml), and unassigned, which holds none. Both
+# opt in to the webhook. The cracha-ca ConfigMap the client pods trust the
+# broker through is created here by e2e/run.sh.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: e2e
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: client
+  namespace: e2e
+  annotations:
+    cracha.dev/enabled: "true"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: unassigned
+  namespace: e2e
+  annotations:
+    cracha.dev/enabled: "true"

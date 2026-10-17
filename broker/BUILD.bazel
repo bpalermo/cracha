@@ -36,7 +36,7 @@ go_image(
     name = "image",
     base = "@distroless_static",
     binary = ":broker",
-    load_tag = "localhost/cracha-2e",
+    load_tag = "localhost/cracha-broker:e2e",
     path = "/cracha-broker",
     registry = IMAGE_REGISTRY,
     repository = image_repository("broker"),
