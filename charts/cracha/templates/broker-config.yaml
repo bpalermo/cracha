@@ -12,9 +12,10 @@ data:
   {{ .Values.broker.assignments.key }}: |
     {{- required "broker.assignments.document is required unless broker.assignments.existingConfigMap names a ConfigMap" .Values.broker.assignments.document | toYaml | nindent 4 }}
 {{- end }}
-{{- if not .Values.broker.grants.existingConfigMap }}
+{{- if and (not .Values.broker.bundle.source) (not .Values.broker.grants.existingConfigMap) }}
 ---
-# The resolved-grants fixture (broker.grants).
+# The resolved-grants fixture (broker.grants), used while no bundle source
+# is configured.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -26,4 +27,21 @@ metadata:
 data:
   {{ .Values.broker.grants.key }}: |
     {{- required "broker.grants.document is required unless broker.grants.existingConfigMap names a ConfigMap" .Values.broker.grants.document | toYaml | nindent 4 }}
+{{- end }}
+{{- if eq (include "cracha.bundleKey" .) "inline" }}
+---
+# The public key the broker verifies the grant bundle's signature with
+# (broker.bundle.verifyKey).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "cracha.name" . }}-bundle-key
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: broker
+type: Opaque
+stringData:
+  public.pem: |
+    {{- .Values.broker.bundle.verifyKey | nindent 4 }}
 {{- end }}

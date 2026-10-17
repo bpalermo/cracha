@@ -1,0 +1,16 @@
+# The suite's one grant (design 6.2): one shape role, a session policy
+# rendered from the template beside it, inside its envelope. What the tests
+# in e2e/credentials_test.go expect of the AssumeRole call comes from here.
+kind: Grant
+metadata:
+  name: e2e-s3-reader
+spec:
+  account: "111122223333"
+  baseRole: arn:aws:iam::111122223333:role/broker/shape-e2e
+  sessionPolicy:
+    template: s3-object-read
+    params: { bucket: cracha-e2e-bucket }
+  sessionTags: { team: platform }
+  duration: 3600
+  envelope:
+    - arn:aws:s3:::cracha-e2e-*

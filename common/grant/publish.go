@@ -32,6 +32,20 @@ type Latest struct {
 	Signature string `json:"signature"`
 }
 
+// ParseLatest decodes a latest pointer. Unknown fields are an error.
+func ParseLatest(data []byte) (*Latest, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var l Latest
+	if err := dec.Decode(&l); err != nil {
+		return nil, fmt.Errorf("%s: %w", LatestFile, err)
+	}
+	if dec.More() {
+		return nil, fmt.Errorf("%s: trailing data", LatestFile)
+	}
+	return &l, nil
+}
+
 // PublishResult says where a publisher put a bundle, relative to its root.
 type PublishResult struct {
 	Version   string

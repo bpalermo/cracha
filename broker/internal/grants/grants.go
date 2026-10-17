@@ -5,8 +5,8 @@
 // and duration of its credential.
 //
 // This package parses neither grant YAML nor the compiled bundle. The
-// compiler lives in common/grant; an adapter from its compiled bundle to
-// [Source], with polling and signature verification, is a later slice. The
+// compiler lives in common/grant, and broker/internal/bundle is the [Source]
+// over its published bundle, with polling and signature verification. The
 // in-memory [Static] source serves wiring and tests, and [LoadFixture] reads
 // a development fixture of already resolved grants.
 package grants

@@ -6,6 +6,7 @@ go_library(
     name = "broker_lib",
     srcs = [
         "config.go",
+        "grants.go",
         "main.go",
     ],
     importpath = "github.com/bpalermo/cracha/broker",
@@ -14,12 +15,17 @@ go_library(
         "//broker/internal/api",
         "//broker/internal/authn",
         "//broker/internal/authz/static",
+        "//broker/internal/bundle",
         "//broker/internal/grants",
         "//broker/internal/issuer",
         "//broker/internal/sts",
+        "//common/grant",
         "//common/idenc",
         "//common/version",
+        "@com_github_aws_aws_sdk_go_v2//aws",
         "@com_github_aws_aws_sdk_go_v2_config//:config",
+        "@com_github_aws_aws_sdk_go_v2_service_kms//:kms",
+        "@com_github_aws_aws_sdk_go_v2_service_s3//:s3",
     ],
 )
 
