@@ -6,9 +6,10 @@
 // Grants come from the signed, polled bundle grantc publishes
 // (--bundle-source, broker/internal/bundle) or, for development, from a
 // resolved-grants fixture file (--grants-fixture); the authorization backend
-// is the static one, and the credential cache (design 6.7) wraps the issuer
-// unless --cache=false. Revocation comes later. Configuration is by flags,
-// each with a CRACHA_* environment fallback (see config.go).
+// is the static assignments file or SpiceDB (--authz-backend, authz.go), and
+// the credential cache (design 6.7) wraps the issuer unless --cache=false.
+// Revocation comes later. Configuration is by flags, each with a CRACHA_*
+// environment fallback (see config.go).
 package main
 
 import (
@@ -27,7 +28,6 @@ import (
 	"github.com/bpalermo/cracha/broker/internal/api"
 	"github.com/bpalermo/cracha/broker/internal/authn"
 	"github.com/bpalermo/cracha/broker/internal/authz"
-	"github.com/bpalermo/cracha/broker/internal/authz/static"
 	"github.com/bpalermo/cracha/broker/internal/cache"
 	"github.com/bpalermo/cracha/broker/internal/issuer"
 	"github.com/bpalermo/cracha/broker/internal/sts"
@@ -63,11 +63,11 @@ func run(ctx context.Context, cfg config) error {
 	log.Info("starting", "version", version.Version, "cluster", cfg.cluster, "listen", cfg.listen,
 		"trust_domain_labels", cfg.labels.String(), "plaintext", cfg.insecurePlaintext)
 
-	store, err := static.Load(cfg.assignments)
+	store, err := newStore(cfg, log)
 	if err != nil {
 		return err
 	}
-	log.Info("loaded assignments", "path", cfg.assignments, "consistency_token", string(store.Token()))
+	defer store.Close()
 
 	var awsOpts []func(*awsconfig.LoadOptions) error
 	if cfg.awsRegion != "" {

@@ -110,6 +110,15 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   validation, templates, lints, the compiled bundle, signing and publishing.
 - `grantc/` is the grant compiler CLI over `common/grant` (lint, compile,
   sign, verify, publish); it runs in CI and has no container image.
+- The broker's authorization store is one of two backends, chosen by
+  `--authz-backend`: `static` (`broker/internal/authz/static`, the
+  assignments file `--assignments`) or `spicedb`
+  (`broker/internal/authz/spicedb`, the adapter over the reference model of
+  design 6.4: the preshared key is read from `--spicedb-token-file`, never a
+  flag value; every query carries the caveat context `now` and `cluster`;
+  every error is a deny; its Watch feeds the cache). The contract both
+  answer is `broker/internal/authz`, and the SpiceDB tests hold the adapter
+  to the static backend's answers for the same assignments.
 - The broker gets its grants from one of two sources, exactly one of which
   is configured. In production it is the compiled bundle `grantc` publishes
   (`--bundle-source local:<dir>` or `s3://bucket/prefix`,
@@ -153,6 +162,12 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   `values.yaml` by hand; `//charts/cracha:pin_test` checks the result with
   `bazel/chart-pin.sh`. The registrar sidecar is the one image pinned by
   hand, by tag and digest.
+- `broker.authz.backend` picks the authorization store: `static` (the
+  default) renders the assignments ConfigMap and its mount; `spicedb` takes
+  `broker.authz.spicedb` (endpoint, `tokenSecret` naming a Secret the
+  operator keeps, whose key is mounted as a file and never put in the
+  environment, an optional `ca` the chart puts in a ConfigMap, `insecure`
+  for kind only, `timeout`).
 - `test/overrides.yaml` must exercise every non-default knob: a new value
   goes there too. A value every install must give (`broker.cluster`,
   `webhook.defaultRegion`) is `required` in the templates and listed in
