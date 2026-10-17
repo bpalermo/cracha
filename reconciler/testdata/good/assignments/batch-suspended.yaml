@@ -1,0 +1,6 @@
+kind: Assignment
+metadata:
+  name: batch-suspended
+spec:
+  subject: prod/payments/batch
+  suspended: true

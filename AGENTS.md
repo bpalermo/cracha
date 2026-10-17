@@ -101,13 +101,23 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 ## Layout
 
 - No `cmd/`. Each binary lives in a root-level directory with its `main.go`:
-  `broker/`, `csi/`, `webhook/`, `grantc/`.
+  `broker/`, `csi/`, `webhook/`, `grantc/`, `reconciler/`.
 - Code private to a binary goes under its `internal/`.
 - Code shared between binaries goes under `common/`. `common/idenc` is the
   single identity-encoding library (design 4.3): nothing else formats a
   SourceIdentity or an authorization subject ID.
 - `common/grant` is the grant bundle model and compiler (design 6.2): loading,
   validation, templates, lints, the compiled bundle, signing and publishing.
+  Its source tree holds three kinds: `Grant`, `Assignment` (a workload's own
+  grants, optionally bounded, or its `suspended: true`) and `Service` (a
+  team's workloads and the grants they share, each bounded like an
+  Assignment; a workload is a member of at most one service). The
+  composition lint unions a subject's grants from both. Names are DNS labels
+  without dots, because they become SpiceDB object IDs.
+- `common/spicedb` is the SpiceDB schema (design 6.4), embedded from
+  `schema.zed`, and the constants for every object type, relation,
+  permission, caveat and caveat context key in it: the broker's adapter and
+  the reconciler spell nothing in the schema twice.
 - `grantc/` is the grant compiler CLI over `common/grant` (lint, compile,
   sign, verify, publish); it runs in CI and has no container image.
 - The broker's authorization store is one of two backends, chosen by
@@ -119,6 +129,13 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   every error is a deny; its Watch feeds the cache). The contract both
   answer is `broker/internal/authz`, and the SpiceDB tests hold the adapter
   to the static backend's answers for the same assignments.
+- `reconciler/` is `cracha-reconciler`, the `authz-reconciler` writer of
+  design 6.4: `schema` writes the embedded schema, `apply` makes SpiceDB's
+  relationships match a grant source tree (`reconciler/internal/reconcile`
+  computes the desired set and the diff; `reconciler/internal/fakespicedb`
+  is the in-memory SpiceDB its tests use). Like `grantc` it runs from CI or
+  an operator's machine and has no container image; the e2e will run it
+  from the host against a port-forwarded SpiceDB.
 - The broker gets its grants from one of two sources, exactly one of which
   is configured. In production it is the compiled bundle `grantc` publishes
   (`--bundle-source local:<dir>` or `s3://bucket/prefix`,

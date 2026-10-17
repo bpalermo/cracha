@@ -147,6 +147,34 @@ spec:
     - arn:aws:dynamodb:*:111122223333:table/payments-*
 ```
 
+Who holds a grant is recorded beside it, in the same tree, as a `kind: Service` (a team's workloads and the grants they share) and `kind: Assignment` (one workload's own grants, or its suspension) documents. They are not part of the bundle: the authorization store answers who holds what (6.1), and the `authz-reconciler` of 6.4 writes it there from these documents, which also let the composition lint (step 5) check what each workload will hold.
+
+```yaml
+kind: Service
+metadata:
+  name: payments-api
+spec:
+  team: payments                   # the owning team; the "team" session tag
+  members:                         # authz subject encodings (4.3); a workload is in at most one service
+    - prod/payments/ledger
+    - prod/payments/api
+  grants:                          # every member holds these
+    - name: payments-ledger-rw
+    - name: payments-outbox-r
+      expiresAt: "2026-12-31T00:00:00Z"   # optional bounds, as on an Assignment
+      clusters: [prod-us-east-1]
+---
+kind: Assignment
+metadata:
+  name: payments-ledger-temp
+spec:
+  subject: prod/payments/ledger
+  grants: [payments-outbox-r]
+  expiresAt: "2026-12-31T00:00:00Z"
+  clusters: [prod-us-east-1]
+  suspended: false                 # true: the subject holds nothing until cleared
+```
+
 A workload has exactly one shape, and its session policy is composed by the broker at issuance time from every grant currently assigned to it in the authorization store. Permissions therefore change by assignment, with no redeploy and no per-workload configuration. All grants assigned to one workload must share its shape; a mix of shapes is ambiguous and denied. There are no profiles: one workload, one shape, one credential source.
 
 CI (`grant-compiler`) pipeline:
@@ -154,7 +182,7 @@ CI (`grant-compiler`) pipeline:
 2. Access Analyzer `ValidatePolicy`.
 3. `CheckNoNewAccess` against the shape's envelope policy.
 4. Size budget lint (2,048-char inline session policy + packed tag budget).
-5. Composition lint, for assignments known in Git: the union of an assignee's grants stays within one shape, the size budget and the envelope. The broker re-checks all three at issuance, since assignments can also come from the approval flow.
+5. Composition lint, for assignments known in Git: the union of an assignee's grants, from its own Assignments and from the Service it is a member of, stays within one shape, the size budget and the envelope. The broker re-checks all three at issuance, since assignments can also come from the approval flow.
 6. Compile → sign (KMS or cosign) → publish to S3.
 
 Broker polls the bundle, verifies signature, swaps atomically, and **keeps the last good bundle on failure (never fails open).**
@@ -179,7 +207,7 @@ Rules:
 
 ### 6.4 Reference backend: SpiceDB
 
-The model below is the reference. Another backend must express the same concepts (team, service, workload, grant, account, time-bounded and cluster-bounded assignment) and give equivalent answers to the questions in 6.3.
+The model below is the reference. Another backend must express the same concepts (team, service, workload, grant, account, time-bounded and cluster-bounded assignment, suspension) and give equivalent answers to the questions in 6.3. The schema lives in `common/spicedb/schema.zed`, with the names in it exported as constants, so the broker's adapter and the reconciler share one spelling of every type, relation, permission, caveat and context key.
 
 ```zed
 definition team {}
@@ -189,7 +217,10 @@ definition service {
   relation member: workload
 }
 
-definition workload {}            // id = idenc authz encoding
+definition workload {
+  relation suspended: team
+  permission is_suspended = suspended
+}
 
 definition aws_account {}
 
@@ -201,14 +232,18 @@ caveat in_clusters(allowed list<string>, cluster string) {
   cluster in allowed
 }
 
+caveat bounded(expires_at timestamp, now timestamp, allowed list<string>, cluster string) {
+  now < expires_at && cluster in allowed
+}
+
 definition grant {
   relation account: aws_account
-  relation assignee_service: service | service with in_clusters
-  relation assignee_workload: workload with within_window
+  relation assignee_service: service | service with within_window | service with in_clusters | service with bounded
+  relation assignee_workload: workload | workload with within_window | workload with in_clusters | workload with bounded
   permission assume = assignee_service->member + assignee_workload
 }
 
-definition dynamodb_table {       // Level 3 only
+definition dynamodb_table {
   relation account: aws_account
   relation writer: service
   relation reader: service
@@ -217,18 +252,35 @@ definition dynamodb_table {       // Level 3 only
 }
 ```
 
+Why it is shaped so:
+- `workload#suspended` and `is_suspended` let SpiceDB express the suspension the contract reports as `ErrSubjectSuspended` (6.3): a workload with the permission holds nothing, whatever `grant#assume` would say. The relation's subject is the team of the workload's service, or `team:none` when it has no service, so the relationship has a subject and a suspension stays attributable.
+- A SpiceDB relationship carries at most one caveat, and a Git assignment may carry both bounds, so `bounded` takes both; `within_window` and `in_clusters` stay for a relationship bound in only one way. Every assignee relation admits all four forms. The broker sends `now` (RFC 3339) and `cluster` as the caveat context of every query; the relationship carries `expires_at` and/or `allowed`.
+- Object IDs: `workload:<authz encoding of 4.3>` (the encoding's charset is a subset of SpiceDB's), `grant:<name>`, `service:<name>`, `team:<name>`, `aws_account:<id>`. Names in Git are DNS labels for this reason.
+
 Integration levels:
 - **L1 (v1):** `Store.Check(subject, grant)` gates issuance (SpiceDB: `CheckPermission(grant#assume, workload)`).
 - **L2 (v1):** service/team returned in `Decision.Tags` become session tags for ABAC.
 - **L3 (later, exceptions only):** `Store.LookupResources` fills template resource lists; every ARN is validated against the grant envelope at runtime; violations reject the request.
 
-Relationship writers (write access to the authz store is security-critical, whatever the backend). Where a writer reads its source of truth from is out of scope; what Crachá requires is that the writer is trusted and that no relationship is derived from anything the workload controls:
+Relationship writers (write access to the authz store is security-critical, whatever the backend). What Crachá requires is that the writer is trusted and that no relationship is derived from anything the workload controls:
 
 | Relationship | Source of truth | Writer |
 |---|---|---|
-| `service#owner`, `grant#assignee_service` | Git (CODEOWNERS) | `authz-reconciler` |
-| `service#member@workload` | Service catalog / Git. **Never** workload-controlled annotations | `authz-reconciler` |
+| `grant#account`, `service#owner`, `service#member`, `grant#assignee_service`, `grant#assignee_workload`, `workload#suspended` | Git: the grant source tree of 6.2 (CODEOWNERS). **Never** workload-controlled annotations | `authz-reconciler` (`cracha-reconciler apply`) |
 | Temporary / break-glass | Approval flow | `access-approver`, with caveat/expiry |
+
+The reconciler's mapping, from the documents of 6.2 to relationships. A grant bounded in time alone carries `within_window{expires_at}`, in clusters alone `in_clusters{allowed}`, in both `bounded{expires_at, allowed}`, in neither no caveat:
+
+| Source | Relationship | Caveat |
+|---|---|---|
+| Grant `g` with `spec.account` | `grant:g#account@aws_account:<account>` | none |
+| Service `s` with `spec.team` | `service:s#owner@team:<team>` | none |
+| Service `s`, each `spec.members` | `service:s#member@workload:<member>` | none |
+| Service `s`, each `spec.grants` `g` | `grant:g#assignee_service@service:s` | by the grant's bounds |
+| Assignment of `subject`, each `spec.grants` `g` | `grant:g#assignee_workload@workload:<subject>` | by the assignment's bounds |
+| Assignment of `subject` with `suspended: true` | `workload:<subject>#suspended@team:<team of its service, or none>` | none |
+
+Two Assignments that give one subject the same grant are one relationship, with the bounds that allow what either allows; when one caveat cannot express that union (one bound in time, the other in clusters, say) the reconciler refuses the tree. The reconciler owns every relationship whose resource is a `grant`, a `service` or a `workload`: it refuses a tree the loader or the lints of 6.2 reject, reads what SpiceDB holds, writes the difference (touches and deletes, in batches of at most 1,000) and reads back at least as fresh as its last write to confirm; a second run is a no-op, and a dry run writes nothing. It writes the schema with `cracha-reconciler schema`, which is idempotent.
 
 Deployment (SpiceDB): one instance per region on its own Postgres. The reconciler writes to every region through the backend adapter (regions stay independent).
 
