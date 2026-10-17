@@ -93,58 +93,72 @@ func (t *Template) resolveParams(account string, params map[string]Param) (map[s
 func substitute(v any, values map[string]Param) (any, error) {
 	switch x := v.(type) {
 	case map[string]any:
-		out := make(map[string]any, len(x))
-		for _, k := range sortedKeys(x) {
-			child := x[k]
-			if s, ok := child.(string); ok {
-				expanded, fromList, err := expand(s, values)
-				if err != nil {
-					return nil, fmt.Errorf("%s: %w", k, err)
-				}
-				if fromList {
-					out[k] = toAnySlice(expanded)
-				} else {
-					out[k] = expanded[0]
-				}
-				continue
-			}
-			r, err := substitute(child, values)
-			if err != nil {
-				return nil, fmt.Errorf("%s: %w", k, err)
-			}
-			out[k] = r
-		}
-		return out, nil
+		return substituteObject(x, values)
 	case []any:
-		out := make([]any, 0, len(x))
-		for i, child := range x {
-			if s, ok := child.(string); ok {
-				expanded, _, err := expand(s, values)
-				if err != nil {
-					return nil, fmt.Errorf("[%d]: %w", i, err)
-				}
-				out = append(out, toAnySlice(expanded)...)
-				continue
-			}
-			r, err := substitute(child, values)
-			if err != nil {
-				return nil, fmt.Errorf("[%d]: %w", i, err)
-			}
-			out = append(out, r)
-		}
-		return out, nil
+		return substituteArray(x, values)
 	case string:
-		expanded, fromList, err := expand(x, values)
-		if err != nil {
-			return nil, err
-		}
-		if fromList {
-			return toAnySlice(expanded), nil
-		}
-		return expanded[0], nil
+		return substituteString(x, values)
 	default:
 		return v, nil
 	}
+}
+
+// substituteObject renders an object's values; a string value that
+// references a list becomes an array.
+func substituteObject(x map[string]any, values map[string]Param) (map[string]any, error) {
+	out := make(map[string]any, len(x))
+	for _, k := range sortedKeys(x) {
+		r, err := substitute(x[k], values)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", k, err)
+		}
+		out[k] = r
+	}
+	return out, nil
+}
+
+// substituteArray renders an array's elements; a string element that
+// references a list is spliced in place.
+func substituteArray(x []any, values map[string]Param) ([]any, error) {
+	out := make([]any, 0, len(x))
+	for i, child := range x {
+		elems, err := substituteElement(child, values)
+		if err != nil {
+			return nil, fmt.Errorf("[%d]: %w", i, err)
+		}
+		out = append(out, elems...)
+	}
+	return out, nil
+}
+
+// substituteElement renders one array element as the elements that take
+// its place: every expansion of a string, one value for anything else.
+func substituteElement(child any, values map[string]Param) ([]any, error) {
+	if s, ok := child.(string); ok {
+		expanded, _, err := expand(s, values)
+		if err != nil {
+			return nil, err
+		}
+		return toAnySlice(expanded), nil
+	}
+	r, err := substitute(child, values)
+	if err != nil {
+		return nil, err
+	}
+	return []any{r}, nil
+}
+
+// substituteString renders a string: an array when it references a list,
+// a string otherwise.
+func substituteString(s string, values map[string]Param) (any, error) {
+	expanded, fromList, err := expand(s, values)
+	if err != nil {
+		return nil, err
+	}
+	if fromList {
+		return toAnySlice(expanded), nil
+	}
+	return expanded[0], nil
 }
 
 func toAnySlice(ss []string) []any {
@@ -159,58 +173,88 @@ func toAnySlice(ss []string) []any {
 // combination of the referenced lists' elements (a single string when no
 // list is referenced) and whether a list was referenced.
 func expand(s string, values map[string]Param) ([]string, bool, error) {
-	results := []string{""}
-	fromList := false
-	appendLiteral := func(lit string) {
-		for i := range results {
-			results[i] += lit
-		}
-	}
-	i := 0
-	for i < len(s) {
+	e := &expansion{results: []string{""}}
+	for i := 0; i < len(s); {
 		rest := s[i:]
 		switch {
 		case strings.HasPrefix(rest, "$${"):
-			appendLiteral("${")
+			e.literal("${")
 			i += 3
 		case strings.HasPrefix(rest, "${"):
-			end := strings.IndexByte(rest, '}')
-			if end < 0 {
-				return nil, false, fmt.Errorf("unterminated ${ in %q", s)
+			name, n, err := parseReference(rest, s)
+			if err != nil {
+				return nil, false, err
 			}
-			name := rest[2:end]
 			v, ok := values[name]
 			if !ok {
 				return nil, false, fmt.Errorf("unknown parameter %q in %q (write $${%s} for a literal)", name, s, name)
 			}
-			if v.IsList {
-				fromList = true
-				next := make([]string, 0, len(results)*len(v.List))
-				for _, prefix := range results {
-					for _, item := range v.List {
-						next = append(next, prefix+item)
-					}
-				}
-				results = next
-			} else {
-				appendLiteral(v.String)
-			}
-			i += end + 1
+			e.param(v)
+			i += n
 		default:
-			j := strings.Index(rest, "$")
-			if j < 0 {
-				appendLiteral(rest)
-				i = len(s)
-			} else if j == 0 {
-				appendLiteral("$")
-				i++
-			} else {
-				appendLiteral(rest[:j])
-				i += j
-			}
+			lit, n := literalPrefix(rest)
+			e.literal(lit)
+			i += n
 		}
 	}
-	return results, fromList, nil
+	return e.results, e.fromList, nil
+}
+
+// expansion accumulates the strings an expand call produces, one per
+// combination of the list elements referenced so far.
+type expansion struct {
+	results  []string
+	fromList bool
+}
+
+// literal appends lit to every result.
+func (e *expansion) literal(lit string) {
+	for i := range e.results {
+		e.results[i] += lit
+	}
+}
+
+// param appends a parameter's value: a string to every result, a list as
+// the product of the results and its elements.
+func (e *expansion) param(v Param) {
+	if !v.IsList {
+		e.literal(v.String)
+		return
+	}
+	e.fromList = true
+	next := make([]string, 0, len(e.results)*len(v.List))
+	for _, prefix := range e.results {
+		for _, item := range v.List {
+			next = append(next, prefix+item)
+		}
+	}
+	e.results = next
+}
+
+// parseReference reads the ${name} at the start of rest and returns the
+// name and the reference's length. whole is the string being expanded, for
+// the message.
+func parseReference(rest, whole string) (string, int, error) {
+	end := strings.IndexByte(rest, '}')
+	if end < 0 {
+		return "", 0, fmt.Errorf("unterminated ${ in %q", whole)
+	}
+	return rest[2:end], end + 1, nil
+}
+
+// literalPrefix returns the literal text at the start of rest, up to the
+// next "$" (a "$" that starts no reference is itself literal), and its
+// length.
+func literalPrefix(rest string) (string, int) {
+	j := strings.Index(rest, "$")
+	switch {
+	case j < 0:
+		return rest, len(rest)
+	case j == 0:
+		return "$", 1
+	default:
+		return rest[:j], j
+	}
 }
 
 // MinifyJSON encodes a decoded JSON value compactly, keys sorted, without

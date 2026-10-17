@@ -170,3 +170,34 @@ func TestValidateAssignment(t *testing.T) {
 		})
 	}
 }
+
+// A document that does not validate on its own is reported by ValidateSource
+// with its name and path, and its references are not checked.
+func TestValidateSourceInvalidDocuments(t *testing.T) {
+	g := baseGrant()
+	g.Path = "grants/bad.yaml"
+	g.Spec.Account = "1"
+	a := &Assignment{
+		Kind: KindAssignment, Metadata: Metadata{Name: "bad"}, Path: "assignments/bad.yaml",
+		Spec: AssignmentSpec{Subject: "prod/x/y", Grants: []string{"ghost"}, Clusters: []string{""}},
+	}
+	err := ValidateSource(&Source{Grants: []*Grant{g}, Assignments: []*Assignment{a}, Templates: map[string]*Template{}})
+	if err == nil {
+		t.Fatal("ValidateSource succeeded, want an error")
+	}
+	for _, want := range []string{
+		"grant payments-ledger-rw (grants/bad.yaml): ",
+		"must be 12 digits",
+		"assignment bad (assignments/bad.yaml): ",
+		"clusters: empty name",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %v, want it to contain %q", err, want)
+		}
+	}
+	for _, unwanted := range []string{`template "dynamo-table-rw" not found`, `grant "ghost" not found`} {
+		if strings.Contains(err.Error(), unwanted) {
+			t.Errorf("error = %v, references of an invalid document should not be checked (%q)", err, unwanted)
+		}
+	}
+}
