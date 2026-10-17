@@ -82,8 +82,9 @@ manifests, values files, `spire.sh` and `run.sh` are `data` of
 fixture the suite deploys goes in that glob. A documentation-only change
 builds nothing and creates no kind cluster; the formatter and the Gazelle
 check run on every change regardless. A change to the files CI itself
-depends on and Bazel does not hash (`.bazelrc`, `.bazelversion`,
-`MODULE.bazel` and its lock, `ci.yml`, the script) runs everything, as does
+depends on and no target does (`.bazelrc`, `.bazelversion`, `MODULE.bazel`
+and its lock, `ci.yml`, the script, the lint aspects under `bazel/lint/` and
+`.shellcheckrc`, which `.bazelrc` attaches to every build) runs everything, as does
 any error in the computation: the fallback is always a full run, never a
 smaller one. To see what a change would run, from a clone (the script checks
 revisions out, so not the checkout you are working in) with bazel-diff from
