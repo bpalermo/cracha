@@ -198,14 +198,23 @@ full_run() {
 [ -n "${BASE_SHA:-}" ] || full_run "no BASE_SHA"
 git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null || full_run "BASE_SHA ${BASE_SHA} unreachable"
 
+# Seed files: hashed into every target, so a change to one of them is a full
+# run. They are the inputs CI depends on that no target depends on. The lint
+# aspects and their configs are here because .bazelrc attaches them to every
+# build: a .bzl loaded only from .bazelrc, or a config a .bzl names by label,
+# is in no target's graph, so bazel-diff would see nothing impacted and the
+# threshold or rule it changed would never be checked (#19 skipped the build).
 SEED="${OUT_DIR}/seed.txt"
 cat >"${SEED}" <<'EOF'
 .bazelrc
 .bazelversion
 .github/workflows/ci.yml
+.shellcheckrc
 MODULE.bazel
 MODULE.bazel.lock
 bazel/ci-impacted-targets.sh
+bazel/lint/gocognit.bzl
+bazel/lint/linters.bzl
 EOF
 
 generate() { # ref outfile
