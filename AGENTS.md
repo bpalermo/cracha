@@ -146,7 +146,77 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   kind only: the broker's certificate must be trusted by the workload images
   (design 6.5), so production uses `existing` or `cert-manager`.
 - The chart is published to `chart_registry_url("cracha")` of
-  `bazel/registry.bzl`; there is no publish workflow yet.
+  `bazel/registry.bzl` by the publish workflow (below).
+
+## Publishing
+
+- Every published coordinate comes from `bazel/registry.bzl`: the registry
+  host, the organization, the three image repositories and the chart's.
+  Bazel loads it; shell and the workflows read it through `bazel/registry.sh`
+  (`bazel/registry.sh` prints `KEY=VALUE` lines, `bazel/registry.sh ref csi`
+  one reference). `bazel/check-registry-config.sh`, run by the `lint` job of
+  `ci.yml`, fails a change that spells the registry out anywhere else; the
+  README is the one file allowed to, because people copy install commands
+  from it. Moving registries is an edit to `bazel/registry.bzl` and nothing
+  else.
+- `.github/workflows/publish.yml` publishes on every push to `main` and on
+  every `v*` tag, in the GitHub environment `release`, which only `main` and
+  `v*` tags may use. It builds everything it will push in one
+  `bazel build --config=ci` before any credential exists on the runner,
+  refuses an unstamped chart or a chart whose pins are not the digests it is
+  about to push, logs in to the registry once (`docker/login-action`, which
+  `image_push` and cosign both read), pushes the three images, signs each
+  index and its platform manifests keyless by digest with the pinned cosign
+  (`cosign sign --recursive`), verifies them before signing (so an unchanged
+  digest is not signed twice) and after, then pushes the chart with
+  `//charts/cracha:cracha.push_registry` and signs and verifies it the same
+  way. A `check` job pulls the chart back by its version with the pinned helm,
+  asserts it is the manifest the push reported and pins the digests that were
+  pushed, and verifies every signature without credentials. The workflow
+  cannot be exercised from a pull request, so read a change to it twice and
+  watch the run after merge. It reads files from `bazel-out`: an output that
+  is not a target's default output is absent there on a cache hit, so request
+  its output group in the build step (see `--output_groups=+digest`).
+- The credentials are a Quay robot account of the `cracha` organization that
+  can write (not create) the repositories, in the secrets `QUAY_USERNAME` and
+  `QUAY_TOKEN` of the `release` environment; nothing else is configured
+  outside the repository. The repositories are public, and they are created
+  by hand: a new image needs its quay.io repository, an entry in
+  `bazel/registry.sh` and the comments of `bazel/registry.bzl`, the build
+  lists of `ci.yml` and `publish.yml` (build, push, record, sign, verify,
+  check, release notes) and, if the chart deploys it, `values.yaml`, the
+  chart's `images` and `PINNED_COMPONENTS`, and
+  `bazel/check-registry-config.sh`.
+- cosign is the release binary the `rules_img_signer_cosign` bazel_dep pins by
+  sha256, wrapped as `//bazel/cosign`; `//bazel/cosign:version_test` fails
+  when the pin and the test's `EXPECTED` disagree, so bump both together. To
+  verify a published image (the index and every platform manifest, and that
+  the signature is a referrer as `SIGNATURE_LAYOUT` promises) or the chart:
+
+  ```bash
+  bazel run //bazel/cosign:verify_image -- "$(bazel/registry.sh ref csi)@sha256:<digest>"
+  bazel run //bazel/cosign:verify_image -- --single "$(bazel/registry.sh chart-ref cracha)@sha256:<digest>"
+  bazel run //bazel/cosign -- verify "$(bazel/registry.sh ref csi)@sha256:<digest>" \
+    --certificate-identity-regexp '^https://github.com/bpalermo/cracha/.github/workflows/publish.yml@refs/(heads/main|tags/v.*)$' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  ```
+
+### Releasing
+
+- `VERSION` holds the release being worked towards. Every commit to `main`
+  publishes a snapshot of it: the chart as `<VERSION>-dev.<commit time>.g<commit>`,
+  the images under the mutable tag `dev` and the immutable `dev-<commit>`.
+- A release is a tag `v<VERSION>` on a commit of `main`, pushed by a person.
+  Cut a candidate first, `v<VERSION>-rc.<n>`, since the tag path of the
+  workflow runs only on a real tag. The tag publishes the images under
+  `v<VERSION>` (and `v<VERSION>-<commit>`), the chart as `<VERSION>`, signs
+  them, and once `check` passes creates the GitHub Release with the pinned
+  references and the `cosign verify` command in its notes. A tag that is not
+  on `main`, or that does not match `VERSION` (the workspace status then
+  reports a snapshot, not the release), is refused.
+- After the release, set `VERSION` to the next one in a pull request.
+- In 0.x a release may break the protocol between components or the chart's
+  values; say so in the release notes when one does.
 
 ## Pull requests
 

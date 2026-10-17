@@ -4,7 +4,9 @@ Every published coordinate is derived from the constants below: the
 `image_push` of each `go_image` (//broker:image_push, //csi:image_push,
 //webhook:image_push), the chart push (//charts/cracha:cracha.push_registry)
 and the chart's default image repositories (charts/cracha/values.yaml, which
-takes each from its image_push). Nothing else may spell the registry out.
+takes each from its image_push). Shell and the workflows read it through
+bazel/registry.sh, and bazel/check-registry-config.sh fails CI on a registry
+spelled out anywhere else. Nothing else may spell the registry out.
 
 The coordinates:
 
@@ -26,6 +28,12 @@ IMAGE_REGISTRY = "quay.io"
 # Organization under the host. Quay has NO nested repositories: everything is
 # `<host>/<namespace>/<name>`, one path segment after the org.
 IMAGE_NAMESPACE = "cracha"
+
+# Where cosign's keyless signature lands on IMAGE_REGISTRY, which the publish
+# workflow ASSERTS for every digest it signs: "referrer" (an OCI 1.1 referrer
+# and no tag -- a registry that serves the Referrers API, as quay.io does) or
+# "tag" (cosign 3's `sha256-<hex>` fallback tag -- a registry without it).
+SIGNATURE_LAYOUT = "referrer"
 
 def image_repository(component):
     """Repository path (no host) of a component's image.

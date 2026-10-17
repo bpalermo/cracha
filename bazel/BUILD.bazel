@@ -1,22 +1,47 @@
 load("@rules_shell//shell:sh_library.bzl", "sh_library")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
-# The publishing coordinates (registry.bzl), the git state that stamps the
-# images' tags, the binaries' version and the chart's version
-# (workspace_status.sh), and the reader of a packaged chart's image pins
-# (chart-pin.sh, run by //charts/cracha:pin_test).
+# The publishing coordinates (registry.bzl) and their reader for shell and the
+# workflows (registry.sh), the git state that stamps the images' tags, the
+# binaries' version and the chart's version (workspace_status.sh), the reader
+# of a packaged chart's image pins (chart-pin.sh, run by
+# //charts/cracha:pin_test and by the publish workflow, so both read a chart's
+# pins the same way), and the signature verifier with its registry helpers
+# (verify-image-signatures.sh, registry-lib.sh), which //bazel/cosign:verify_image
+# runs with the pinned cosign. registry.sh parses registry.bzl from the
+# checkout, not from runfiles, so the verifier takes its expected layout from
+# the environment there.
 exports_files([
     "chart-pin.sh",
+    "check-registry-config.sh",
     "registry.bzl",
+    "registry.sh",
+    "registry-lib.sh",
+    "verify-image-signatures.sh",
     "workspace_status.sh",
 ])
 
 # For the shellcheck aspect (--config=lint): the workspace status script is
-# run by Bazel itself and chart-pin.sh is test data, so no target would
-# otherwise show them to the aspect.
+# run by Bazel itself, chart-pin.sh is test data and the rest are run by
+# people and workflows, so no target would otherwise show them to the aspect.
 sh_library(
     name = "scripts",
     srcs = glob(["*.sh"]),
+)
+
+# The decision of check-registry-config.sh (the `lint` job of ci.yml), on
+# fixture checkouts: the setting alone passes, a literal elsewhere or a chart
+# default that is not derived fails.
+sh_test(
+    name = "check_registry_config_test",
+    size = "small",
+    srcs = ["check_registry_config_test.sh"],
+    data = [
+        "check-registry-config.sh",
+        "registry.bzl",
+        "registry.sh",
+        "//charts/cracha:values.yaml",
+    ],
 )
 
 sh_test(
