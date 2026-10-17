@@ -1,0 +1,6 @@
+kind: Assignment
+metadata:
+  name: billing-reports
+spec:
+  subject: prod/billing/reports
+  grants: [billing-reports]

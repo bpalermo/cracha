@@ -1,0 +1,10 @@
+kind: Grant
+metadata:
+  name: billing-reports
+spec:
+  account: "444455556666"
+  baseRole: arn:aws:iam::444455556666:role/shape-reports
+  managedPolicyArns:
+    - arn:aws:iam::444455556666:policy/reports-read
+    - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+  duration: 1800

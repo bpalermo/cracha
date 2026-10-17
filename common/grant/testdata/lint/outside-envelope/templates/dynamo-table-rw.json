@@ -1,0 +1,40 @@
+{
+  "params": {
+    "tables": {
+      "type": "list",
+      "description": "DynamoDB table names"
+    },
+    "region": {
+      "type": "string",
+      "description": "region, any by default",
+      "default": "*"
+    }
+  },
+  "policy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "Table",
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:Query",
+          "dynamodb:BatchWriteItem"
+        ],
+        "Resource": [
+          "arn:aws:dynamodb:${region}:${account}:table/${tables}",
+          "arn:aws:dynamodb:${region}:${account}:table/${tables}/index/*"
+        ]
+      },
+      {
+        "Sid": "Describe",
+        "Effect": "Allow",
+        "Action": "dynamodb:DescribeTable",
+        "Resource": "arn:aws:dynamodb:${region}:${account}:table/${tables}"
+      }
+    ]
+  }
+}

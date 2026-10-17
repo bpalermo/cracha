@@ -1,0 +1,48 @@
+{
+  "generatedAt": "2026-10-17T12:34:56Z",
+  "grants": [
+    {
+      "account": "444455556666",
+      "baseRole": "arn:aws:iam::444455556666:role/shape-reports",
+      "duration": 1800,
+      "envelope": [],
+      "managedPolicyArns": [
+        "arn:aws:iam::444455556666:policy/reports-read",
+        "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+      ],
+      "name": "billing-reports",
+      "sessionPolicy": "",
+      "sessionTags": {}
+    },
+    {
+      "account": "111122223333",
+      "baseRole": "arn:aws:iam::111122223333:role/broker/shape-dynamo-rw",
+      "duration": 3600,
+      "envelope": [
+        "arn:aws:dynamodb:*:111122223333:table/payments-*"
+      ],
+      "managedPolicyArns": [],
+      "name": "payments-ledger-rw",
+      "sessionPolicy": "{\"Statement\":[{\"Action\":[\"dynamodb:GetItem\",\"dynamodb:PutItem\",\"dynamodb:UpdateItem\",\"dynamodb:DeleteItem\",\"dynamodb:Query\",\"dynamodb:BatchWriteItem\"],\"Effect\":\"Allow\",\"Resource\":[\"arn:aws:dynamodb:*:111122223333:table/payments-ledger\",\"arn:aws:dynamodb:*:111122223333:table/payments-ledger-outbox\",\"arn:aws:dynamodb:*:111122223333:table/payments-ledger/index/*\",\"arn:aws:dynamodb:*:111122223333:table/payments-ledger-outbox/index/*\"],\"Sid\":\"Table\"},{\"Action\":\"dynamodb:DescribeTable\",\"Effect\":\"Allow\",\"Resource\":[\"arn:aws:dynamodb:*:111122223333:table/payments-ledger\",\"arn:aws:dynamodb:*:111122223333:table/payments-ledger-outbox\"],\"Sid\":\"Describe\"}],\"Version\":\"2012-10-17\"}",
+      "sessionTags": {
+        "team": "payments"
+      }
+    },
+    {
+      "account": "111122223333",
+      "baseRole": "arn:aws:iam::111122223333:role/broker/shape-dynamo-rw",
+      "duration": 3600,
+      "envelope": [
+        "arn:aws:dynamodb:*:111122223333:table/payments-outbox"
+      ],
+      "managedPolicyArns": [],
+      "name": "payments-outbox-r",
+      "sessionPolicy": "{\"Statement\":[{\"Action\":[\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:BatchGetItem\"],\"Condition\":{\"StringEquals\":{\"aws:ResourceTag/team\":\"${aws:PrincipalTag/team}\"}},\"Effect\":\"Allow\",\"Resource\":[\"arn:aws:dynamodb:*:111122223333:table/payments-outbox\"]},{\"Action\":\"dynamodb:DeleteTable\",\"Effect\":\"Deny\",\"Resource\":\"*\"}],\"Version\":\"2012-10-17\"}",
+      "sessionTags": {
+        "service": "outbox",
+        "team": "payments"
+      }
+    }
+  ],
+  "version": "abc123"
+}

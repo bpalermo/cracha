@@ -1,0 +1,56 @@
+kind: Grant
+metadata:
+  name: payments-ledger-rw
+spec:
+  account: "111122223333"
+  baseRole: arn:aws:iam::111122223333:role/broker/shape-dynamo-rw
+  sessionPolicy:
+    template: dynamo-table-rw
+    params:
+      tables:
+        - payments-table-number-00
+        - payments-table-number-01
+        - payments-table-number-02
+        - payments-table-number-03
+        - payments-table-number-04
+        - payments-table-number-05
+        - payments-table-number-06
+        - payments-table-number-07
+        - payments-table-number-08
+        - payments-table-number-09
+        - payments-table-number-10
+        - payments-table-number-11
+        - payments-table-number-12
+        - payments-table-number-13
+        - payments-table-number-14
+        - payments-table-number-15
+        - payments-table-number-16
+        - payments-table-number-17
+        - payments-table-number-18
+        - payments-table-number-19
+        - payments-table-number-20
+        - payments-table-number-21
+        - payments-table-number-22
+        - payments-table-number-23
+        - payments-table-number-24
+        - payments-table-number-25
+        - payments-table-number-26
+        - payments-table-number-27
+        - payments-table-number-28
+        - payments-table-number-29
+        - payments-table-number-30
+        - payments-table-number-31
+        - payments-table-number-32
+        - payments-table-number-33
+        - payments-table-number-34
+        - payments-table-number-35
+        - payments-table-number-36
+        - payments-table-number-37
+        - payments-table-number-38
+        - payments-table-number-39
+
+  managedPolicyArns: []
+  sessionTags: { team: payments }
+  duration: 3600
+  envelope:
+    - arn:aws:dynamodb:*:111122223333:table/payments-*

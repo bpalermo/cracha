@@ -1,0 +1,14 @@
+kind: Grant
+metadata:
+  name: payments-ledger-other
+spec:
+  account: "111122223333"
+  baseRole: arn:aws:iam::111122223333:role/broker/shape-dynamo-rw
+  sessionPolicy:
+    template: dynamo-table-rw
+    params: { tables: [payments-ledger, payments-ledger-outbox] }
+  managedPolicyArns: []
+  sessionTags: { team: billing }
+  duration: 3600
+  envelope:
+    - arn:aws:dynamodb:*:111122223333:table/payments-*

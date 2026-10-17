@@ -1,0 +1,8 @@
+kind: Assignment
+metadata:
+  name: payments-ledger-temp
+spec:
+  subject: prod/payments/ledger
+  grants: [payments-outbox-r]
+  expiresAt: "2030-01-01T00:00:00Z"
+  clusters: [prod-us-east-1]

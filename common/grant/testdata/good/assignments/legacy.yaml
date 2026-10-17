@@ -1,0 +1,7 @@
+kind: Assignment
+metadata:
+  name: legacy-expired
+spec:
+  subject: prod/payments/legacy
+  grants: [payments-ledger-rw, billing-reports]
+  expiresAt: "2020-01-01T00:00:00Z"
