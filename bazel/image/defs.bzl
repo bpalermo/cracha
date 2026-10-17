@@ -24,8 +24,8 @@ def go_image(
         path,
         base,
         load_tag,
-        registry,
-        repository,
+        registry = None,
+        repository = None,
         user = None,
         default_tag = "dev",
         platforms = DEFAULT_PLATFORMS,
@@ -40,7 +40,8 @@ def go_image(
       //pkg:image_load      loads the index into the local daemon as `load_tag`
       //pkg:image_tag       string_flag, the mutable tag (override with
                             --//pkg:image_tag=vX.Y.Z)
-      //pkg:image_push      pushes the index under two tags
+      //pkg:image_push      pushes the index under two tags, when registry
+                            and repository are given
 
     Args:
       name: prefix for the generated targets.
@@ -48,9 +49,11 @@ def go_image(
       path: absolute path of the binary inside the image.
       base: digest-pinned base image.
       load_tag: the name the image gets in a local daemon.
-      registry: registry host: IMAGE_REGISTRY of //bazel:registry.bzl.
+      registry: registry host: IMAGE_REGISTRY of //bazel:registry.bzl. None
+        for an image that is never published, such as a test helper: no push
+        target is defined then, and repository must be None too.
       repository: repository path within the registry: image_repository(...)
-        of //bazel:registry.bzl.
+        of //bazel:registry.bzl, or None with registry.
       default_tag: value of the tag flag when nothing overrides it.
       user: user the container runs as; None keeps the base image's user.
       platforms: platform labels, one manifest per platform.
@@ -91,6 +94,11 @@ def go_image(
         tag = load_tag,
         visibility = visibility,
     )
+
+    if (registry == None) != (repository == None):
+        fail("go_image %s: registry and repository go together" % name)
+    if registry == None:
+        return
 
     # Two tags deliberately. The first is mutable and is what a human pulls; the
     # second is immutable and answers "what did this commit publish?". Several

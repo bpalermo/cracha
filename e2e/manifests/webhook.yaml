@@ -1,0 +1,34 @@
+# The webhook registration (docs/design.md, section 7.4). ${CA_BUNDLE} is
+# the base64 CA that signed the webhook's certificate; e2e/run.sh fills it in.
+#
+# failurePolicy Fail: a pod must never be admitted unwired because the webhook
+# was unreachable. The namespaces Crachá itself and SPIRE run in are left
+# out, as is kube-system: nothing there is a workload of the broker, and a
+# pod of the webhook's own namespace must not depend on the webhook to start.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: cracha-webhook
+webhooks:
+  - name: pods.cracha.dev
+    admissionReviewVersions: [v1]
+    sideEffects: None
+    failurePolicy: Fail
+    timeoutSeconds: 10
+    clientConfig:
+      service:
+        name: cracha-webhook
+        namespace: cracha-system
+        path: /mutate
+        port: 443
+      caBundle: ${CA_BUNDLE}
+    rules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [cracha-system, spire, kube-system]

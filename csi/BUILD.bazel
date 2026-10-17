@@ -33,7 +33,7 @@ go_image(
     name = "image",
     base = "@distroless_static",
     binary = ":csi",
-    load_tag = "localhost/cracha-2e",
+    load_tag = "localhost/cracha-csi:e2e",
     path = "/cracha-csi",
     registry = IMAGE_REGISTRY,
     repository = image_repository("csi"),

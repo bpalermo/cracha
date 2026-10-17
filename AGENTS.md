@@ -22,6 +22,21 @@ bazel mod tidy              # after changing go.mod or a bazel_dep
 bazel build --config=ci //...   # what CI builds: lockfile must be current, shellcheck on
 ```
 
+### End to end
+
+```bash
+e2e/run.sh                      # the whole system in a kind cluster
+E2E_FILTER=TestName e2e/run.sh  # only the tests whose name matches
+E2E_KEEP_CLUSTER=1 e2e/run.sh   # leave the cluster up to look around
+```
+
+Needs docker, kind, kubectl and openssl. The suite in `e2e/` is tagged `e2e`
+and excluded from `bazel test //...`; `e2e/run.sh` creates or reuses the kind
+cluster `cracha-e2e`, loads the images built from the checkout, deploys SPIRE
+(`e2e/spire.sh`) and Crachá with an STS stand-in (`e2e/manifests`,
+`e2e/stsstub`) and runs the tests against the ambient kubeconfig. CI runs the
+same script. Every change that adds user-visible behaviour extends the suite.
+
 Bazel is the only build. Never run the host `go` tool: not `go mod tidy`, not
 `go get`, not `go test`. Change a Go dependency through rules_go's SDK:
 
@@ -57,7 +72,8 @@ hand-editing what Gazelle owns.
   validation, templates, lints, the compiled bundle, signing and publishing.
 - `grantc/` is the grant compiler CLI over `common/grant` (lint, compile,
   sign, verify, publish); it runs in CI and has no container image.
-- `bazel/` holds build rules; `docs/` the design.
+- `bazel/` holds build rules; `docs/` the design; `e2e/` the end-to-end
+  suite with its manifests and the two images only it uses.
 
 ## Images and versions
 

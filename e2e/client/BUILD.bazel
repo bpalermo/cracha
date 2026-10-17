@@ -1,0 +1,33 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+load("//bazel/image:defs.bzl", "go_image")
+
+go_library(
+    name = "client_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/bpalermo/cracha/e2e/client",
+    visibility = ["//visibility:private"],
+    deps = [
+        "@com_github_aws_aws_sdk_go_v2_config//:config",
+        "@com_github_aws_aws_sdk_go_v2_credentials//endpointcreds",
+    ],
+)
+
+go_binary(
+    name = "client",
+    basename = "client",
+    embed = [":client_lib"],
+    # Pure Go: the image binary is cross-built for linux with cgo off.
+    pure = "on",
+    visibility = ["//visibility:public"],
+)
+
+# The workload of the end-to-end suite: an AWS SDK user with no configuration
+# of its own. Loaded into the kind node by e2e/run.sh; never published, hence
+# no registry.
+go_image(
+    name = "image",
+    base = "@distroless_static",
+    binary = ":client",
+    load_tag = "localhost/cracha-e2e-client:e2e",
+    path = "/client",
+)

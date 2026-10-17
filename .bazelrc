@@ -11,6 +11,16 @@ build --workspace_status_command=bazel/workspace_status.sh
 # on each commit; nothing else rebuilds.
 build --stamp
 test --test_output=errors
+# The end-to-end suite needs a kind cluster, so it is tagged e2e and excluded
+# from `bazel test //...`; `--config=e2e` selects it instead, forwards the
+# kubeconfig and never caches a result. Run it through e2e/run.sh.
+test --test_tag_filters=-e2e
+test:e2e --test_tag_filters=e2e
+test:e2e --nocache_test_results
+test:e2e --test_env=KUBECONFIG
+test:e2e --test_timeout=1500
+# Each test by name, with its timing, in the test log.
+test:e2e --test_arg=-test.v
 
 # rules_lint reports its use to Aspect unless told not to.
 common --repo_env=ASPECT_TOOLS_TELEMETRY=-all
