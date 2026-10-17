@@ -1,0 +1,28 @@
+apiVersion: v2
+name: cracha
+description: |
+  Crachá issues AWS credentials to Kubernetes workloads from their SPIFFE
+  identity. A pod's AWS SDK reads a short-lived JWT-SVID from a file and
+  trades it with the broker for STS credentials; nothing in the pod changes.
+
+  This chart installs the credential broker, the CSI node plugin that writes
+  each pod's token, and the mutating webhook that wires opted-in pods up.
+type: application
+# The template of the chart's Chart.yaml: :chart_yaml writes @VERSION@ and
+# @APP_VERSION@ from the workspace status (bazel/workspace_status.sh) at build
+# time. Do not write a version here.
+#
+# A release, built from a commit tagged v<VERSION>, is versioned <VERSION>
+# (or <VERSION>-rc.<n> for a candidate). Every other commit is a snapshot of
+# the release it leads up to: <VERSION>-dev.<commit time, UTC>.g<commit>. The
+# time makes snapshots order by age; the commit says what was built. The
+# version being worked towards is the VERSION file at the root.
+version: "@VERSION@"
+appVersion: "@APP_VERSION@"
+keywords:
+  - aws
+  - credentials
+  - spiffe
+  - csi
+sources:
+  - https://github.com/bpalermo/cracha

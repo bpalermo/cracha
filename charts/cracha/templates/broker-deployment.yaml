@@ -1,0 +1,152 @@
+{{- $selector := dict "root" . "component" "broker" -}}
+{{- $labels := list -}}
+{{- range $domain, $label := .Values.broker.trustDomainLabels -}}
+{{- $labels = append $labels (printf "%s=%s" $domain $label) -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cracha.name" . }}-broker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: broker
+spec:
+  replicas: {{ .Values.broker.replicas }}
+  selector:
+    matchLabels:
+      {{- include "cracha.selectorLabels" $selector | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cracha.labels" . | nindent 8 }}
+        app.kubernetes.io/component: broker
+      annotations:
+        # A new document restarts the pods: the broker reads its files once.
+        checksum/config: {{ include (print .Template.BasePath "/broker-config.yaml") . | sha256sum }}
+        {{- with .Values.broker.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.broker.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      serviceAccountName: {{ include "cracha.name" . }}-broker
+      # The broker has no use for the Kubernetes API.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.broker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.broker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: broker
+          image: {{ include "cracha.image" (dict "root" . "image" .Values.broker.image) }}
+          imagePullPolicy: {{ .Values.broker.image.pullPolicy }}
+          args:
+            - --listen=:{{ .Values.broker.port }}
+            {{- include "cracha.tlsArgs" $selector | nindent 12 }}
+            - --workload-api-socket=unix:///spiffe-workload-api/{{ .Values.broker.workloadAPI.socket }}
+            - --cluster={{ required "broker.cluster is required: the name of the cluster this broker serves" .Values.broker.cluster }}
+            {{- if $labels }}
+            - --trust-domain-labels={{ join "," $labels }}
+            {{- end }}
+            - --assignments=/etc/cracha/assignments/{{ .Values.broker.assignments.key }}
+            - --grants-fixture=/etc/cracha/grants/{{ .Values.broker.grants.key }}
+            {{- with .Values.broker.awsRegion }}
+            - --aws-region={{ . }}
+            {{- end }}
+            - --log-level={{ include "cracha.logLevel" .Values.broker.logLevel }}
+          {{- with .Values.broker.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.broker.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: https
+              containerPort: {{ .Values.broker.port }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            periodSeconds: 10
+          securityContext:
+            {{- include "cracha.restrictedSecurityContext" . | nindent 12 }}
+          {{- with .Values.broker.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- include "cracha.tlsVolumeMount" $selector | nindent 12 }}
+            - name: assignments
+              mountPath: /etc/cracha/assignments
+              readOnly: true
+            - name: grants
+              mountPath: /etc/cracha/grants
+              readOnly: true
+            - name: spire-workload-api
+              mountPath: /spiffe-workload-api
+              readOnly: true
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      # Replicas should not share a fate.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "cracha.selectorLabels" $selector | nindent 14 }}
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "cracha.selectorLabels" $selector | nindent 14 }}
+      volumes:
+        {{- include "cracha.tlsVolume" $selector | nindent 8 }}
+        - name: assignments
+          configMap:
+            name: {{ .Values.broker.assignments.existingConfigMap | default (printf "%s-assignments" (include "cracha.name" .)) }}
+        - name: grants
+          configMap:
+            name: {{ .Values.broker.grants.existingConfigMap | default (printf "%s-grants" (include "cracha.name" .)) }}
+        # The trust bundle the JWT-SVIDs are verified against comes from the
+        # broker's own Workload API connection (design 6.5).
+        - name: spire-workload-api
+          {{- toYaml .Values.broker.workloadAPI.volume | nindent 10 }}
+---
+# The broker's service account exists for the platform identity (design 5):
+# an IAM role annotation, or an EKS Pod Identity association. It holds no
+# Kubernetes permissions.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "cracha.name" . }}-broker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: broker
+  {{- with .Values.broker.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: false

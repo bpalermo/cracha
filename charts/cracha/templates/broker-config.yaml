@@ -1,0 +1,29 @@
+{{- if not .Values.broker.assignments.existingConfigMap }}
+# The static authorization backend's assignments (broker.assignments).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cracha.name" . }}-assignments
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: broker
+data:
+  {{ .Values.broker.assignments.key }}: |
+    {{- required "broker.assignments.document is required unless broker.assignments.existingConfigMap names a ConfigMap" .Values.broker.assignments.document | toYaml | nindent 4 }}
+{{- end }}
+{{- if not .Values.broker.grants.existingConfigMap }}
+---
+# The resolved-grants fixture (broker.grants).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cracha.name" . }}-grants
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: broker
+data:
+  {{ .Values.broker.grants.key }}: |
+    {{- required "broker.grants.document is required unless broker.grants.existingConfigMap names a ConfigMap" .Values.broker.grants.document | toYaml | nindent 4 }}
+{{- end }}

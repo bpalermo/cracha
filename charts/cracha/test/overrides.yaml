@@ -1,0 +1,127 @@
+# Every non-default knob the chart has, so a template test renders the paths
+# the defaults leave out.
+nameOverride: custom
+imagePullSecrets:
+  - name: registry-credentials
+tls:
+  mode: existing
+  existingSecrets:
+    broker: broker-certs
+    webhook: webhook-certs
+  caBundle: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCg==
+broker:
+  image:
+    repository: registry.example.com/cracha/broker
+    tag: v9.9.9
+    digest: ""
+    pullPolicy: Always
+  replicas: 1
+  port: 9443
+  cluster: prod-eu
+  trustDomainLabels:
+    prod.example.org: prod
+    partner.example.net: partner
+  awsRegion: eu-west-1
+  logLevel: debug
+  workloadAPI:
+    volume:
+      csi:
+        driver: csi.spiffe.io
+        readOnly: true
+    socket: socket
+  assignments:
+    existingConfigMap: my-assignments
+    key: my-assignments.yaml
+  grants:
+    existingConfigMap: my-grants
+    key: my-grants.yaml
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/cracha-broker
+  env:
+    - name: AWS_ENDPOINT_URL_STS
+      value: https://sts.eu-west-1.amazonaws.com
+  envFrom:
+    - secretRef:
+        name: broker-aws
+  priorityClassName: system-cluster-critical
+  nodeSelector:
+    kubernetes.io/os: linux
+  tolerations:
+    - key: dedicated
+      operator: Exists
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  podAnnotations:
+    example.com/scrape: "true"
+csi:
+  image:
+    repository: registry.example.com/cracha/csi
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    pullPolicy: Always
+  registrar:
+    image:
+      repository: registry.example.com/sig-storage/csi-node-driver-registrar
+      tag: v2.99.0
+      digest: ""
+      pullPolicy: Always
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+  kubeletDir: /var/lib/k0s/kubelet
+  workloadAPI:
+    hostPath: /run/spiffe/agent
+    socket: api.sock
+  brokerAPI:
+    hostPath: /run/spiffe/broker
+    socket: api.sock
+  maxTokenTTL: 2m
+  publishDeadline: 10s
+  tokenUid: 1000
+  tokenGid: 1000
+  healthzPort: 9909
+  logLevel: warn
+  priorityClassName: ""
+  tolerations: []
+  nodeSelector:
+    kubernetes.io/os: linux
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+  podAnnotations:
+    example.com/scrape: "true"
+webhook:
+  image:
+    repository: registry.example.com/cracha/webhook
+    tag: v9.9.9
+    digest: ""
+    pullPolicy: Always
+  replicas: 1
+  port: 9443
+  brokerUrl: https://credentials.example.org
+  defaultRegion: eu-west-1
+  conflictingEnv: strip
+  saCacheTTL: 0s
+  timeoutSeconds: 5
+  excludedNamespaces:
+    - spire
+    - kube-system
+  logLevel: error
+  priorityClassName: system-cluster-critical
+  nodeSelector:
+    kubernetes.io/os: linux
+  tolerations:
+    - key: dedicated
+      operator: Exists
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+  podAnnotations:
+    example.com/scrape: "true"

@@ -1,0 +1,37 @@
+{{- $selector := dict "root" . "component" "webhook" -}}
+# What the apiserver calls (clientConfig.service of the webhook
+# configuration), on 443.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cracha.name" . }}-webhook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webhook
+spec:
+  selector:
+    {{- include "cracha.selectorLabels" $selector | nindent 4 }}
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+      appProtocol: https
+{{- if gt (int .Values.webhook.replicas) 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "cracha.name" . }}-webhook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webhook
+spec:
+  # One at a time: with failurePolicy Fail, no webhook means no new pods in
+  # the namespaces it covers.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "cracha.selectorLabels" $selector | nindent 6 }}
+{{- end }}

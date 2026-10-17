@@ -1,15 +1,19 @@
 load("@rules_shell//shell:sh_library.bzl", "sh_library")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
-# The publishing coordinates (registry.bzl) and the git state that stamps the
-# images' tags and the binaries' version (workspace_status.sh).
+# The publishing coordinates (registry.bzl), the git state that stamps the
+# images' tags, the binaries' version and the chart's version
+# (workspace_status.sh), and the reader of a packaged chart's image pins
+# (chart-pin.sh, run by //charts/cracha:pin_test).
 exports_files([
+    "chart-pin.sh",
     "registry.bzl",
     "workspace_status.sh",
 ])
 
 # For the shellcheck aspect (--config=lint): the workspace status script is
-# run by Bazel itself, so no target would otherwise show it to the aspect.
+# run by Bazel itself and chart-pin.sh is test data, so no target would
+# otherwise show them to the aspect.
 sh_library(
     name = "scripts",
     srcs = glob(["*.sh"]),

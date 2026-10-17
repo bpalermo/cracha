@@ -1,17 +1,20 @@
-"""Where Crachá's images are published: ONE setting.
+"""Where Crachá's images and chart are published: ONE setting.
 
 Every published coordinate is derived from the constants below: the
 `image_push` of each `go_image` (//broker:image_push, //csi:image_push,
-//webhook:image_push). Nothing else may spell the registry out.
+//webhook:image_push), the chart push (//charts/cracha:cracha.push_registry)
+and the chart's default image repositories (charts/cracha/values.yaml, which
+takes each from its image_push). Nothing else may spell the registry out.
 
 The coordinates:
 
     <IMAGE_REGISTRY>/<IMAGE_NAMESPACE>/broker
     <IMAGE_REGISTRY>/<IMAGE_NAMESPACE>/csi
     <IMAGE_REGISTRY>/<IMAGE_NAMESPACE>/webhook
+    oci://<IMAGE_REGISTRY>/<IMAGE_NAMESPACE>/cracha        (the chart)
 
 Repositories are not prefixed with the project name: the namespace already is
-the project.
+the project. The chart is `cracha` because no image is.
 
 Keep each assignment below on ONE line, exactly `NAME = "value"`, so a script
 can read it with a line-anchored grep.
@@ -45,3 +48,28 @@ def image_reference(component):
       e.g. "quay.io/cracha/csi".
     """
     return "{}/{}".format(IMAGE_REGISTRY, image_repository(component))
+
+def chart_push_url():
+    """The OCI base `helm push <chart>.tgz` is given (scheme, no chart name).
+
+    `helm push` appends the packaged chart's Chart.yaml `name:` to this base and
+    uses the chart version as the tag, so the repository a chart lands in is
+    chart_registry_url(<name>).
+
+    Returns:
+      "oci://quay.io/cracha".
+    """
+    return "oci://{}/{}".format(IMAGE_REGISTRY, IMAGE_NAMESPACE)
+
+def chart_registry_url(chart):
+    """The host-qualified OCI repository a chart is pushed to (no scheme, no tag).
+
+    Consumers pull it with `helm pull oci://<this> --version <X.Y.Z>`.
+
+    Args:
+      chart: the Chart.yaml name, "cracha".
+
+    Returns:
+      e.g. "quay.io/cracha/cracha".
+    """
+    return "{}/{}/{}".format(IMAGE_REGISTRY, IMAGE_NAMESPACE, chart)

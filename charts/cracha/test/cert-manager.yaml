@@ -1,0 +1,10 @@
+# The cert-manager TLS mode: Certificates instead of Secrets, and the CA
+# injector's annotation on the webhook configuration.
+tls:
+  mode: cert-manager
+  certManager:
+    issuerRef:
+      name: internal-ca
+      kind: Issuer
+    duration: 720h
+    renewBefore: 120h

@@ -1,0 +1,12 @@
+{{- /*
+The webhook registration in the modes where the authority comes from outside
+the chart. In the generated mode tls.yaml renders it, with the authority it
+makes.
+*/ -}}
+{{- if eq .Values.tls.mode "existing" }}
+{{- $caBundle := required "tls.caBundle is required with tls.mode existing: the base64 PEM of the authority that signed the webhook's certificate" .Values.tls.caBundle }}
+{{- include "cracha.webhookConfiguration" (dict "root" . "caBundle" $caBundle "annotations" dict) }}
+{{- else if eq .Values.tls.mode "cert-manager" }}
+{{- $annotations := dict "cert-manager.io/inject-ca-from" (printf "%s/%s-webhook" .Release.Namespace (include "cracha.name" .)) }}
+{{- include "cracha.webhookConfiguration" (dict "root" . "caBundle" "" "annotations" $annotations) }}
+{{- end }}
