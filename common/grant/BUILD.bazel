@@ -38,6 +38,7 @@ go_test(
         "bundle_test.go",
         "lint_test.go",
         "load_test.go",
+        "pipeline_test.go",
         "publish_test.go",
         "sign_test.go",
         "template_test.go",

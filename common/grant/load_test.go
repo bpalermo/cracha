@@ -1,6 +1,7 @@
 package grant
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -126,6 +127,55 @@ func TestValidateSourceReferences(t *testing.T) {
 func TestLoadMissingDir(t *testing.T) {
 	if _, err := Load("testdata/does-not-exist"); err == nil {
 		t.Error("Load of a missing directory succeeded")
+	}
+}
+
+// Problems the checked-in bad trees do not cover: a second definition of an
+// assignment or a template, and a document that cannot be read.
+func TestLoadDuplicatesAndUnreadable(t *testing.T) {
+	const assignment = "kind: Assignment\nmetadata:\n  name: payments\nspec:\n  subject: prod/payments/ledger\n  grants: [payments-ledger-rw]\n"
+	const template = `{"policy": {"Version": "2012-10-17"}}`
+	write := func(t *testing.T, dir, name, content string) {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, dir string)
+		want  string
+	}{
+		{"duplicate assignment", func(t *testing.T, dir string) {
+			write(t, dir, "assignments/a.yaml", assignment)
+			write(t, dir, "assignments/b.yml", assignment)
+		}, `assignments/b.yml: assignment "payments" already defined in assignments/a.yaml`},
+		{"duplicate template", func(t *testing.T, dir string) {
+			write(t, dir, "templates/t.json", template)
+			write(t, dir, "templates/z/t.json", template)
+		}, `templates/z/t.json: template "t" already defined in `},
+		{"unreadable document", func(t *testing.T, dir string) {
+			if err := os.Symlink(filepath.Join(dir, "missing.yaml"), filepath.Join(dir, "dangling.yaml")); err != nil {
+				t.Skipf("symlink: %v", err)
+			}
+		}, "dangling.yaml"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tt.setup(t, dir)
+			_, err := Load(dir)
+			if err == nil {
+				t.Fatal("Load succeeded, want an error")
+			}
+			if !strings.Contains(err.Error(), filepath.FromSlash(tt.want)) {
+				t.Errorf("error = %v, want it to contain %q", err, tt.want)
+			}
+		})
 	}
 }
 

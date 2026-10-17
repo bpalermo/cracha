@@ -29,6 +29,21 @@ var (
 // maxSubjectLen is the authorization subject length limit of design 4.3.
 const maxSubjectLen = 1024
 
+// errList collects the problems a validation finds, in the order found.
+type errList []error
+
+// addf records a new problem; %w wraps as in fmt.Errorf.
+func (l *errList) addf(format string, args ...any) {
+	*l = append(*l, fmt.Errorf(format, args...))
+}
+
+// add records err when it is not nil.
+func (l *errList) add(err error) {
+	if err != nil {
+		*l = append(*l, err)
+	}
+}
+
 func validateName(what, name string) error {
 	if len(name) > maxNameLen {
 		return fmt.Errorf("%s %q: longer than %d characters", what, name, maxNameLen)
@@ -39,93 +54,139 @@ func validateName(what, name string) error {
 	return nil
 }
 
+// grantChecks are the rules ValidateGrant applies, in the order their
+// problems are reported.
+var grantChecks = []func(g *Grant) errList{
+	validateGrantHeader,
+	func(g *Grant) errList { return validateAccountAndRole(&g.Spec) },
+	func(g *Grant) errList { return validateSessionPolicy(&g.Spec) },
+	func(g *Grant) errList { return validateManagedPolicyArns(&g.Spec) },
+	func(g *Grant) errList { return validateDuration(&g.Spec) },
+	func(g *Grant) errList { return validateEnvelope(&g.Spec) },
+	func(g *Grant) errList { return validateTags(g.Spec.SessionTags) },
+}
+
 // ValidateGrant checks a Grant against the rules of design 6.2 and the STS
 // limits, and returns every problem found, joined.
 func ValidateGrant(g *Grant) error {
-	var errs []error
-	fail := func(format string, args ...any) {
-		errs = append(errs, fmt.Errorf(format, args...))
+	var errs errList
+	for _, check := range grantChecks {
+		errs = append(errs, check(g)...)
 	}
+	return errors.Join(errs...)
+}
+
+// validateGrantHeader checks the kind and the name.
+func validateGrantHeader(g *Grant) errList {
+	var errs errList
 	if g.Kind != KindGrant {
-		fail("kind must be %s", KindGrant)
+		errs.addf("kind must be %s", KindGrant)
 	}
-	if err := validateName("grant name", g.Name()); err != nil {
-		errs = append(errs, err)
-	}
-	s := &g.Spec
+	errs.add(validateName("grant name", g.Name()))
+	return errs
+}
+
+// validateAccountAndRole checks the account and that the base role is a
+// role of that account.
+func validateAccountAndRole(s *GrantSpec) errList {
+	var errs errList
 	if !accountRE.MatchString(s.Account) {
-		fail("account %q: must be 12 digits", s.Account)
+		errs.addf("account %q: must be 12 digits", s.Account)
 	}
-	if m := roleARNRE.FindStringSubmatch(s.BaseRole); m == nil {
-		fail("baseRole %q: must be an IAM role ARN", s.BaseRole)
-	} else {
-		if m[1] != s.Account {
-			fail("baseRole %q: account %s does not match the grant's account %s", s.BaseRole, m[1], s.Account)
+	m := roleARNRE.FindStringSubmatch(s.BaseRole)
+	if m == nil {
+		errs.addf("baseRole %q: must be an IAM role ARN", s.BaseRole)
+		return errs
+	}
+	if m[1] != s.Account {
+		errs.addf("baseRole %q: account %s does not match the grant's account %s", s.BaseRole, m[1], s.Account)
+	}
+	if len(m[2]) > 64 {
+		errs.addf("baseRole %q: role name longer than 64 characters", s.BaseRole)
+	}
+	return errs
+}
+
+// validateSessionPolicy checks the session policy reference, and that a
+// grant without one carries managed policies instead.
+func validateSessionPolicy(s *GrantSpec) errList {
+	var errs errList
+	sp := s.SessionPolicy
+	if sp == nil {
+		if len(s.ManagedPolicyArns) == 0 {
+			errs.addf("a grant needs a sessionPolicy or managedPolicyArns; without either it would hand out the whole base role")
 		}
-		if len(m[2]) > 64 {
-			fail("baseRole %q: role name longer than 64 characters", s.BaseRole)
+		return errs
+	}
+	errs.add(validateName("sessionPolicy.template", sp.Template))
+	for _, name := range sortedKeys(sp.Params) {
+		if err := validateParamName(name); err != nil {
+			errs.addf("sessionPolicy.params: %w", err)
 		}
 	}
-	if s.SessionPolicy == nil && len(s.ManagedPolicyArns) == 0 {
-		fail("a grant needs a sessionPolicy or managedPolicyArns; without either it would hand out the whole base role")
+	if len(s.Envelope) == 0 {
+		errs.addf("envelope is required when a sessionPolicy is set")
 	}
-	if s.SessionPolicy != nil {
-		if err := validateName("sessionPolicy.template", s.SessionPolicy.Template); err != nil {
-			errs = append(errs, err)
-		}
-		for _, name := range sortedKeys(s.SessionPolicy.Params) {
-			if err := validateParamName(name); err != nil {
-				errs = append(errs, fmt.Errorf("sessionPolicy.params: %w", err))
-			}
-		}
-		if len(s.Envelope) == 0 {
-			fail("envelope is required when a sessionPolicy is set")
-		}
-	}
+	return errs
+}
+
+// validateManagedPolicyArns checks the managed policies: at most STS's
+// limit, each listed once, each a policy ARN of AWS or the grant's account.
+func validateManagedPolicyArns(s *GrantSpec) errList {
+	var errs errList
 	if len(s.ManagedPolicyArns) > MaxManagedPolicyArns {
-		fail("managedPolicyArns: %d entries, STS allows at most %d", len(s.ManagedPolicyArns), MaxManagedPolicyArns)
+		errs.addf("managedPolicyArns: %d entries, STS allows at most %d", len(s.ManagedPolicyArns), MaxManagedPolicyArns)
 	}
 	seen := map[string]bool{}
 	for _, arn := range s.ManagedPolicyArns {
 		if seen[arn] {
-			fail("managedPolicyArns: %q listed twice", arn)
+			errs.addf("managedPolicyArns: %q listed twice", arn)
 		}
 		seen[arn] = true
 		m := policyARNRE.FindStringSubmatch(arn)
 		if m == nil {
-			fail("managedPolicyArns: %q is not an IAM managed policy ARN", arn)
+			errs.addf("managedPolicyArns: %q is not an IAM managed policy ARN", arn)
 			continue
 		}
 		if m[1] != "aws" && m[1] != s.Account {
-			fail("managedPolicyArns: %q is in account %s, not the grant's account %s", arn, m[1], s.Account)
+			errs.addf("managedPolicyArns: %q is in account %s, not the grant's account %s", arn, m[1], s.Account)
 		}
 	}
+	return errs
+}
+
+// validateDuration checks a set duration against STS's bounds.
+func validateDuration(s *GrantSpec) errList {
+	var errs errList
 	if s.Duration != 0 && (s.Duration < MinDuration || s.Duration > MaxDuration) {
-		fail("duration %d: must be between %d and %d seconds", s.Duration, MinDuration, MaxDuration)
+		errs.addf("duration %d: must be between %d and %d seconds", s.Duration, MinDuration, MaxDuration)
 	}
-	seen = map[string]bool{}
+	return errs
+}
+
+// validateEnvelope checks that every envelope entry is an ARN pattern
+// listed once.
+func validateEnvelope(s *GrantSpec) errList {
+	var errs errList
+	seen := map[string]bool{}
 	for _, pattern := range s.Envelope {
 		if seen[pattern] {
-			fail("envelope: %q listed twice", pattern)
+			errs.addf("envelope: %q listed twice", pattern)
 		}
 		seen[pattern] = true
 		if !IsARNPattern(pattern) {
-			fail("envelope: %q is not an ARN pattern", pattern)
+			errs.addf("envelope: %q is not an ARN pattern", pattern)
 		}
 	}
-	errs = append(errs, validateTags(s.SessionTags)...)
-	return errors.Join(errs...)
+	return errs
 }
 
 // validateTags checks session tags against STS's charset and limits, with
 // the broker's own tags reserved.
-func validateTags(tags map[string]string) []error {
-	var errs []error
-	fail := func(format string, args ...any) {
-		errs = append(errs, fmt.Errorf(format, args...))
-	}
+func validateTags(tags map[string]string) errList {
+	var errs errList
 	if n, limit := len(tags), MaxSessionTags-BrokerTagCount; n > limit {
-		fail("sessionTags: %d tags, at most %d allowed once the broker's %d are counted", n, limit, BrokerTagCount)
+		errs.addf("sessionTags: %d tags, at most %d allowed once the broker's %d are counted", n, limit, BrokerTagCount)
 	}
 	chars := 0
 	for _, k := range sortedKeys(tags) {
@@ -133,25 +194,25 @@ func validateTags(tags map[string]string) []error {
 		chars += len(k) + len(v)
 		switch {
 		case k == "":
-			fail("sessionTags: empty key")
+			errs.addf("sessionTags: empty key")
 		case len(k) > MaxTagKeyChars:
-			fail("sessionTags: key %q longer than %d characters", k, MaxTagKeyChars)
+			errs.addf("sessionTags: key %q longer than %d characters", k, MaxTagKeyChars)
 		case !tagRE.MatchString(k):
-			fail("sessionTags: key %q has characters outside the tag charset", k)
+			errs.addf("sessionTags: key %q has characters outside the tag charset", k)
 		case strings.HasPrefix(strings.ToLower(k), "aws:"):
-			fail("sessionTags: key %q: the aws: prefix is reserved", k)
+			errs.addf("sessionTags: key %q: the aws: prefix is reserved", k)
 		case isBrokerTagKey(k):
-			fail("sessionTags: key %q is set by the broker and cannot be set by a grant", k)
+			errs.addf("sessionTags: key %q is set by the broker and cannot be set by a grant", k)
 		}
 		switch {
 		case len(v) > MaxTagValueChars:
-			fail("sessionTags: value of %q longer than %d characters", k, MaxTagValueChars)
+			errs.addf("sessionTags: value of %q longer than %d characters", k, MaxTagValueChars)
 		case !tagRE.MatchString(v):
-			fail("sessionTags: value of %q has characters outside the tag charset", k)
+			errs.addf("sessionTags: value of %q has characters outside the tag charset", k)
 		}
 	}
 	if limit := TagBudgetChars - BrokerTagChars; chars > limit {
-		fail("sessionTags: %d characters of keys and values, at most %d allowed once the broker's are counted", chars, limit)
+		errs.addf("sessionTags: %d characters of keys and values, at most %d allowed once the broker's are counted", chars, limit)
 	}
 	return errs
 }
@@ -168,75 +229,101 @@ func isBrokerTagKey(k string) bool {
 // ValidateAssignment checks an Assignment's own fields; whether its grants
 // exist is checked by ValidateSource.
 func ValidateAssignment(a *Assignment) error {
-	var errs []error
-	fail := func(format string, args ...any) {
-		errs = append(errs, fmt.Errorf(format, args...))
-	}
+	var errs errList
 	if a.Kind != KindAssignment {
-		fail("kind must be %s", KindAssignment)
+		errs.addf("kind must be %s", KindAssignment)
 	}
-	if err := validateName("assignment name", a.Name()); err != nil {
-		errs = append(errs, err)
-	}
+	errs.add(validateName("assignment name", a.Name()))
 	s := &a.Spec
 	if !subjectRE.MatchString(s.Subject) || len(s.Subject) > maxSubjectLen {
-		fail("subject %q: must be an authorization subject encoding (design 4.3)", s.Subject)
+		errs.addf("subject %q: must be an authorization subject encoding (design 4.3)", s.Subject)
 	}
-	if len(s.Grants) == 0 {
-		fail("grants: at least one grant is required")
+	errs = append(errs, validateAssignedGrants(s.Grants)...)
+	_, err := s.Expiry()
+	errs.add(err)
+	errs = append(errs, validateClusters(s.Clusters)...)
+	return errors.Join(errs...)
+}
+
+// validateAssignedGrants checks an assignment's grant names: at least one,
+// each listed once, each a valid name.
+func validateAssignedGrants(grants []string) errList {
+	var errs errList
+	if len(grants) == 0 {
+		errs.addf("grants: at least one grant is required")
 	}
 	seen := map[string]bool{}
-	for _, name := range s.Grants {
+	for _, name := range grants {
 		if seen[name] {
-			fail("grants: %q listed twice", name)
+			errs.addf("grants: %q listed twice", name)
 		}
 		seen[name] = true
 		if err := validateName("grant name", name); err != nil {
-			errs = append(errs, fmt.Errorf("grants: %w", err))
+			errs.addf("grants: %w", err)
 		}
 	}
-	if _, err := s.Expiry(); err != nil {
-		errs = append(errs, err)
-	}
-	seen = map[string]bool{}
-	for _, c := range s.Clusters {
+	return errs
+}
+
+// validateClusters checks an assignment's cluster names: none empty, each
+// listed once.
+func validateClusters(clusters []string) errList {
+	var errs errList
+	seen := map[string]bool{}
+	for _, c := range clusters {
 		if c == "" {
-			fail("clusters: empty name")
+			errs.addf("clusters: empty name")
 		}
 		if seen[c] {
-			fail("clusters: %q listed twice", c)
+			errs.addf("clusters: %q listed twice", c)
 		}
 		seen[c] = true
 	}
-	return errors.Join(errs...)
+	return errs
 }
 
 // ValidateSource validates every document of a source tree and the
 // references between them: a grant's template must exist, and an
 // assignment's grants must exist.
 func ValidateSource(src *Source) error {
-	var errs []error
+	var errs errList
 	for _, g := range src.Grants {
-		if err := ValidateGrant(g); err != nil {
-			errs = append(errs, fmt.Errorf("grant %s (%s): %w", g.Name(), g.Path, err))
-			continue
-		}
-		if sp := g.Spec.SessionPolicy; sp != nil {
-			if _, ok := src.Templates[sp.Template]; !ok {
-				errs = append(errs, fmt.Errorf("grant %s (%s): template %q not found under %s/", g.Name(), g.Path, sp.Template, TemplatesDir))
-			}
-		}
+		errs.add(validateSourceGrant(src, g))
 	}
 	for _, a := range src.Assignments {
-		if err := ValidateAssignment(a); err != nil {
-			errs = append(errs, fmt.Errorf("assignment %s (%s): %w", a.Name(), a.Path, err))
-			continue
-		}
-		for _, name := range a.Spec.Grants {
-			if src.Grant(name) == nil {
-				errs = append(errs, fmt.Errorf("assignment %s (%s): grant %q not found", a.Name(), a.Path, name))
-			}
-		}
+		errs = append(errs, validateSourceAssignment(src, a)...)
 	}
 	return errors.Join(errs...)
+}
+
+// validateSourceGrant validates one grant and, when it is valid, that the
+// template it names exists.
+func validateSourceGrant(src *Source, g *Grant) error {
+	if err := ValidateGrant(g); err != nil {
+		return fmt.Errorf("grant %s (%s): %w", g.Name(), g.Path, err)
+	}
+	sp := g.Spec.SessionPolicy
+	if sp == nil {
+		return nil
+	}
+	if _, ok := src.Templates[sp.Template]; !ok {
+		return fmt.Errorf("grant %s (%s): template %q not found under %s/", g.Name(), g.Path, sp.Template, TemplatesDir)
+	}
+	return nil
+}
+
+// validateSourceAssignment validates one assignment and, when it is valid,
+// that every grant it names exists.
+func validateSourceAssignment(src *Source, a *Assignment) errList {
+	var errs errList
+	if err := ValidateAssignment(a); err != nil {
+		errs.addf("assignment %s (%s): %w", a.Name(), a.Path, err)
+		return errs
+	}
+	for _, name := range a.Spec.Grants {
+		if src.Grant(name) == nil {
+			errs.addf("assignment %s (%s): grant %q not found", a.Name(), a.Path, name)
+		}
+	}
+	return errs
 }

@@ -249,3 +249,51 @@ func TestLintCompositionSynthetic(t *testing.T) {
 		t.Errorf("problems = %v, want the managed policy total", r.Problems)
 	}
 }
+
+// The composed policy of a subject's grants is itself checked: it must
+// compose, and fit the size budget.
+func TestLintCompositionComposedPolicy(t *testing.T) {
+	role := "arn:aws:iam::111122223333:role/shape"
+	src := &Source{
+		Grants: []*Grant{
+			{Kind: KindGrant, Metadata: Metadata{Name: "a"}, Spec: GrantSpec{Account: "111122223333", BaseRole: role, Envelope: []string{"arn:aws:s3:::a/*"}}},
+			{Kind: KindGrant, Metadata: Metadata{Name: "b"}, Spec: GrantSpec{Account: "111122223333", BaseRole: role, Envelope: []string{"arn:aws:s3:::b/*"}}},
+		},
+		Assignments: []*Assignment{
+			{Kind: KindAssignment, Metadata: Metadata{Name: "x"}, Spec: AssignmentSpec{Subject: "x", Grants: []string{"a", "b"}}},
+		},
+	}
+	inside := func(bucket string, n int) string {
+		resources := make([]string, n)
+		for i := range resources {
+			resources[i] = `"arn:aws:s3:::` + bucket + `/prefix/key-number-` + strings.Repeat("0", 10) + `/` + string(rune('a'+i)) + `/*"`
+		}
+		return `{"Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":[` + strings.Join(resources, ",") + `]}]}`
+	}
+	tests := []struct {
+		name     string
+		rendered map[string]string
+		want     string // substring of a problem; empty means none
+		composed bool   // whether the composition carries a composed policy
+	}{
+		{"does not compose", map[string]string{"a": inside("a", 1), "b": `{}`}, "subject x: composing session policies: policy 1: no Statement", false},
+		{"too large together", map[string]string{"a": inside("a", 25), "b": inside("b", 25)}, "subject x: composed session policy is ", true},
+		{"fits", map[string]string{"a": inside("a", 1), "b": inside("b", 1)}, "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := LintComposition(src, tt.rendered, lintNow)
+			all := strings.Join(r.Problems, "\n")
+			if tt.want == "" && all != "" {
+				t.Errorf("problems = %v, want none", r.Problems)
+			}
+			if tt.want != "" && !strings.Contains(all, tt.want) {
+				t.Errorf("problems = %v, want one containing %q", r.Problems, tt.want)
+			}
+			c := r.Compositions[0]
+			if (c.Policy != "") != tt.composed || c.PolicyChars != len(c.Policy) {
+				t.Errorf("composition = %+v, want composed = %v", c, tt.composed)
+			}
+		})
+	}
+}

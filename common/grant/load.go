@@ -71,79 +71,127 @@ const (
 // under dir/templates is a template. It reports every problem it finds, not
 // only the first.
 func Load(dir string) (*Source, error) {
-	src := &Source{Templates: map[string]*Template{}}
-	var errs []error
-	seenGrants := map[string]string{}
-	seenAssignments := map[string]string{}
-
-	templatesDir := filepath.Join(dir, TemplatesDir)
-	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		rel, relErr := filepath.Rel(dir, path)
-		if relErr != nil {
-			rel = path
-		}
-		inTemplates := path == templatesDir || strings.HasPrefix(path, templatesDir+string(filepath.Separator))
-		switch ext := filepath.Ext(path); {
-		case inTemplates && ext == ".json":
-			t, err := LoadTemplate(path)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("%s: %w", rel, err))
-				return nil
-			}
-			if prev, dup := src.Templates[t.Name]; dup {
-				errs = append(errs, fmt.Errorf("%s: template %q already defined in %s", rel, t.Name, prev.Path))
-				return nil
-			}
-			src.Templates[t.Name] = t
-		case inTemplates:
-			errs = append(errs, fmt.Errorf("%s: only *.json templates belong under %s", rel, TemplatesDir))
-		case ext == ".yaml" || ext == ".yml":
-			data, err := os.ReadFile(path)
-			if err != nil {
-				errs = append(errs, err)
-				return nil
-			}
-			obj, err := ParseDocument(data)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("%s: %w", rel, err))
-				return nil
-			}
-			switch o := obj.(type) {
-			case *Grant:
-				o.Path = rel
-				if prev, dup := seenGrants[o.Name()]; dup {
-					errs = append(errs, fmt.Errorf("%s: grant %q already defined in %s", rel, o.Name(), prev))
-					return nil
-				}
-				seenGrants[o.Name()] = rel
-				src.Grants = append(src.Grants, o)
-			case *Assignment:
-				o.Path = rel
-				if prev, dup := seenAssignments[o.Name()]; dup {
-					errs = append(errs, fmt.Errorf("%s: assignment %q already defined in %s", rel, o.Name(), prev))
-					return nil
-				}
-				seenAssignments[o.Name()] = rel
-				src.Assignments = append(src.Assignments, o)
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		errs = append(errs, err)
-	}
+	l := newLoader(dir)
+	l.errs.add(filepath.WalkDir(dir, l.visit))
+	src := l.src
 	sort.Slice(src.Grants, func(i, j int) bool { return src.Grants[i].Name() < src.Grants[j].Name() })
 	sort.Slice(src.Assignments, func(i, j int) bool { return src.Assignments[i].Name() < src.Assignments[j].Name() })
-	if len(errs) > 0 {
-		return nil, errors.Join(errs...)
+	if len(l.errs) > 0 {
+		return nil, errors.Join(l.errs...)
 	}
 	return src, nil
+}
+
+// loader is one Load in progress: the tree being read, what has been
+// loaded from it, and the problems found so far.
+type loader struct {
+	dir          string
+	templatesDir string
+	src          *Source
+	errs         errList
+	// seenGrants and seenAssignments map a name to the file that defined
+	// it, to report a second definition.
+	seenGrants      map[string]string
+	seenAssignments map[string]string
+}
+
+func newLoader(dir string) *loader {
+	return &loader{
+		dir:             dir,
+		templatesDir:    filepath.Join(dir, TemplatesDir),
+		src:             &Source{Templates: map[string]*Template{}},
+		seenGrants:      map[string]string{},
+		seenAssignments: map[string]string{},
+	}
+}
+
+// visit is the WalkDir callback: it loads one file by where it is and what
+// its extension says it is, recording problems rather than stopping the
+// walk.
+func (l *loader) visit(path string, d fs.DirEntry, err error) error {
+	if err != nil {
+		return err
+	}
+	if d.IsDir() {
+		return nil
+	}
+	rel := l.rel(path)
+	inTemplates := path == l.templatesDir || strings.HasPrefix(path, l.templatesDir+string(filepath.Separator))
+	switch ext := filepath.Ext(path); {
+	case inTemplates && ext == ".json":
+		l.loadTemplate(path, rel)
+	case inTemplates:
+		l.errs.addf("%s: only *.json templates belong under %s", rel, TemplatesDir)
+	case ext == ".yaml" || ext == ".yml":
+		l.loadDocument(path, rel)
+	}
+	return nil
+}
+
+// rel is path relative to the source root, for messages.
+func (l *loader) rel(path string) string {
+	rel, err := filepath.Rel(l.dir, path)
+	if err != nil {
+		return path
+	}
+	return rel
+}
+
+// loadTemplate loads one template file, which must not redefine a name.
+func (l *loader) loadTemplate(path, rel string) {
+	t, err := LoadTemplate(path)
+	if err != nil {
+		l.errs.addf("%s: %w", rel, err)
+		return
+	}
+	if prev, dup := l.src.Templates[t.Name]; dup {
+		l.errs.addf("%s: template %q already defined in %s", rel, t.Name, prev.Path)
+		return
+	}
+	l.src.Templates[t.Name] = t
+}
+
+// loadDocument loads one YAML file as the Grant or Assignment it declares.
+func (l *loader) loadDocument(path, rel string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		l.errs.add(err)
+		return
+	}
+	obj, err := ParseDocument(data)
+	if err != nil {
+		l.errs.addf("%s: %w", rel, err)
+		return
+	}
+	switch o := obj.(type) {
+	case *Grant:
+		l.addGrant(o, rel)
+	case *Assignment:
+		l.addAssignment(o, rel)
+	}
+}
+
+// addGrant records a grant loaded from rel, which must not redefine a name.
+func (l *loader) addGrant(g *Grant, rel string) {
+	g.Path = rel
+	if prev, dup := l.seenGrants[g.Name()]; dup {
+		l.errs.addf("%s: grant %q already defined in %s", rel, g.Name(), prev)
+		return
+	}
+	l.seenGrants[g.Name()] = rel
+	l.src.Grants = append(l.src.Grants, g)
+}
+
+// addAssignment records an assignment loaded from rel, which must not
+// redefine a name.
+func (l *loader) addAssignment(a *Assignment, rel string) {
+	a.Path = rel
+	if prev, dup := l.seenAssignments[a.Name()]; dup {
+		l.errs.addf("%s: assignment %q already defined in %s", rel, a.Name(), prev)
+		return
+	}
+	l.seenAssignments[a.Name()] = rel
+	l.src.Assignments = append(l.src.Assignments, a)
 }
 
 // ParseDocument parses one YAML document into a *Grant or an *Assignment,
