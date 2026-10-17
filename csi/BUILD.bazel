@@ -7,7 +7,17 @@ go_library(
     srcs = ["main.go"],
     importpath = "github.com/bpalermo/cracha/csi",
     visibility = ["//visibility:private"],
-    deps = ["//common/version"],
+    deps = [
+        "//common/version",
+        "//csi/internal/driver",
+        "//csi/internal/issuer",
+        "//csi/internal/issuer/spire",
+        "//csi/internal/token",
+        "//csi/internal/tokenreview",
+        "@io_k8s_client_go//kubernetes",
+        "@io_k8s_client_go//rest",
+        "@org_golang_x_sync//errgroup",
+    ],
 )
 
 go_binary(
