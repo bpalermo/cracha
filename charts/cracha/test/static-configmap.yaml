@@ -1,0 +1,5 @@
+# The static backend with an assignments ConfigMap the install keeps.
+broker:
+  assignments:
+    existingConfigMap: my-assignments
+    key: my-assignments.yaml

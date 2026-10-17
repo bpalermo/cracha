@@ -144,11 +144,36 @@ broker:
         type: Directory
     socket: spire-agent.sock
 
-  # The static authorization backend's assignments (broker/internal/authz/
-  # static): which workloads belong to which service, and the grants of each
-  # service. Either the document, which the chart puts in a ConfigMap, or
-  # the name of a ConfigMap you keep yourself; `key` is the file in it. The
-  # subjects are the identity encoding of design 4.3:
+  # The authorization backend (design 6.3): which workloads hold which
+  # grants, and their service and team tags.
+  #   static   the assignments file in `assignments` below, held in memory.
+  #   spicedb  the reference backend (design 6.4; broker/internal/authz/
+  #            spicedb), reached over gRPC with the knobs under `spicedb`:
+  #     endpoint     host:port of SpiceDB.
+  #     tokenSecret  a Secret you keep, with the preshared key under `key`.
+  #                  It is mounted as a file, never put in the environment.
+  #     ca           the PEM bundle SpiceDB's certificate is verified with
+  #                  when it is not the system roots; the chart puts it in a
+  #                  ConfigMap.
+  #     insecure     plaintext gRPC, the key in the clear: for kind only.
+  #                  Excludes ca.
+  #     timeout      how long one SpiceDB call may take.
+  authz:
+    backend: static
+    spicedb:
+      endpoint: ""
+      tokenSecret:
+        name: ""
+        key: token
+      ca: ""
+      insecure: false
+      timeout: 5s
+
+  # The static backend's assignments (broker/internal/authz/static), used
+  # with `authz.backend` static: which workloads belong to which service,
+  # and the grants of each service. Either the document, which the chart
+  # puts in a ConfigMap, or the name of a ConfigMap you keep yourself; `key`
+  # is the file in it. The subjects are the identity encoding of design 4.3:
   # <trust domain label>/<namespace>/<service account>.
   #   document:
   #     services:

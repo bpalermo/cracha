@@ -5,6 +5,8 @@
 {{- end -}}
 {{- $bundleKey := include "cracha.bundleKey" . -}}
 {{- $bundleDir := include "cracha.bundleDir" . -}}
+{{- $backend := include "cracha.authzBackend" . -}}
+{{- $spicedb := .Values.broker.authz.spicedb -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -60,7 +62,20 @@ spec:
             {{- if $labels }}
             - --trust-domain-labels={{ join "," $labels }}
             {{- end }}
+            - --authz-backend={{ $backend }}
+            {{- if eq $backend "static" }}
             - --assignments=/etc/cracha/assignments/{{ .Values.broker.assignments.key }}
+            {{- else }}
+            - --spicedb-endpoint={{ $spicedb.endpoint }}
+            - --spicedb-token-file=/etc/cracha/spicedb/token/{{ $spicedb.tokenSecret.key }}
+            {{- if $spicedb.ca }}
+            - --spicedb-ca=/etc/cracha/spicedb/ca/ca.pem
+            {{- end }}
+            {{- if $spicedb.insecure }}
+            - --spicedb-insecure
+            {{- end }}
+            - --spicedb-timeout={{ $spicedb.timeout }}
+            {{- end }}
             {{- if .Values.broker.bundle.source }}
             - --bundle-source={{ .Values.broker.bundle.source }}
             {{- if eq $bundleKey "kms" }}
@@ -114,9 +129,20 @@ spec:
           {{- end }}
           volumeMounts:
             {{- include "cracha.tlsVolumeMount" $selector | nindent 12 }}
+            {{- if eq $backend "static" }}
             - name: assignments
               mountPath: /etc/cracha/assignments
               readOnly: true
+            {{- else }}
+            - name: spicedb-token
+              mountPath: /etc/cracha/spicedb/token
+              readOnly: true
+            {{- if $spicedb.ca }}
+            - name: spicedb-ca
+              mountPath: /etc/cracha/spicedb/ca
+              readOnly: true
+            {{- end }}
+            {{- end }}
             {{- if $bundleDir }}
             - name: bundle
               mountPath: {{ $bundleDir }}
@@ -154,9 +180,22 @@ spec:
               {{- include "cracha.selectorLabels" $selector | nindent 14 }}
       volumes:
         {{- include "cracha.tlsVolume" $selector | nindent 8 }}
+        {{- if eq $backend "static" }}
         - name: assignments
           configMap:
             name: {{ .Values.broker.assignments.existingConfigMap | default (printf "%s-assignments" (include "cracha.name" .)) }}
+        {{- else }}
+        # SpiceDB's preshared key, from the Secret the install keeps, read
+        # by the broker as a file.
+        - name: spicedb-token
+          secret:
+            secretName: {{ $spicedb.tokenSecret.name }}
+        {{- if $spicedb.ca }}
+        - name: spicedb-ca
+          configMap:
+            name: {{ include "cracha.name" . }}-spicedb-ca
+        {{- end }}
+        {{- end }}
         {{- if $bundleDir }}
         # The published bundle, laid out as grantc publish writes it.
         - name: bundle
