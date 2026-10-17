@@ -253,11 +253,89 @@ func runCompile(ctx context.Context, args []string, stdout, stderr io.Writer, cl
 	return nil
 }
 
+// keyFlags are the key-source flags sign and verify share: a local PEM
+// file, named by the command's own flag (-key or -pub), or a KMS key. cmd
+// and local name the command and that flag in errors.
+type keyFlags struct {
+	cmd, local string
+	file       string
+	kmsKey     string
+	region     string
+}
+
+func (f *keyFlags) register(fs *flag.FlagSet, fileUsage, kmsUsage string) {
+	fs.StringVar(&f.file, f.local, "", fileUsage)
+	fs.StringVar(&f.kmsKey, "kms-key", "", kmsUsage)
+	fs.StringVar(&f.region, "region", "", "AWS region for KMS (default: the SDK's)")
+}
+
+// resolve reads the key source the flags name: the PEM file's contents for
+// a local key, or the KMS client for -kms-key. Exactly one of the two is
+// returned; giving both flags, or neither, is an error.
+func (f *keyFlags) resolve(ctx context.Context, clients awsClients) ([]byte, grant.KMSAPI, error) {
+	switch {
+	case f.file != "" && f.kmsKey != "":
+		return nil, nil, fmt.Errorf("%s: -%s and -kms-key are exclusive", f.cmd, f.local)
+	case f.file != "":
+		pemData, err := os.ReadFile(f.file)
+		return pemData, nil, err
+	case f.kmsKey != "":
+		api, err := clients.kms(ctx, f.region)
+		return nil, api, err
+	default:
+		return nil, nil, fmt.Errorf("%s: one of -%s or -kms-key is required", f.cmd, f.local)
+	}
+}
+
+// wrap names the PEM file in an error about the key it holds.
+func (f *keyFlags) wrap(err error) error {
+	return fmt.Errorf("%s: %s: %w", f.cmd, f.file, err)
+}
+
+// signer makes the signer the flags name.
+func (f *keyFlags) signer(ctx context.Context, clients awsClients) (grant.Signer, error) {
+	pemData, api, err := f.resolve(ctx, clients)
+	if err != nil {
+		return nil, err
+	}
+	if api != nil {
+		return grant.NewKMSSigner(api, f.kmsKey), nil
+	}
+	key, err := grant.ParseECPrivateKey(pemData)
+	if err != nil {
+		return nil, f.wrap(err)
+	}
+	signer, err := grant.NewLocalSigner(key)
+	if err != nil {
+		return nil, f.wrap(err)
+	}
+	return signer, nil
+}
+
+// verifier makes the verifier the flags name.
+func (f *keyFlags) verifier(ctx context.Context, clients awsClients) (grant.Verifier, error) {
+	pemData, api, err := f.resolve(ctx, clients)
+	if err != nil {
+		return nil, err
+	}
+	if api != nil {
+		return grant.NewKMSVerifier(api, f.kmsKey), nil
+	}
+	pub, err := grant.ParseECPublicKey(pemData)
+	if err != nil {
+		return nil, f.wrap(err)
+	}
+	verifier, err := grant.NewLocalVerifier(pub)
+	if err != nil {
+		return nil, f.wrap(err)
+	}
+	return verifier, nil
+}
+
 func runSign(ctx context.Context, args []string, stdout, stderr io.Writer, clients awsClients) error {
 	fs := newFlags("sign", stderr)
-	keyFile := fs.String("key", "", "PEM file with the ECDSA P-256 private key")
-	kmsKey := fs.String("kms-key", "", "ARN of the KMS signing key (ECC_NIST_P256)")
-	region := fs.String("region", "", "AWS region for KMS (default: the SDK's)")
+	kf := keyFlags{cmd: "sign", local: "key"}
+	kf.register(fs, "PEM file with the ECDSA P-256 private key", "ARN of the KMS signing key (ECC_NIST_P256)")
 	out := fs.String("o", "", "where to write the signature (default: <bundle>.sig)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -265,30 +343,9 @@ func runSign(ctx context.Context, args []string, stdout, stderr io.Writer, clien
 	if fs.NArg() != 1 {
 		return errors.New("sign: want exactly one bundle file")
 	}
-	var signer grant.Signer
-	switch {
-	case *keyFile != "" && *kmsKey != "":
-		return errors.New("sign: -key and -kms-key are exclusive")
-	case *keyFile != "":
-		pemData, err := os.ReadFile(*keyFile)
-		if err != nil {
-			return err
-		}
-		key, err := grant.ParseECPrivateKey(pemData)
-		if err != nil {
-			return fmt.Errorf("sign: %s: %w", *keyFile, err)
-		}
-		if signer, err = grant.NewLocalSigner(key); err != nil {
-			return fmt.Errorf("sign: %s: %w", *keyFile, err)
-		}
-	case *kmsKey != "":
-		api, err := clients.kms(ctx, *region)
-		if err != nil {
-			return err
-		}
-		signer = grant.NewKMSSigner(api, *kmsKey)
-	default:
-		return errors.New("sign: one of -key or -kms-key is required")
+	signer, err := kf.signer(ctx, clients)
+	if err != nil {
+		return err
 	}
 	bundlePath := fs.Arg(0)
 	data, err := os.ReadFile(bundlePath)
@@ -319,9 +376,8 @@ func runSign(ctx context.Context, args []string, stdout, stderr io.Writer, clien
 
 func runVerify(ctx context.Context, args []string, stdout, stderr io.Writer, clients awsClients) error {
 	fs := newFlags("verify", stderr)
-	pubFile := fs.String("pub", "", "PEM file with the ECDSA P-256 public key")
-	kmsKey := fs.String("kms-key", "", "ARN of the KMS key that signed")
-	region := fs.String("region", "", "AWS region for KMS (default: the SDK's)")
+	kf := keyFlags{cmd: "verify", local: "pub"}
+	kf.register(fs, "PEM file with the ECDSA P-256 public key", "ARN of the KMS key that signed")
 	sigPath := fs.String("sig", "", "the signature file (default: <bundle>.sig)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -329,30 +385,9 @@ func runVerify(ctx context.Context, args []string, stdout, stderr io.Writer, cli
 	if fs.NArg() != 1 {
 		return errors.New("verify: want exactly one bundle file")
 	}
-	var verifier grant.Verifier
-	switch {
-	case *pubFile != "" && *kmsKey != "":
-		return errors.New("verify: -pub and -kms-key are exclusive")
-	case *pubFile != "":
-		pemData, err := os.ReadFile(*pubFile)
-		if err != nil {
-			return err
-		}
-		pub, err := grant.ParseECPublicKey(pemData)
-		if err != nil {
-			return fmt.Errorf("verify: %s: %w", *pubFile, err)
-		}
-		if verifier, err = grant.NewLocalVerifier(pub); err != nil {
-			return fmt.Errorf("verify: %s: %w", *pubFile, err)
-		}
-	case *kmsKey != "":
-		api, err := clients.kms(ctx, *region)
-		if err != nil {
-			return err
-		}
-		verifier = grant.NewKMSVerifier(api, *kmsKey)
-	default:
-		return errors.New("verify: one of -pub or -kms-key is required")
+	verifier, err := kf.verifier(ctx, clients)
+	if err != nil {
+		return err
 	}
 	bundlePath := fs.Arg(0)
 	data, sig, err := readSigned(bundlePath, *sigPath)
@@ -429,45 +464,14 @@ func readSigned(bundlePath, sigPath string) ([]byte, *grant.Signature, error) {
 	return data, sig, nil
 }
 
-// printReport writes a lint report for humans.
+// printReport writes a lint report for humans: a line per grant, one per
+// subject, the steps that did not run and the verdict.
 func printReport(w io.Writer, r *grant.Report) {
 	for _, g := range r.Grants {
-		status := "ok"
-		if !g.Problems.OK() {
-			status = fmt.Sprintf("%d problems", len(g.Problems))
-		}
-		var size string
-		if g.Size != nil {
-			size = fmt.Sprintf(", policy %d/%d chars, tags %d", g.Size.PolicyChars, grant.MaxPolicyChars, g.Size.TagCount)
-		}
-		fmt.Fprintf(w, "grant %s: %s%s\n", g.Grant, status, size)
-		for _, f := range g.Validation {
-			if !f.Blocking() {
-				fmt.Fprintf(w, "  note: %s %s: %s\n", f.Type, f.Code, f.Detail)
-			}
-		}
-		for _, p := range g.Problems {
-			fmt.Fprintf(w, "  problem: %s\n", p)
-		}
+		printGrant(w, g)
 	}
 	if r.Composition != nil {
-		for _, c := range r.Composition.Compositions {
-			scope := c.Subject
-			if c.Cluster != "" {
-				scope += " in cluster " + c.Cluster
-			}
-			status := "ok"
-			if !c.Problems.OK() {
-				status = fmt.Sprintf("%d problems", len(c.Problems))
-			}
-			fmt.Fprintf(w, "subject %s: %s, grants %s, policy %d/%d chars\n", scope, status, strings.Join(c.Grants, ","), c.PolicyChars, grant.MaxPolicyChars)
-			for _, p := range c.Problems {
-				fmt.Fprintf(w, "  problem: %s\n", p)
-			}
-		}
-		for _, name := range r.Composition.Expired {
-			fmt.Fprintf(w, "assignment %s: expired, left out of the composition\n", name)
-		}
+		printComposition(w, r.Composition)
 	}
 	for _, step := range r.Skipped {
 		fmt.Fprintf(w, "skipped: %s (run with -access-analyzer)\n", step)
@@ -476,5 +480,58 @@ func printReport(w io.Writer, r *grant.Report) {
 		fmt.Fprintln(w, "ok: no problems")
 	} else {
 		fmt.Fprintf(w, "%d problems\n", len(r.Problems))
+	}
+}
+
+// printGrant writes a grant's line, with its status and its size when the
+// size step ran, then the validation findings that do not block and its
+// problems.
+func printGrant(w io.Writer, g grant.GrantResult) {
+	var size string
+	if g.Size != nil {
+		size = fmt.Sprintf(", policy %d/%d chars, tags %d", g.Size.PolicyChars, grant.MaxPolicyChars, g.Size.TagCount)
+	}
+	fmt.Fprintf(w, "grant %s: %s%s\n", g.Grant, problemStatus(g.Problems), size)
+	for _, f := range g.Validation {
+		if !f.Blocking() {
+			fmt.Fprintf(w, "  note: %s %s: %s\n", f.Type, f.Code, f.Detail)
+		}
+	}
+	printProblems(w, g.Problems)
+}
+
+// printComposition writes a line per subject and cluster scope, then the
+// assignments left out as expired.
+func printComposition(w io.Writer, r *grant.CompositionReport) {
+	for _, c := range r.Compositions {
+		printSubject(w, c)
+	}
+	for _, name := range r.Expired {
+		fmt.Fprintf(w, "assignment %s: expired, left out of the composition\n", name)
+	}
+}
+
+// printSubject writes one composition's line and its problems.
+func printSubject(w io.Writer, c grant.Composition) {
+	scope := c.Subject
+	if c.Cluster != "" {
+		scope += " in cluster " + c.Cluster
+	}
+	fmt.Fprintf(w, "subject %s: %s, grants %s, policy %d/%d chars\n", scope, problemStatus(c.Problems), strings.Join(c.Grants, ","), c.PolicyChars, grant.MaxPolicyChars)
+	printProblems(w, c.Problems)
+}
+
+// problemStatus is "ok" or the count of problems.
+func problemStatus(p grant.Problems) string {
+	if p.OK() {
+		return "ok"
+	}
+	return fmt.Sprintf("%d problems", len(p))
+}
+
+// printProblems writes each problem under its grant's or subject's line.
+func printProblems(w io.Writer, problems grant.Problems) {
+	for _, p := range problems {
+		fmt.Fprintf(w, "  problem: %s\n", p)
 	}
 }
