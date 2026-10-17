@@ -14,8 +14,10 @@ go_library(
     deps = [
         "//broker/internal/api",
         "//broker/internal/authn",
+        "//broker/internal/authz",
         "//broker/internal/authz/static",
         "//broker/internal/bundle",
+        "//broker/internal/cache",
         "//broker/internal/grants",
         "//broker/internal/issuer",
         "//broker/internal/sts",

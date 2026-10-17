@@ -21,13 +21,15 @@ const dynamoRole = "arn:aws:iam::111122223333:role/broker/shape-dynamo-rw"
 var ledger = idenc.Identity{TrustDomain: "example.org", Namespace: "payments", ServiceAccount: "ledger"}
 
 type fakeStore struct {
-	subject  authz.Subject
-	decision authz.Decision
-	err      error
+	subject     authz.Subject
+	consistency authz.Consistency
+	decision    authz.Decision
+	err         error
 }
 
-func (f *fakeStore) ListGrants(_ context.Context, s authz.Subject, _ authz.Consistency) (authz.Decision, error) {
+func (f *fakeStore) ListGrants(_ context.Context, s authz.Subject, c authz.Consistency) (authz.Decision, error) {
 	f.subject = s
+	f.consistency = c
 	return f.decision, f.err
 }
 
@@ -208,16 +210,37 @@ func TestStoreAndSTSFailuresDeny(t *testing.T) {
 	d := newDirect(t, &fakeStore{err: errors.New("store down")}, assumer, nil)
 	_, err := d.Issue(context.Background(), ledger)
 	var deny *grants.DenyError
-	if err == nil || errors.As(err, &deny) {
-		t.Fatalf("store failure: got %v, want a non-reason error", err)
+	if err == nil || errors.As(err, &deny) || !errors.Is(err, ErrStore) {
+		t.Fatalf("store failure: got %v, want a non-reason error marked ErrStore", err)
 	}
 	if assumer.calls != 0 {
 		t.Fatal("STS called after a store failure")
 	}
 
 	d = newDirect(t, &fakeStore{decision: authz.Decision{Grants: []string{"ledger"}}}, &fakeSTS{err: errors.New("throttled")}, nil)
-	if _, err := d.Issue(context.Background(), ledger); err == nil || errors.As(err, &deny) {
-		t.Fatalf("sts failure: got %v", err)
+	if _, err := d.Issue(context.Background(), ledger); err == nil || errors.As(err, &deny) || errors.Is(err, ErrStore) {
+		t.Fatalf("sts failure: got %v, want a non-reason error that is not the store's", err)
+	}
+}
+
+func TestConsistencyFromContext(t *testing.T) {
+	store := &fakeStore{decision: authz.Decision{Grants: []string{"ledger"}}}
+	d := newDirect(t, store, &fakeSTS{}, nil)
+	if _, err := d.Resolve(context.Background(), ledger); err != nil {
+		t.Fatal(err)
+	}
+	if store.consistency != (authz.Consistency{}) {
+		t.Errorf("a plain context asked for %+v, want minimize-latency", store.consistency)
+	}
+	ctx := WithConsistency(context.Background(), authz.Consistency{AtLeastAsFresh: "zed-5"})
+	if _, err := d.Issue(ctx, ledger); err != nil {
+		t.Fatal(err)
+	}
+	if store.consistency.AtLeastAsFresh != "zed-5" {
+		t.Errorf("the store was asked for %+v, want at least as fresh as zed-5", store.consistency)
+	}
+	if got := ConsistencyFrom(context.Background()); got != (authz.Consistency{}) {
+		t.Errorf("ConsistencyFrom(plain) = %+v", got)
 	}
 }
 

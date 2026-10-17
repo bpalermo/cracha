@@ -2,8 +2,8 @@
 // section 6.5 and the sequence in 7.5): from a verified workload identity to
 // the authorization store, the composed grants and the STS call. [Issuer] is
 // the interface the API serves; [Direct] is the implementation that goes to
-// the store and STS on every call. The cache of section 6.7 will wrap an
-// Issuer in a later slice.
+// the store and STS on every call; broker/internal/cache wraps it with the
+// cache of section 6.7.
 package issuer
 
 import (
@@ -37,6 +37,43 @@ type Resolution struct {
 type Issuance struct {
 	Resolution
 	Credentials sts.Credentials
+	// Cache says how the credential cache served the issuance, for the
+	// Cracha-Cache header; empty when no cache was involved.
+	Cache CacheOutcome
+}
+
+// CacheOutcome is what the cache did for one issuance (section 6.7).
+type CacheOutcome string
+
+const (
+	// CacheHit served cached credentials after re-checking the store.
+	CacheHit CacheOutcome = "hit"
+	// CacheMiss called STS for the credentials it served.
+	CacheMiss CacheOutcome = "miss"
+	// CacheRefresh served cached credentials and started a refresh-ahead.
+	CacheRefresh CacheOutcome = "refresh"
+)
+
+// ErrStore marks a failure of the authorization store to answer, as
+// opposed to an answer that denies. A cache may serve a hit within bounded
+// staleness on it (section 6.7); nothing else treats it differently from a
+// deny.
+var ErrStore = errors.New("authorization store")
+
+type consistencyKey struct{}
+
+// WithConsistency returns a context asking the store for answers at least
+// as fresh as the token, for a caller such as an approver or revocation
+// tool that holds one (section 6.7). The API does not set it yet.
+func WithConsistency(ctx context.Context, c authz.Consistency) context.Context {
+	return context.WithValue(ctx, consistencyKey{}, c)
+}
+
+// ConsistencyFrom returns the consistency a context asks for; the zero
+// value, minimize-latency, when it asks for none.
+func ConsistencyFrom(ctx context.Context) authz.Consistency {
+	c, _ := ctx.Value(consistencyKey{}).(authz.Consistency)
+	return c
 }
 
 // Issuer decides and issues. A *grants.DenyError is a denial with a reason
@@ -90,12 +127,12 @@ func (d *Direct) resolve(ctx context.Context, id idenc.Identity) (Resolution, er
 	}
 	r.Subject = authz.Subject{ID: subjectID, Cluster: d.Cluster}
 
-	decision, err := d.Store.ListGrants(ctx, r.Subject, authz.Consistency{})
+	decision, err := d.Store.ListGrants(ctx, r.Subject, ConsistencyFrom(ctx))
 	if err != nil {
 		if errors.Is(err, authz.ErrSubjectSuspended) {
 			return r, &grants.DenyError{Reason: grants.ReasonSubjectSuspended, Detail: err.Error()}
 		}
-		return r, fmt.Errorf("authorization store: %w", err)
+		return r, fmt.Errorf("%w: %w", ErrStore, err)
 	}
 	r.Decision = decision
 
@@ -137,6 +174,14 @@ func (d *Direct) Issue(ctx context.Context, id idenc.Identity) (Issuance, error)
 		d.logDenial(id, r, err)
 		return Issuance{}, err
 	}
+	return d.Assume(ctx, r)
+}
+
+// Assume assumes the shape role for a resolution already made, without
+// going back to the store: what the cache calls on a miss, after its own
+// Resolve.
+func (d *Direct) Assume(ctx context.Context, r Resolution) (Issuance, error) {
+	id := r.Identity
 	creds, err := d.STS.AssumeRole(ctx, sts.Request{
 		RoleARN:         r.Composed.BaseRole,
 		SessionName:     r.SourceIdentity,
