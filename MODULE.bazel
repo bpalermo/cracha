@@ -12,8 +12,19 @@ bazel_dep(name = "rules_img", version = "0.3.23")
 # digests pinned, and the lint and template tests run the pinned helm. 0.34.0
 # is the newest release in the Bazel Central Registry. It depends on rules_go
 # 0.63.0 and gazelle 0.53.0, both below the versions above, so it adds no Go
-# SDK: the root module's go_sdk.from_file below is the only one.
+# SDK: the root module's go_sdk.download below is the only one.
 bazel_dep(name = "rules_helm", version = "0.34.0")
+
+# Helm's own binary, so the chart is packaged, linted and installed with a
+# pinned toolchain rather than whatever is on a developer's PATH: @helm//:helm
+# is what e2e/run.sh runs. The version is pinned here for the host tool and in
+# .bazelrc (--@rules_helm//helm/settings:version) for the rules' toolchain;
+# keep the two the same.
+helm = use_extension("@rules_helm//helm:extensions.bzl", "helm")
+helm.host_tools(version = "4.2.0")
+use_repo(helm, "helm", "helm_toolchains")
+
+register_toolchains("@helm_toolchains//:all")
 
 # Named by //bazel/image for string_flag, and already in the graph through
 # rules_img and rules_go; declared so a bump of those cannot drop it.
@@ -28,8 +39,12 @@ bazel_dep(name = "rules_shell", version = "0.8.0")
 bazel_dep(name = "aspect_rules_lint", version = "2.9.1")
 bazel_dep(name = "buildifier_prebuilt", version = "10.1.0")
 
+# The Go toolchain, pinned here rather than read from go.mod: go.mod's `go`
+# line is the language version the module requires, this is the exact SDK
+# every build compiles with. Bump both together; the SDK must not be older
+# than the `go` line.
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
-go_sdk.from_file(go_mod = "//:go.mod")
+go_sdk.download(version = "1.27.2")
 
 # Static analysis, run as part of compiling every Go package of this module
 # (and of none of its dependencies): a finding fails the build. //:nogo says
@@ -54,14 +69,3 @@ pull(
     registry = "gcr.io",
     repository = "distroless/static-debian13",
 )
-
-# Helm's own binary, so the chart is packaged, linted and installed with a
-# pinned toolchain rather than whatever is on a developer's PATH: @helm//:helm
-# is what e2e/run.sh runs. The version is pinned here for the host tool and in
-# .bazelrc (--@rules_helm//helm/settings:version) for the rules' toolchain;
-# keep the two the same.
-helm = use_extension("@rules_helm//helm:extensions.bzl", "helm")
-helm.host_tools(version = "4.2.0")
-use_repo(helm, "helm", "helm_toolchains")
-
-register_toolchains("@helm_toolchains//:all")
