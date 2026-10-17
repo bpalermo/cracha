@@ -57,8 +57,10 @@ the public proxy instead.
 
 Linting is part of the build. Every Go package is compiled with the analyzers
 of `//:nogo` (`go vet`'s and staticcheck's), and a finding is a compile error:
-fix it rather than excluding the file. Shell scripts are checked by shellcheck,
-an aspect that `--config=ci` turns on; a script is only seen through a Bazel
+fix it rather than excluding the file. Go functions are also held under a
+cognitive-complexity ceiling by gocognit (`bazel/lint/linters.bzl`, a ratchet
+heading for 15; lower it when you simplify something, never raise it). Shell
+scripts are checked by shellcheck, an aspect that `--config=ci` turns on; a script is only seen through a Bazel
 target, so a new directory of scripts needs an `sh_library` like
 `//bazel:scripts`.
 
