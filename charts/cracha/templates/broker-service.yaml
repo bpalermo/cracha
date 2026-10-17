@@ -1,0 +1,35 @@
+{{- $selector := dict "root" . "component" "broker" -}}
+# What every wired pod's SDK calls (webhook.brokerUrl).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cracha.name" . }}-broker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: broker
+spec:
+  selector:
+    {{- include "cracha.selectorLabels" $selector | nindent 4 }}
+  ports:
+    - name: https
+      port: {{ .Values.broker.port }}
+      targetPort: https
+      appProtocol: https
+{{- if gt (int .Values.broker.replicas) 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "cracha.name" . }}-broker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: broker
+spec:
+  # One at a time: every SDK refresh in the cluster goes through here.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "cracha.selectorLabels" $selector | nindent 6 }}
+{{- end }}

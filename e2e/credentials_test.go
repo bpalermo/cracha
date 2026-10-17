@@ -14,7 +14,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// What e2e/stsstub answers and e2e/manifests/cracha-system.yaml grants.
+// What e2e/stsstub answers and e2e/values.yaml (the chart's assignments and
+// grants) grants.
 const (
 	stubAccessKeyID = "ASIACRACHAE2ESTUB000"
 	grantName       = "e2e-s3-reader"

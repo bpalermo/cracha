@@ -10,6 +10,9 @@ build --workspace_status_command=bazel/workspace_status.sh
 # (//common/version) come from the workspace status. Every binary links again
 # on each commit; nothing else rebuilds.
 build --stamp
+# The helm the chart rules run (MODULE.bazel pins the same version for the
+# host tool, @helm//:helm).
+build --@rules_helm//helm/settings:version=4.2.0
 test --test_output=errors
 # The end-to-end suite needs a kind cluster, so it is tagged e2e and excluded
 # from `bazel test //...`; `--config=e2e` selects it instead, forwards the

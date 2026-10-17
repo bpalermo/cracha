@@ -18,15 +18,15 @@ import (
 // The suite runs against whatever cluster the ambient kubeconfig points at,
 // through client-go. It is tagged e2e and excluded from `bazel test //...`;
 // e2e/run.sh creates the kind cluster, loads the images built from this
-// checkout, deploys SPIRE and Crachá (e2e/spire.sh, e2e/manifests) and runs
-// it.
+// checkout, deploys SPIRE and Crachá (e2e/spire.sh, then the chart with
+// e2e/values.yaml) and runs it.
 
 const (
 	// imageTag is the tag the Bazel image_load targets give locally built
 	// images; e2e/run.sh loads them into the kind node under the same names.
 	imageTag = "e2e"
 
-	// systemNamespace is where e2e/manifests/cracha-system.yaml deploys
+	// systemNamespace is where e2e/run.sh installs the chart, which deploys
 	// Crachá; testNamespace is where the suite runs its workloads
 	// (e2e/manifests/e2e.yaml), with the ServiceAccounts below.
 	systemNamespace = "cracha-system"
@@ -256,9 +256,9 @@ func dumpDiagnostics(t *testing.T, pod string) {
 	}
 	for _, c := range []struct{ ns, selector, container string }{
 		{testNamespace, suiteLabel + "=true", ""},
-		{systemNamespace, "app.kubernetes.io/name=cracha-csi", "csi"},
-		{systemNamespace, "app.kubernetes.io/name=cracha-broker", ""},
-		{systemNamespace, "app.kubernetes.io/name=cracha-webhook", ""},
+		{systemNamespace, "app.kubernetes.io/name=cracha,app.kubernetes.io/component=csi", "csi"},
+		{systemNamespace, "app.kubernetes.io/name=cracha,app.kubernetes.io/component=broker", ""},
+		{systemNamespace, "app.kubernetes.io/name=cracha,app.kubernetes.io/component=webhook", ""},
 		{systemNamespace, "app.kubernetes.io/name=cracha-stsstub", ""},
 		{"spire", "app=spire-agent", ""},
 	} {

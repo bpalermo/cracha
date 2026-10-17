@@ -1,0 +1,311 @@
+# Overrides the name used for the chart's resources (default: the chart name).
+# The Services are <name>-broker and <name>-webhook, the DaemonSet <name>-csi.
+nameOverride: ""
+
+# Pull secrets added to every pod of the chart.
+imagePullSecrets: []
+
+# The serving certificates of the broker (which every pod's AWS SDK calls over
+# HTTPS, design 6.5) and of the webhook (which the apiserver calls).
+#
+# The broker's certificate has to be trusted by the WORKLOAD images, which
+# verify it with their own trust store: a public CA, or the organisation's
+# PKI already in the images. The chart cannot put a CA into every image, so
+# only "existing" and "cert-manager", with a certificate the images trust,
+# are fit for production. The webhook's certificate only has to be trusted by
+# the apiserver, which the webhook configuration's caBundle takes care of in
+# every mode.
+tls:
+  # generated     The chart creates a private certificate authority and one
+  #               certificate per component at render time, in Secrets it
+  #               keeps across upgrades, and puts the authority in the
+  #               webhook configuration's caBundle. FOR DEVELOPMENT AND
+  #               KIND ONLY: nothing but this chart trusts that authority, so
+  #               a workload reaches the broker only if its image is given
+  #               the CA (the end-to-end suite mounts it and points
+  #               SSL_CERT_FILE at it). A certificate close to expiring is
+  #               replaced by the next `helm upgrade` (see generated, below);
+  #               the authority itself, valid for ten years, is never renewed.
+  # existing      You provide the Secrets (type kubernetes.io/tls: tls.crt
+  #               and tls.key), for example from your PKI, and the CA bundle
+  #               the apiserver verifies the webhook's certificate with.
+  # cert-manager  The chart creates a cert-manager Certificate per component
+  #               from the issuer named below, and annotates the webhook
+  #               configuration for cert-manager's CA injector to fill in the
+  #               caBundle. Needs cert-manager, with its CA injector, in the
+  #               cluster.
+  mode: generated
+
+  # With mode "generated": how long a component's certificate is valid, and
+  # how close to its expiry an upgrade replaces it. With these defaults, any
+  # upgrade in a certificate's last two months renews it.
+  generated:
+    validityDays: 365
+    renewBeforeDays: 60
+
+  # With mode "existing": the Secret of each component. The broker's
+  # certificate must carry <name>-broker.<namespace>.svc (the default
+  # webhook.brokerUrl) or whatever webhook.brokerUrl names; the webhook's must
+  # carry <name>-webhook.<namespace>.svc.
+  existingSecrets:
+    broker: ""
+    webhook: ""
+
+  # With mode "existing": the PEM bundle, base64-encoded, of the authority
+  # that signed the webhook's certificate; the apiserver verifies the webhook
+  # with it (clientConfig.caBundle).
+  caBundle: ""
+
+  # With mode "cert-manager": the issuer of both certificates and their
+  # lifetimes, as cert-manager's Certificate takes them.
+  certManager:
+    issuerRef:
+      name: ""
+      kind: ClusterIssuer
+      group: cert-manager.io
+    duration: 2160h
+    renewBefore: 360h
+
+# Every image of the chart is set the same way:
+#
+#   repository  Substituted at package time from the component's image_push
+#               target, which takes it from bazel/registry.bzl: the registry
+#               is spelled out in one place.
+#   tag         Defaults to the chart's appVersion. Ignored when digest is set.
+#   digest      Substituted at package time with the digest of the image index
+#               the push target publishes, so a published chart can only
+#               reference the images built from the same commit. Takes
+#               precedence over tag. A chart you build yourself pins the image
+#               YOUR build produces, which exists nowhere until it is pushed:
+#               install it with `--set <component>.image.digest=` (empty) to
+#               use `tag` instead, as e2e/run.sh does.
+
+# The credential broker (design 6): verifies a pod's JWT-SVID, looks its
+# grants up and answers with STS credentials in the container-credentials
+# format the AWS SDKs read.
+broker:
+  image:
+    repository: "{@//broker:image_push.repository}"
+    tag: ""
+    digest: "{@//broker:image_push.digest}"
+    pullPolicy: IfNotPresent
+
+  # Stateless; the design runs at least three. A PodDisruptionBudget keeping
+  # all but one up is created when there is more than one.
+  replicas: 3
+
+  # The HTTPS port, in the pod and on the Service.
+  port: 8443
+
+  # The name of the cluster this broker serves, as it appears in the
+  # SourceIdentity of every session it assumes (design 4.3). Required.
+  cluster: ""
+
+  # Short labels for trust domains, which keep SourceIdentity within its 64
+  # characters: <trust domain>: <label>. An unmapped domain is encoded as
+  # td.<name>.
+  #   trustDomainLabels:
+  #     prod.example.org: prod
+  trustDomainLabels: {}
+
+  # The AWS region STS is called in. Empty leaves it to the SDK's default
+  # chain (AWS_REGION in env, below).
+  awsRegion: ""
+
+  # The log level: debug, info, warn or error.
+  logLevel: info
+
+  # The SPIFFE Workload API the broker reads the trust bundles from (design
+  # 6.5): the volume holding the socket, as a Kubernetes volume source, and
+  # the socket's file name in it. The default is a SPIRE agent sharing its
+  # socket directory on the node; with the SPIFFE CSI driver:
+  #   volume:
+  #     csi:
+  #       driver: csi.spiffe.io
+  #       readOnly: true
+  workloadAPI:
+    volume:
+      hostPath:
+        path: /run/spire/agent-sockets
+        type: Directory
+    socket: spire-agent.sock
+
+  # The static authorization backend's assignments (broker/internal/authz/
+  # static): which workloads belong to which service, and the grants of each
+  # service. Either the document, which the chart puts in a ConfigMap, or
+  # the name of a ConfigMap you keep yourself; `key` is the file in it. The
+  # subjects are the identity encoding of design 4.3:
+  # <trust domain label>/<namespace>/<service account>.
+  #   document:
+  #     services:
+  #       - name: payments
+  #         team: payments
+  #         members:
+  #           - prod/payments/ledger
+  #         grants:
+  #           - name: payments-ledger-rw
+  assignments:
+    existingConfigMap: ""
+    key: assignments.yaml
+    document:
+      services: []
+
+  # The resolved-grants fixture (broker/internal/grants/fixture.go), the
+  # same way: the document or an existing ConfigMap. It stands in for the
+  # compiled grant bundle until the bundle loader lands; a broker with no
+  # grants denies every request.
+  #   document:
+  #     version: "2026-01-01"
+  #     grants:
+  #       - name: payments-ledger-rw
+  #         account: "111122223333"
+  #         baseRole: arn:aws:iam::111122223333:role/broker/shape-dynamo-rw
+  #         sessionPolicy: {...}
+  #         sessionTags: {team: payments}
+  #         durationSeconds: 3600
+  #         envelope:
+  #           - arn:aws:dynamodb:*:111122223333:table/payments-*
+  grants:
+    existingConfigMap: ""
+    key: grants.yaml
+    document:
+      version: none
+      grants: []
+
+  # The broker's own AWS credentials come from the platform (design 5): EKS
+  # Pod Identity or an instance profile needs nothing here; IAM roles for
+  # service accounts need the role on the service account:
+  #   serviceAccount:
+  #     annotations:
+  #       eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/cracha-broker
+  serviceAccount:
+    annotations: {}
+
+  # Extra environment for the broker's container, as a container's `env` and
+  # `envFrom`: an STS endpoint (AWS_ENDPOINT_URL_STS), static credentials
+  # from a Secret for a cluster without a platform identity, a proxy.
+  env: []
+  envFrom: []
+
+  priorityClassName: ""
+  nodeSelector: {}
+  tolerations: []
+  resources: {}
+  podAnnotations: {}
+
+# The CSI node plugin (design 7), one pod per node: writes each pod's JWT-SVID
+# where the SDK reads it, before the pod's containers start, and rotates it.
+csi:
+  image:
+    repository: "{@//csi:image_push.repository}"
+    tag: ""
+    digest: "{@//csi:image_push.digest}"
+    pullPolicy: IfNotPresent
+
+  # The sidecar that registers the plugin's socket with kubelet.
+  registrar:
+    image:
+      repository: registry.k8s.io/sig-storage/csi-node-driver-registrar
+      tag: v2.18.0
+      digest: sha256:b7fefd08651f00ac4df1a196ed4c621c2451fbb899297fe9fad9e36c667af0c0
+      pullPolicy: IfNotPresent
+    resources: {}
+
+  # kubelet's root directory on the nodes. /var/lib/kubelet on most
+  # distributions; some (k0s, MicroK8s, ...) use another path. The plugin
+  # directory and the pods directory under it are mounted into the plugin,
+  # the latter at the same path as on the host.
+  kubeletDir: /var/lib/kubelet
+
+  # The identity issuer's two sockets on each node, from a SPIRE agent
+  # (design 4.2): the Workload API, for the plugin's own identity, and the
+  # Broker API, which hands out the pods' JWT-SVIDs. Each is a host
+  # directory and the socket's file name in it; both are mounted read-only.
+  workloadAPI:
+    hostPath: /run/spire/agent-sockets
+    socket: spire-agent.sock
+  brokerAPI:
+    hostPath: /run/spire/broker-sockets
+    socket: broker.sock
+
+  # The longest JWT-SVID lifetime written to disk; a longer token is refused.
+  # The design caps it at 5m (section 11); the plugin refuses anything
+  # above, so this can only tighten it.
+  maxTokenTTL: 5m
+
+  # How long one NodePublishVolume retries a pod the issuer does not know yet
+  # or an issuer that is unavailable, before failing the mount (kubelet
+  # retries the mount itself after that).
+  publishDeadline: 30s
+
+  # The owner of the token file in each pod's volume. The file is 0640, so a
+  # container that does not run as this uid or gid cannot read it. 0 is root;
+  # -1 keeps the plugin's own.
+  tokenUid: 0
+  tokenGid: 0
+
+  # The port of the plugin's /healthz, for the liveness probe.
+  healthzPort: 9808
+
+  # The log level: debug, info, warn or error.
+  logLevel: info
+
+  priorityClassName: system-node-critical
+
+  # Tokens must be written on every node pods can run on.
+  tolerations:
+    - operator: Exists
+
+  nodeSelector: {}
+  resources: {}
+  podAnnotations: {}
+
+# The mutating webhook (design 7.4): wires the CSI volume and the SDK's
+# environment into pods whose ServiceAccount opts in.
+webhook:
+  image:
+    repository: "{@//webhook:image_push.repository}"
+    tag: ""
+    digest: "{@//webhook:image_push.digest}"
+    pullPolicy: IfNotPresent
+
+  # With failurePolicy Fail, an unreachable webhook refuses every pod of the
+  # namespaces it covers: run more than one. A PodDisruptionBudget keeping
+  # all but one up is created when there is more than one.
+  replicas: 2
+
+  # The HTTPS port in the pod; the Service listens on 443.
+  port: 8443
+
+  # The URL the SDK in every wired pod fetches credentials from: the broker.
+  # Empty is the broker Service of this release,
+  # https://<name>-broker.<namespace>.svc:<broker.port>. Set it when the
+  # broker is reached under another name, which its certificate must carry.
+  brokerUrl: ""
+
+  # AWS_REGION for the pods that do not set their own. Required.
+  defaultRegion: ""
+
+  # What to do with AWS credential variables a pod sets itself: "reject" the
+  # pod, or "strip" them and record what was removed in an annotation.
+  conflictingEnv: reject
+
+  # How long a ServiceAccount lookup is remembered; 0 looks up every pod.
+  saCacheTTL: 30s
+
+  # How long the apiserver waits for an answer before failing the pod.
+  timeoutSeconds: 10
+
+  # Namespaces the webhook never sees, besides the release's own namespace
+  # (a pod of the webhook's own namespace must not depend on the webhook to
+  # start) and kube-system: the identity issuer's, for example.
+  excludedNamespaces: []
+
+  # The log level: debug, info, warn or error.
+  logLevel: info
+
+  priorityClassName: ""
+  nodeSelector: {}
+  tolerations: []
+  resources: {}
+  podAnnotations: {}

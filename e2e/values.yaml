@@ -1,0 +1,79 @@
+# How e2e/run.sh installs the chart in the kind cluster. The images are the
+# chart's own: e2e/values-local.yaml replaces them with the ones built from
+# this checkout. The TLS mode stays the chart's default, generated: run.sh
+# hands the authority the chart makes to the test workloads.
+broker:
+  # One node, one replica.
+  replicas: 1
+  cluster: kind
+  # The trust domain e2e/spire.sh registers everything under, with the label
+  # the assignments below use.
+  trustDomainLabels:
+    cracha.test: cracha
+  awsRegion: us-east-1
+  logLevel: debug
+  # The SPIRE agent's sockets (e2e/spire.yaml), shared on the node.
+  workloadAPI:
+    volume:
+      hostPath:
+        path: /run/spire/agent-sockets
+        type: Directory
+    socket: spire-agent.sock
+  # Subjects are the authz encoding <trust-domain label>/<ns>/<sa>. The e2e
+  # namespace's client holds one grant through its service; unassigned is
+  # not here at all.
+  assignments:
+    document:
+      services:
+        - name: e2e-client
+          team: platform
+          members:
+            - cracha/e2e/client
+          grants:
+            - name: e2e-s3-reader
+  # One grant on one shape role, with a session policy inside its envelope.
+  grants:
+    document:
+      version: e2e-1
+      grants:
+        - name: e2e-s3-reader
+          account: "111122223333"
+          baseRole: arn:aws:iam::111122223333:role/broker/shape-e2e
+          sessionPolicy:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: arn:aws:s3:::cracha-e2e-bucket/*
+          sessionTags: {team: platform}
+          durationSeconds: 3600
+          envelope:
+            - arn:aws:s3:::cracha-e2e-*
+  env:
+    # The broker's own AWS credentials (design 5) are the platform's; here,
+    # anything the stub accepts, which is anything.
+    - name: AWS_ACCESS_KEY_ID
+      value: cracha-e2e
+    - name: AWS_SECRET_ACCESS_KEY
+      value: cracha-e2e
+    # The SDK's own endpoint override: STS is the stand-in run.sh deploys
+    # (e2e/manifests/stsstub.yaml).
+    - name: AWS_ENDPOINT_URL_STS
+      value: http://cracha-stsstub.cracha-system.svc:8080
+    - name: AWS_EC2_METADATA_DISABLED
+      value: "true"
+csi:
+  workloadAPI:
+    hostPath: /run/spire/agent-sockets
+    socket: spire-agent.sock
+  brokerAPI:
+    hostPath: /run/spire/broker-sockets
+    socket: broker.sock
+  logLevel: debug
+webhook:
+  replicas: 1
+  defaultRegion: us-east-1
+  logLevel: debug
+  # SPIRE's pods are nobody's workloads.
+  excludedNamespaces:
+    - spire

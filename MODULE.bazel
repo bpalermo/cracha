@@ -8,6 +8,13 @@ bazel_dep(name = "gazelle", version = "0.54.0")
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "rules_img", version = "0.3.23")
 
+# The Helm chart (//charts/cracha): helm_chart packages it with the images'
+# digests pinned, and the lint and template tests run the pinned helm. 0.34.0
+# is the newest release in the Bazel Central Registry. It depends on rules_go
+# 0.63.0 and gazelle 0.53.0, both below the versions above, so it adds no Go
+# SDK: the root module's go_sdk.from_file below is the only one.
+bazel_dep(name = "rules_helm", version = "0.34.0")
+
 # Named by //bazel/image for string_flag, and already in the graph through
 # rules_img and rules_go; declared so a bump of those cannot drop it.
 bazel_dep(name = "bazel_skylib", version = "1.9.2")
@@ -47,3 +54,14 @@ pull(
     registry = "gcr.io",
     repository = "distroless/static-debian13",
 )
+
+# Helm's own binary, so the chart is packaged, linted and installed with a
+# pinned toolchain rather than whatever is on a developer's PATH: @helm//:helm
+# is what e2e/run.sh runs. The version is pinned here for the host tool and in
+# .bazelrc (--@rules_helm//helm/settings:version) for the rules' toolchain;
+# keep the two the same.
+helm = use_extension("@rules_helm//helm:extensions.bzl", "helm")
+helm.host_tools(version = "4.2.0")
+use_repo(helm, "helm", "helm_toolchains")
+
+register_toolchains("@helm_toolchains//:all")

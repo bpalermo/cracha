@@ -30,12 +30,18 @@ E2E_FILTER=TestName e2e/run.sh  # only the tests whose name matches
 E2E_KEEP_CLUSTER=1 e2e/run.sh   # leave the cluster up to look around
 ```
 
-Needs docker, kind, kubectl and openssl. The suite in `e2e/` is tagged `e2e`
-and excluded from `bazel test //...`; `e2e/run.sh` creates or reuses the kind
-cluster `cracha-e2e`, loads the images built from the checkout, deploys SPIRE
-(`e2e/spire.sh`) and Crachá with an STS stand-in (`e2e/manifests`,
-`e2e/stsstub`) and runs the tests against the ambient kubeconfig. CI runs the
-same script. Every change that adds user-visible behaviour extends the suite.
+Needs docker, kind and kubectl; helm comes from Bazel. The suite in `e2e/` is
+tagged `e2e` and excluded from `bazel test //...`; `e2e/run.sh` creates or
+reuses the kind cluster `cracha-e2e`, loads the images built from the
+checkout, deploys SPIRE (`e2e/spire.sh`), installs the chart built from the
+checkout with `e2e/values.yaml` (the suite's assignments, grants, SPIRE socket
+paths and STS endpoint) and `e2e/values-local.yaml` (the images just loaded),
+deploys the STS stand-in (`e2e/manifests/stsstub.yaml`, `e2e/stsstub`) and
+runs the tests against the ambient kubeconfig. The chart's generated CA is
+what the test workloads trust: run.sh copies it from the `cracha-ca` Secret
+into a ConfigMap of the test namespace. CI runs the same script. Every change
+that adds user-visible behaviour extends the suite, and a change to how
+Crachá is deployed goes in the chart, not in a manifest.
 
 Bazel is the only build. Never run the host `go` tool: not `go mod tidy`, not
 `go get`, not `go test`. Change a Go dependency through rules_go's SDK:
@@ -72,8 +78,9 @@ hand-editing what Gazelle owns.
   validation, templates, lints, the compiled bundle, signing and publishing.
 - `grantc/` is the grant compiler CLI over `common/grant` (lint, compile,
   sign, verify, publish); it runs in CI and has no container image.
-- `bazel/` holds build rules; `docs/` the design; `e2e/` the end-to-end
-  suite with its manifests and the two images only it uses.
+- `bazel/` holds build rules; `docs/` the design; `charts/cracha` the Helm
+  chart; `e2e/` the end-to-end suite with its values files, the fixtures it
+  deploys beside the chart and the two images only it uses.
 
 ## Images and versions
 
@@ -84,6 +91,33 @@ hand-editing what Gazelle owns.
   `broker`, `csi` and `webhook`.
 - `VERSION` holds the release being worked towards. Binaries report the commit
   they were built from, stamped by `bazel/workspace_status.sh`.
+
+## Chart
+
+- `charts/cracha` is the Helm chart: the CSIDriver, the CSI DaemonSet, the
+  broker and the webhook with their TLS. It is built, linted, templated and
+  installed with the helm that rules_helm pins (`@helm//:helm`, the version
+  in `MODULE.bazel` and `.bazelrc`); never a helm from PATH.
+  `bazel build //charts/cracha:cracha` packages it as
+  `bazel-bin/charts/cracha/cracha.tgz`; `bazel test //charts/cracha/...`
+  runs the lint, template (defaults, every override, cert-manager) and pin
+  tests.
+- The chart's version and image pins are stamped at package time: the
+  version from `STABLE_CHART_VERSION`, each image's repository and digest
+  from its `image_push` target (`{@//csi:image_push.digest}` in
+  `values.yaml`). Do not write a version or a digest into `Chart.yaml.in` or
+  `values.yaml` by hand; `//charts/cracha:pin_test` checks the result with
+  `bazel/chart-pin.sh`. The registrar sidecar is the one image pinned by
+  hand, by tag and digest.
+- `test/overrides.yaml` must exercise every non-default knob: a new value
+  goes there too. A value every install must give (`broker.cluster`,
+  `webhook.defaultRegion`) is `required` in the templates and listed in
+  `test/required.yaml`.
+- The default TLS mode generates a CA at render time, for development and
+  kind only: the broker's certificate must be trusted by the workload images
+  (design 6.5), so production uses `existing` or `cert-manager`.
+- The chart is published to `chart_registry_url("cracha")` of
+  `bazel/registry.bzl`; there is no publish workflow yet.
 
 ## Pull requests
 

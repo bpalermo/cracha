@@ -1,0 +1,17 @@
+# The images e2e/run.sh just built from this checkout and loaded into the
+# node: by tag, never pulled, with the digest the chart pins cleared (that
+# digest exists in no registry until it is published).
+broker:
+  image: &local
+    repository: localhost/cracha-broker
+    tag: e2e
+    digest: ""
+    pullPolicy: Never
+csi:
+  image:
+    <<: *local
+    repository: localhost/cracha-csi
+webhook:
+  image:
+    <<: *local
+    repository: localhost/cracha-webhook

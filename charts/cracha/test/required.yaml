@@ -1,0 +1,6 @@
+# The two values every install has to give (the chart refuses to render
+# without them), so the default-values tests render the defaults.
+broker:
+  cluster: test
+webhook:
+  defaultRegion: us-east-1

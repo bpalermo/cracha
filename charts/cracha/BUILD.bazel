@@ -1,0 +1,132 @@
+load("@rules_helm//helm:defs.bzl", "helm_chart", "helm_lint_test", "helm_template_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//bazel:registry.bzl", "chart_push_url", "chart_registry_url", "image_reference")
+
+# The chart package, built with the pinned helm toolchain:
+# bazel-bin/charts/cracha/cracha.tgz.
+#
+# `images` pins the digest of each component's image_push into values.yaml at
+# package time ({@//csi:image_push.digest}), so the chart and the images it
+# names cannot drift. It also derives each default repository from the push
+# target ({@//csi:image_push.repository}), which takes it from
+# bazel/registry.bzl.
+#
+# Published by :cracha.push_registry: plain `helm push` of the package to
+# chart_push_url() lands it in chart_registry_url("cracha"), since helm
+# appends the chart's `name:` and the chart is named after its repository.
+# Run it with HELM_REGISTRY_USERNAME and HELM_REGISTRY_PASSWORD set
+# (rules_helm logs in with them), after the images it pins have been pushed.
+# Never use :cracha.push, which pushes the images too. There is no publish
+# workflow yet.
+
+# The components whose images the chart deploys, as bazel/registry.bzl names
+# them. Keep in step with `images` below.
+PINNED_COMPONENTS = [
+    "broker",
+    "csi",
+    "webhook",
+]
+
+# Chart.yaml, with its versions from the workspace status. rules_helm stamps
+# only by substituting {KEY} in place, which cannot make a release's version
+# plain (0.1.0) while a snapshot's is a pre-release of it, and turns {KEY} into
+# an invalid version when not stamping. Unstamped (--nostamp), the chart is
+# 0.0.0-dev.unstamped.
+genrule(
+    name = "chart_yaml",
+    srcs = ["Chart.yaml.in"],
+    outs = ["Chart.yaml"],
+    cmd = """
+status=bazel-out/stable-status.txt
+version=0.0.0-dev.unstamped
+app=unstamped
+if [ -r "$$status" ]; then
+  version="$$(sed -n 's/^STABLE_CHART_VERSION //p' "$$status")"
+  app="$$(sed -n 's/^STABLE_GIT_VERSION //p' "$$status")"
+fi
+sed -e "s|@VERSION@|$$version|" -e "s|@APP_VERSION@|$$app|" $< >$@
+""",
+    stamp = -1,
+)
+
+helm_chart(
+    name = "cracha",
+    chart = ":chart_yaml",
+    images = [
+        "//broker:image_push",
+        "//csi:image_push",
+        "//webhook:image_push",
+    ],
+    registry_url = chart_push_url(),
+    templates = glob(["templates/**"]),
+    values = "values.yaml",
+    visibility = ["//visibility:public"],
+)
+
+# The defaults render only with the values an install has to give.
+REQUIRED_VALUES = [
+    "test/required.yaml",
+]
+
+helm_lint_test(
+    name = "cracha_lint_test",
+    size = "small",
+    chart = ":cracha",
+    values = REQUIRED_VALUES,
+)
+
+helm_template_test(
+    name = "cracha_template_test",
+    size = "small",
+    chart = ":cracha",
+    values = REQUIRED_VALUES,
+)
+
+# Every non-default knob: tls.mode existing with its Secrets and CA bundle,
+# existing ConfigMaps, every image overridden, trust-domain labels, the env
+# and envFrom, the scheduling knobs of each component.
+helm_template_test(
+    name = "cracha_overrides_template_test",
+    size = "small",
+    chart = ":cracha",
+    values = ["test/overrides.yaml"],
+)
+
+helm_lint_test(
+    name = "cracha_overrides_lint_test",
+    size = "small",
+    chart = ":cracha",
+    values = ["test/overrides.yaml"],
+)
+
+# The third TLS mode, which renders cert-manager resources instead of
+# Secrets.
+helm_template_test(
+    name = "cracha_cert_manager_template_test",
+    size = "small",
+    chart = ":cracha",
+    values = REQUIRED_VALUES + ["test/cert-manager.yaml"],
+)
+
+# The chart packs the pins the way a publish workflow relies on: every
+# component's repository is exactly bazel/registry.bzl's and is followed by a
+# sha256 digest, and the version is the VERSION file's: the release, a
+# candidate or a snapshot of it (or the unstamped placeholder).
+sh_test(
+    name = "pin_test",
+    size = "small",
+    srcs = ["pin_test.sh"],
+    data = [
+        ":cracha",
+        "//:VERSION",
+        "//bazel:chart-pin.sh",
+    ],
+    env = {
+        "CHART_RLOCATIONPATH": "$(rlocationpath :cracha)",
+        "CHART_PIN_RLOCATIONPATH": "$(rlocationpath //bazel:chart-pin.sh)",
+        "VERSION_RLOCATIONPATH": "$(rlocationpath //:VERSION)",
+        "EXPECT_REPOSITORIES": " ".join([image_reference(c) for c in PINNED_COMPONENTS]),
+        "EXPECT_CHART_REPOSITORY": chart_registry_url("cracha"),
+    },
+    deps = ["@bazel_tools//tools/bash/runfiles"],
+)
