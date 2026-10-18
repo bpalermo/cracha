@@ -28,6 +28,7 @@ bazel build --config=ci //...   # what CI builds: lockfile must be current, shel
 ```bash
 e2e/run.sh                      # the whole system in a kind cluster
 E2E_AUTHZ=spicedb e2e/run.sh    # with SpiceDB as the authorization backend
+E2E_ENROL=cni e2e/run.sh        # enrolling pods through the CNI plugin, not the init container
 E2E_FILTER=TestName e2e/run.sh  # only the tests whose name matches
 E2E_KEEP_CLUSTER=1 e2e/run.sh   # leave the cluster up to look around
 E2E_CHART=0.1.0 e2e/run.sh      # a published chart and its images, not the checkout's
@@ -36,31 +37,51 @@ E2E_CHART=0.1.0 e2e/run.sh      # a published chart and its images, not the chec
 Needs docker, kind and kubectl; helm comes from Bazel. The suite in `e2e/` is
 tagged `e2e` and excluded from `bazel test //...`; `e2e/run.sh` creates or
 reuses the kind cluster `cracha-e2e`, loads the images built from the
-checkout, deploys SPIRE (`e2e/spire.sh`), installs the chart built from the
-checkout with `e2e/values.yaml` (the suite's assignments, SPIRE socket paths
-and STS endpoint), `e2e/values-local.yaml` (the images just loaded) and a
-values file it writes for the grant bundle it compiled from `e2e/grants`,
-signed with a throwaway key and published into a ConfigMap,
+checkout (the broker, the agent, the webhook and the suite's own two,
+`e2e/client` and `e2e/stsstub`), deploys SPIRE (`e2e/spire.sh`: the server
+and agent of `e2e/spire.yaml`, with the agent's Broker API open to
+`cracha-agent` alone, and the entries of the three components and the test
+workloads, the webhook's with its Service name as a DNS SAN), installs the
+chart built from the checkout with `e2e/values.yaml` (the suite's
+assignments, the SPIRE socket paths, the kind node's CRI socket and netns
+directory, the STS endpoint), `e2e/values-local.yaml` (the images just
+loaded) and a values file it writes for the grant bundle it compiled from
+`e2e/grants`, signed with a throwaway key and published into a ConfigMap,
 deploys the STS stand-in (`e2e/manifests/stsstub.yaml`, `e2e/stsstub`) and
-runs the tests against the ambient kubeconfig. The chart's generated CA is
-what the test workloads trust: run.sh copies it from the `cracha-ca` Secret
-into a ConfigMap of the test namespace. `E2E_AUTHZ` picks the broker's
-authorization backend: `static` (the default) is the assignments document
-in `e2e/values.yaml`; `spicedb` also deploys SpiceDB from
+runs the tests against the ambient kubeconfig. Nothing is generated or
+handed to a workload: every certificate is an X.509-SVID from that SPIRE,
+the agent reaches the broker over SPIFFE mTLS, and the test workloads see
+only the loopback listener in their own network namespace, so there is no
+CA anywhere in the suite. `E2E_AUTHZ` picks the broker's authorization
+backend: `static` (the default) is the assignments document in
+`e2e/values.yaml`; `spicedb` also deploys SpiceDB from
 `e2e/manifests/spicedb.yaml` (memory datastore, plaintext gRPC, a preshared
 key the script makes), runs `cracha-reconciler` built from the checkout on
 the host through a `kubectl port-forward` to write the schema and the
 relationships of `e2e/grants`, and installs the chart with
-`e2e/values-spicedb.yaml` on top. The tests that need SpiceDB (revocation
-through Watch, suspension, the cache's mode) skip in static mode; the rest
-run in both, and one of them checks that the static document and the grant
-tree assign the same things. CI runs the script once per backend. The
-cluster is created from the node image in `e2e/kind-node-image`, by tag and
-digest; CI's `e2e` job gives `helm/kind-action` the same file and pins the
-kind release it is the default of. To move to another Kubernetes, write the
-image for that minor from the kind release notes into the file and the kind
-release into `ci.yml`; a kept cluster made from the old image is reused as
-is until it is deleted.
+`e2e/values-spicedb.yaml` on top. `E2E_ENROL` picks how the agent enrols a
+pod (design 7.2): `init` (the default, the chart's) has the webhook inject
+the `cracha-enrol` init container; `cni` installs the chart with
+`e2e/values-cni.yaml` on top, which switches the agent to the `cracha-cni`
+plugin. A kept cluster that ran in `cni` mode keeps the plugin chained on
+its node, where it fails every sandbox while no agent serves its socket, so
+run.sh refuses to run it in `init` mode until it is deleted. The tests that
+need SpiceDB (revocation through Watch, suspension,
+the cache's mode) skip in static mode, those that look at one enrolment
+mode's wiring skip in the other; the rest run everywhere, and one of them
+checks that the static document and the grant tree assign the same
+things. `e2e/client` is the workload: the AWS SDK with the injected
+environment and nothing else, its first action the credential fetch with
+the provider's retries off, reporting the answer, the request count and
+then `GET /v1/grants` as JSON lines the tests read from its log, and
+fetching again at `E2E_FETCH_INTERVAL` when asked. CI runs the script once
+per backend and enrolment mode. The cluster is created from the node image
+in `e2e/kind-node-image`, by tag and digest; CI's `e2e` job gives
+`helm/kind-action` the same file and pins the kind release it is the
+default of. To move to another Kubernetes, write the image for that minor
+from the kind release notes into the file and the kind release into
+`ci.yml` and `e2e-published.yml`; a kept cluster made from the old image is
+reused as is until it is deleted.
 `E2E_CHART=<version>` runs the suite against a published chart instead of
 the one built from the checkout: run.sh pulls
 `oci://$(bazel/registry.sh chart-ref cracha)` at that version with the
@@ -71,10 +92,11 @@ chart's digest and its image pins first, so the log says what was tested.
 The suite, SPIRE, the bundle, the STS stand-in and the suite's own images
 still come from the checkout, so run it from the commit whose suite
 matches the chart. The `e2e-published` workflow
-(`.github/workflows/e2e-published.yml`, run by hand with the chart version
-and the backend) does the same in a kind cluster on a runner. Every change
-that adds user-visible behaviour extends the suite, and a change to how
-Crachá is deployed goes in the chart, not in a manifest.
+(`.github/workflows/e2e-published.yml`, run by hand with the chart version,
+the backend and the enrolment mode) does the same in a kind cluster on a
+runner. Every change that adds user-visible behaviour extends the suite,
+and a change to how Crachá is deployed goes in the chart, not in a
+manifest.
 
 Bazel is the only build. Never run the host `go` tool: not `go mod tidy`, not
 `go get`, not `go test`. Change a Go dependency through rules_go's SDK:
@@ -107,12 +129,14 @@ CI builds and tests only what a change impacts. The `diff` job hashes the
 build graph at the base and the head of the change with bazel-diff
 (`bazel/ci-impacted-targets.sh`) and hands `build` the impacted rules to
 build and the impacted tests to run; `build` is skipped when nothing is
-impacted, and the `e2e (kind)` job runs only when the impacted set reaches
-something the suite deploys or runs: anything under `//e2e/...`, the chart
-`//charts/cracha:cracha` or a component's `image_load`. The suite's
-manifests, values files, `spire.sh` and `run.sh` are `data` of
-`//e2e:e2e_test`, so editing one of them is an e2e-relevant change; a new
-fixture the suite deploys goes in that glob. A documentation-only change
+impacted, and the `e2e (kind, <authz>, <enrol>)` matrix, one leg per
+authorization backend and enrolment mode (`E2E_AUTHZ`, `E2E_ENROL`), runs
+only when the impacted set reaches something the suite deploys or runs:
+anything under `//e2e/...`, the chart `//charts/cracha:cracha` or a
+component's `image_load`. The suite's manifests, values files, `spire.sh`
+and `run.sh` are `data` of `//e2e:e2e_test`, so editing one of them is an
+e2e-relevant change; a new fixture the suite deploys goes in that glob. The
+`ci` aggregate takes the matrix as one result: every leg has to pass. A documentation-only change
 builds nothing and creates no kind cluster; the formatter and the Gazelle
 check run on every change regardless. A change to the files CI itself
 depends on and no target does (`.bazelrc`, `.bazelversion`, `MODULE.bazel`

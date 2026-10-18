@@ -24,9 +24,6 @@ const (
 	// sourceIdentity is the idenc STS encoding of the client's identity:
 	// w.<label>.<ns>.<sa>, with the label the broker maps cracha.test to.
 	sourceIdentity = "w.cracha.e2e.client"
-	// jwtTTL is the JWT-SVID lifetime e2e/spire.sh registers the test
-	// workloads with.
-	jwtTTL = 240 * time.Second
 	// bundleConfigMap is where e2e/run.sh puts the bundle it compiled,
 	// signed and published, in the chart's namespace; latestKey holds the
 	// publication's latest pointer, whose version the broker must report.
@@ -64,9 +61,9 @@ type report struct {
 		CanExpire       bool      `json:"canExpire"`
 		Expires         time.Time `json:"expires"`
 	} `json:"credentials"`
-	Error    string     `json:"error"`
-	Exchange *exchange  `json:"exchange"`
-	Token    *tokenLine `json:"token"`
+	Error    string    `json:"error"`
+	Exchange *exchange `json:"exchange"`
+	Attempts int       `json:"attempts"`
 }
 
 // exchange is one HTTP answer of the broker as e2e/client recorded it.
@@ -88,19 +85,6 @@ func (e *exchange) reason() string {
 	return body.Reason
 }
 
-// tokenLine is what e2e/client prints about the token file: in the report,
-// and once per change afterwards.
-type tokenLine struct {
-	Kind    string    `json:"kind"`
-	Subject string    `json:"sub"`
-	Aud     []string  `json:"aud"`
-	Iat     int64     `json:"iat"`
-	Exp     int64     `json:"exp"`
-	ReadAt  time.Time `json:"readAt"`
-	Error   string    `json:"error"`
-	Changed bool      `json:"changed"`
-}
-
 // stsRequest is one AssumeRole as e2e/stsstub recorded it.
 type stsRequest struct {
 	RoleArn           string            `json:"roleArn"`
@@ -113,9 +97,11 @@ type stsRequest struct {
 	TransitiveTagKeys []string          `json:"transitiveTagKeys"`
 }
 
-// The workload's identity in its pod: a non-root user whose primary group is
-// not the fsGroup, so the token is readable only through the group the CSI
-// plugin gives it, the pod's fsGroup (section 7.3).
+// The workload's identity in its pod: a non-root user with an fsGroup of its
+// own, the way a hardened pod runs. Neither matters to Crachá any more
+// (nothing in the pod is read), which is the point: the enrolment the
+// webhook injects in init mode runs under the restricted standard beside
+// whatever the pod chose.
 const (
 	workloadUID     = int64(1000)
 	workloadGID     = int64(1000)
@@ -123,12 +109,9 @@ const (
 )
 
 // workloadPod is the suite's workload (e2e/client) running as the given
-// ServiceAccount, as a non-root user with an fsGroup, the way a hardened pod
-// does. An init container, non-root too, checks that it can read the token
-// before any container starts (section 7, "Ordering"); the container trusts
-// the suite's CA through SSL_CERT_FILE, which Go honours, and nothing else
-// about AWS is configured: the environment the webhook injects is all it
-// has.
+// ServiceAccount. Nothing about AWS is configured, nothing is mounted and
+// nothing is trusted: the environment the webhook injects is all it has
+// (design 7.7).
 func workloadPod(name, serviceAccount string, env ...corev1.EnvVar) *corev1.Pod {
 	grace := int64(0)
 	uid, gid, fsGroup := workloadUID, workloadGID, workloadFSGroup
@@ -142,26 +125,11 @@ func workloadPod(name, serviceAccount string, env ...corev1.EnvVar) *corev1.Pod 
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsUser: &uid, RunAsGroup: &gid, RunAsNonRoot: &nonRoot, FSGroup: &fsGroup,
 			},
-			InitContainers: []corev1.Container{{
-				Name:  "token-readable",
-				Image: busybox,
-				// Not root, the file is there, not empty, and readable: cat
-				// fails on a token the init container's user may not open.
-				Command: []string{"sh", "-c", fmt.Sprintf(
-					`[ "$(id -u)" = %d ] && test -s %s && cat %s >/dev/null`, workloadUID, tokenPath, tokenPath)},
-			}},
 			Containers: []corev1.Container{{
 				Name:            "client",
 				Image:           image("cracha-e2e-client"),
 				ImagePullPolicy: corev1.PullNever,
-				Env:             append([]corev1.EnvVar{{Name: "SSL_CERT_FILE", Value: "/etc/cracha-ca/ca.crt"}}, env...),
-				VolumeMounts:    []corev1.VolumeMount{{Name: "ca", MountPath: "/etc/cracha-ca", ReadOnly: true}},
-			}},
-			Volumes: []corev1.Volume{{
-				Name: "ca",
-				VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: "cracha-ca"},
-				}},
+				Env:             env,
 			}},
 		},
 	}
@@ -247,36 +215,35 @@ func stubRequests(ctx context.Context, session string) ([]stsRequest, error) {
 	return out, nil
 }
 
-// The whole path for a workload that holds a grant: the token is in place
+// The whole path for a workload that holds a grant: the pod is enrolled
 // before its containers start, the SDK, configured by nothing but the
-// injected environment, obtains credentials from the broker, and the broker
-// assumed the shape role the way section 6.6 says.
+// injected environment, obtains credentials through the loopback listener,
+// and the broker assumed the shape role the way section 6.6 says.
 func TestWorkloadObtainsCredentials(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 	pod, rep := assignedWorkload(ctx, t)
 
-	t.Run("token file", func(t *testing.T) {
-		// The init container only succeeded if its non-root user read the
-		// token.
-		for _, s := range pod.Status.InitContainerStatuses {
-			if s.Name == "token-readable" && (s.State.Terminated == nil || s.State.Terminated.ExitCode != 0) {
-				t.Errorf("the init container that reads the token as uid %d did not succeed: %+v", workloadUID, s.State)
+	t.Run("enrolled", func(t *testing.T) {
+		if pod.Labels[enrolLabel] != "true" {
+			t.Errorf("labels = %v, want %s=true, the enrolment mark", pod.Labels, enrolLabel)
+		}
+		if enrolMode() != enrolInit {
+			return
+		}
+		// In init mode the webhook's init container held the pod until the
+		// agent acknowledged and the listener accepted a connection.
+		running, err := client.CoreV1().Pods(testNamespace).Get(ctx, pod.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := len(running.Spec.InitContainers); n == 0 || running.Spec.InitContainers[0].Name != enrolContainer {
+			t.Fatalf("init containers = %+v, want %s first", running.Spec.InitContainers, enrolContainer)
+		}
+		for _, s := range running.Status.InitContainerStatuses {
+			if s.Name == enrolContainer && (s.State.Terminated == nil || s.State.Terminated.ExitCode != 0) {
+				t.Errorf("the %s init container did not succeed: %+v", enrolContainer, s.State)
 			}
-		}
-		tok := rep.Token
-		if tok == nil || tok.Error != "" {
-			t.Fatalf("the client could not read the token: %+v", tok)
-		}
-		wantSubject := fmt.Sprintf("spiffe://%s/ns/%s/sa/%s", trustDomain, testNamespace, assignedSA)
-		if tok.Subject != wantSubject {
-			t.Errorf("token sub = %q, want %q", tok.Subject, wantSubject)
-		}
-		if len(tok.Aud) != 1 || tok.Aud[0] != "cracha-broker" {
-			t.Errorf("token aud = %v, want [cracha-broker]", tok.Aud)
-		}
-		if lifetime := time.Duration(tok.Exp-tok.Iat) * time.Second; lifetime != jwtTTL {
-			t.Errorf("token lifetime = %s, want %s (section 11 caps it at 5m)", lifetime, jwtTTL)
 		}
 	})
 
@@ -301,7 +268,7 @@ func TestWorkloadObtainsCredentials(t *testing.T) {
 			t.Errorf("the SDK called %s, want %s", ex.URL, credentialsURI)
 		}
 		if ex.Status != 200 {
-			t.Errorf("broker answered %d: %s", ex.Status, ex.Body)
+			t.Errorf("the listener answered %d: %s", ex.Status, ex.Body)
 		}
 		// The bundle version is the compiled bundle's: the broker served
 		// the bundle run.sh published, verified, not a fixture.

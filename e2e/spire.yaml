@@ -114,9 +114,9 @@ data:
       log_level = "INFO"
       ca_ttl = "24h"
       default_x509_svid_ttl = "1h"
-      # The ceiling of docs/design.md, section 11: a JWT-SVID on disk lives
-      # at most 5 minutes. Workload entries set their own, shorter TTL.
-      default_jwt_svid_ttl = "5m"
+      # JWT-SVIDs live as long as SPIRE's default lets them: a pod's token
+      # is held in cracha-agent's memory and presented to the broker only
+      # (docs/design.md, section 4.2), so nothing here bounds its life.
       jwt_issuer = "https://spire-server.spire.svc"
     }
     plugins {
