@@ -133,7 +133,7 @@ func apply(rels []store.Relationship, ch Change) ([]store.Relationship, error) {
 func affected(before, after *Tree, ch Change) []string {
 	set := map[string]bool{}
 	for _, t := range []*store.Tuple{ch.Add, ch.Remove} {
-		if t == nil {
+		if t == nil || t.IsOwnership() {
 			continue
 		}
 		if t.Subject != "" {
@@ -190,9 +190,9 @@ func deltas(subjects []string, before, after scoped) []Delta {
 // its holder has must render the resource (a lookup grant of its kind
 // whose permission the relation gives), and every such grant's envelope
 // must hold the resource rendered alone. A membership has nothing to
-// cover.
+// cover, nor an owner or an approver.
 func coverage(t *Tree, add store.Tuple, subjects []string, after scoped) error {
-	if add.IsMembership() {
+	if !add.IsAccess() {
 		return nil
 	}
 	grants := renderingGrants(t, add, subjects, after)

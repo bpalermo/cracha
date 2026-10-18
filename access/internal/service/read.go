@@ -69,7 +69,7 @@ func listFilter(req *api.ListRequest) (func(store.Tuple, string) bool, error) {
 		}, nil
 	case req.Service != "":
 		return func(t store.Tuple, _ string) bool {
-			return t.Service == req.Service || (t.IsMembership() && t.Name == req.Service)
+			return t.Service == req.Service || (t.Kind == store.KindService && t.Name == req.Service)
 		}, nil
 	}
 	return func(t store.Tuple, _ string) bool { return t.Kind == req.Resource.Kind && t.Name == req.Resource.Name }, nil

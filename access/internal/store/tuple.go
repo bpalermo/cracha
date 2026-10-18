@@ -13,14 +13,17 @@ import (
 // Tuple is one relationship cracha-access writes, in the terms of the
 // grant tree (design 6.2): a workload, or every member of a service,
 // related to a resource by reader or writer (what a kind: Access document
-// says), or a workload made a member of a service.
+// says); a workload made a member of a service; or a workload, or every
+// member of a service, made an owner or an approver of a resource or a
+// service.
 type Tuple struct {
 	// Kind is the target's kind: a resource kind of common/grant
 	// (s3_bucket, dynamodb_table) or KindService for a membership.
 	Kind string `json:"kind"`
 	// Name is the resource's name, or the service's.
 	Name string `json:"name"`
-	// Relation is reader or writer on a resource, member on a service.
+	// Relation is reader or writer on a resource, member on a service, or
+	// owner or approver on either.
 	Relation string `json:"relation"`
 	// Subject is a workload's authorization subject encoding (design
 	// 4.3); Service a service whose members are related. Exactly one is
@@ -35,7 +38,22 @@ type Tuple struct {
 
 // IsMembership reports whether the tuple makes a workload a member of a
 // service.
-func (t Tuple) IsMembership() bool { return t.Kind == KindService }
+func (t Tuple) IsMembership() bool {
+	return t.Kind == KindService && t.Relation == spicedb.RelationMember
+}
+
+// IsAccess reports whether the tuple relates a holder to a resource by
+// reader or writer: what a lookup grant renders.
+func (t Tuple) IsAccess() bool {
+	return isResourceType(t.Kind) && (t.Relation == spicedb.RelationReader || t.Relation == spicedb.RelationWriter)
+}
+
+// IsOwnership reports whether the tuple makes an owner or an approver.
+func (t Tuple) IsOwnership() bool { return isOwnership(t.Relation) }
+
+func isOwnership(relation string) bool {
+	return relation == RelationOwner || relation == RelationApprover
+}
 
 // Holder is who the tuple relates: "workload <subject>" or "service
 // <name>", for messages.
@@ -49,7 +67,7 @@ func (t Tuple) Holder() string {
 // TargetID is the store's object ID of the target: the service's name, or
 // the resource's name in the resource encoding of design 4.3.
 func (t Tuple) TargetID() (string, error) {
-	if t.IsMembership() {
+	if t.Kind == KindService {
 		return t.Name, nil
 	}
 	return idenc.Resource(t.Name)
@@ -82,27 +100,33 @@ func (t Tuple) Key() string {
 // or a service's member. Anything else is not one, and false.
 func TupleOf(r Relationship) (Tuple, bool) {
 	t := Tuple{Kind: r.ResourceType, Relation: r.Relation, ExpiresAt: r.ExpiresAt, Clusters: slices.Clone(r.Allowed)}
-	switch {
-	case r.ResourceType == KindService && r.Relation == spicedb.RelationMember && r.SubjectType == spicedb.TypeWorkload:
-		t.Name, t.Subject = r.ResourceID, r.SubjectID
-		return t, true
-	case !isResourceType(r.ResourceType) || (r.Relation != spicedb.RelationReader && r.Relation != spicedb.RelationWriter):
+	if !t.IsMembership() && !t.IsAccess() && !(t.IsOwnership() && (isResourceType(t.Kind) || t.Kind == KindService)) {
 		return Tuple{}, false
 	}
-	name, err := idenc.ParseResource(r.ResourceID)
-	if err != nil {
+	name, ok := targetName(r)
+	if !ok {
 		return Tuple{}, false
 	}
 	t.Name = name
 	switch {
 	case r.SubjectType == spicedb.TypeWorkload && r.SubjectRelation == "":
 		t.Subject = r.SubjectID
-	case r.SubjectType == spicedb.TypeService && r.SubjectRelation == spicedb.RelationMember:
+	case r.SubjectType == spicedb.TypeService && r.SubjectRelation == spicedb.RelationMember && !t.IsMembership():
 		t.Service = r.SubjectID
 	default:
 		return Tuple{}, false
 	}
 	return t, true
+}
+
+// targetName is the name of a relationship's resource: a service's ID, or
+// a resource's name decoded.
+func targetName(r Relationship) (string, bool) {
+	if r.ResourceType == KindService {
+		return r.ResourceID, true
+	}
+	name, err := idenc.ParseResource(r.ResourceID)
+	return name, err == nil
 }
 
 func isResourceType(t string) bool { return slices.Contains(spicedb.ResourceTypes, t) }
@@ -113,22 +137,62 @@ func isResourceType(t string) bool { return slices.Contains(spicedb.ResourceType
 // checked as a Service document holding the subject would be; a resource
 // relation as an Access document.
 func (t Tuple) Validate() error {
-	if t.IsMembership() {
-		if t.Service != "" || t.Subject == "" {
-			return errors.New("a membership makes a workload (subject) a member of a service")
-		}
-		if t.Relation != spicedb.RelationMember {
-			return fmt.Errorf("relation %q on a service: want %s", t.Relation, spicedb.RelationMember)
-		}
-		if err := grant.ValidateService(&grant.Service{
-			Kind: grant.KindService, Metadata: grant.Metadata{Name: t.Name},
-			Spec: grant.ServiceSpec{Team: "request", Members: []string{t.Subject}},
-		}); err != nil {
-			return err
-		}
-		return validateBounds(t)
+	switch {
+	case t.IsOwnership():
+		return t.validateOwnership()
+	case t.Kind == KindService:
+		return t.validateMembership()
 	}
 	return grant.ValidateAccess(t.Access("request"))
+}
+
+// validateMembership checks a membership as a Service document holding the
+// subject would be.
+func (t Tuple) validateMembership() error {
+	if t.Service != "" || t.Subject == "" {
+		return errors.New("a membership makes a workload (subject) a member of a service")
+	}
+	if t.Relation != spicedb.RelationMember {
+		return fmt.Errorf("relation %q on a service: want %s, %s or %s", t.Relation, spicedb.RelationMember, RelationOwner, RelationApprover)
+	}
+	if err := t.validateService(); err != nil {
+		return err
+	}
+	return validateBounds(t)
+}
+
+// validateOwnership checks an owner or an approver: a target of a known
+// kind and a valid name, one holder, and no bounds, which the schema's
+// owner and approver relations do not carry.
+func (t Tuple) validateOwnership() error {
+	if t.ExpiresAt != "" || len(t.Clusters) > 0 {
+		return fmt.Errorf("%s is not bounded: no expiresAt, no clusters", t.Relation)
+	}
+	if t.Kind == KindService {
+		if (t.Subject == "") == (t.Service == "") {
+			return errors.New("one of subject or service is required")
+		}
+		return t.validateService()
+	}
+	// The holder and the target, checked as an Access document's.
+	a := t.Access("request")
+	a.Spec.Relation = grant.RelationReader
+	return grant.ValidateAccess(a)
+}
+
+// validateService checks the service's name and the subject, as a Service
+// document holding it would be.
+func (t Tuple) validateService() error {
+	spec := grant.ServiceSpec{Team: "request"}
+	if t.Subject != "" {
+		spec.Members = []string{t.Subject}
+	}
+	if t.Service != "" {
+		if err := grant.ValidateService(&grant.Service{Kind: grant.KindService, Metadata: grant.Metadata{Name: t.Service}, Spec: grant.ServiceSpec{Team: "request"}}); err != nil {
+			return err
+		}
+	}
+	return grant.ValidateService(&grant.Service{Kind: grant.KindService, Metadata: grant.Metadata{Name: t.Name}, Spec: spec})
 }
 
 // validateBounds checks a membership's bounds as an Access document's.

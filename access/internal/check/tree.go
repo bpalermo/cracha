@@ -104,7 +104,7 @@ func (tb *treeBuilder) add(r store.Relationship) {
 			})
 		}
 	default:
-		if t, ok := store.TupleOf(r); ok && !t.IsMembership() {
+		if t, ok := store.TupleOf(r); ok && t.IsAccess() {
 			tb.tree.src.Accesses = append(tb.tree.src.Accesses, t.Access(tb.name("access")))
 		}
 	}

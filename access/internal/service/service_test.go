@@ -511,3 +511,25 @@ func TestWatchAudit(t *testing.T) {
 		t.Errorf("the outside write is not flagged:\n%s", out)
 	}
 }
+
+// An owner makes another workload an approver; the write reaches no
+// composition, and only an owner may make it.
+func TestOwnership(t *testing.T) {
+	f := newFixture(t, Config{})
+	req := &api.GrantRequest{Subject: "prod/tools/bob", Resource: api.Resource{Kind: grant.ResourceS3Bucket, Name: "data-b"}, Relation: store.RelationApprover, Reason: "rota"}
+	if _, err := f.svc.Grant(as(stranger), req); err == nil {
+		t.Fatal("an approver made by a stranger")
+	}
+	resp, err := f.svc.Grant(as(owner), req)
+	if err != nil || resp.Status != api.StatusApplied || len(resp.PolicyDelta) != 0 || !f.has("s3_bucket:data-b#approver@workload:prod/tools/bob") {
+		t.Fatalf("resp = %+v, %v, held %v", resp, err, f.fake.Keys())
+	}
+	list, err := f.svc.List(as(stranger), &api.ListRequest{Resource: &api.Resource{Kind: grant.ResourceS3Bucket, Name: "data-b"}})
+	if err != nil || len(list.Relationships) != 1 || list.Relationships[0].Relation != store.RelationApprover {
+		t.Errorf("list = %+v, %v", list, err)
+	}
+	req.ExpiresAt = "2026-10-19T00:00:00Z"
+	if _, err := f.svc.Grant(as(owner), req); err == nil {
+		t.Error("a bounded approver was written")
+	}
+}

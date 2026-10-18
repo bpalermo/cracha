@@ -143,7 +143,7 @@ func (h *holderFlags) bind(fs *flag.FlagSet, e env) {
 	fs.StringVar(&h.subject, "subject", "", "the workload, as its authorization subject encoding (design 4.3)")
 	fs.StringVar(&h.service, "service", "", "the service whose members are related, instead of --subject")
 	fs.StringVar(&h.resource, "resource", "", "kind:name: s3_bucket:<bucket>, dynamodb_table:<table>, or service:<name> for a membership")
-	fs.StringVar(&h.relation, "relation", "", "reader or writer on a resource; member on a service")
+	fs.StringVar(&h.relation, "relation", "", "reader or writer on a resource; member on a service; owner or approver on either")
 	fs.StringVar(&h.reason, "reason", "", "why (required; recorded)")
 	fs.StringVar(&h.requester, "requester", e.str("requester", ""), "who asks: a person or a job, recorded beside the caller's SPIFFE ID (CRACHA_REQUESTER)")
 }

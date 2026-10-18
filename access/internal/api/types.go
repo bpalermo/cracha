@@ -20,8 +20,10 @@ type Resource struct {
 // GrantRequest relates a workload (Subject), or every member of a service
 // (Service), to a resource by Relation (reader or writer), or makes a
 // workload a member of a service (Resource kind service, Relation
-// member). It is what a kind: Access document says (design 6.2), with the
-// same optional bounds.
+// member), or makes a workload or a service's members an owner or an
+// approver of a resource or a service (Relation owner or approver,
+// unbounded). A resource relation is what a kind: Access document says
+// (design 6.2), with the same optional bounds.
 type GrantRequest struct {
 	Subject  string   `json:"subject,omitempty"`
 	Service  string   `json:"service,omitempty"`
