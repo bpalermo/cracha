@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "analyzer.go",
         "arnmatch.go",
+        "assignments.go",
         "bundle.go",
         "doc.go",
         "lint.go",
@@ -35,6 +36,7 @@ go_test(
     srcs = [
         "analyzer_test.go",
         "arnmatch_test.go",
+        "assignments_test.go",
         "bundle_test.go",
         "lint_test.go",
         "load_test.go",

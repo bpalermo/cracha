@@ -248,3 +248,70 @@ func TestKMSSignVerify(t *testing.T) {
 		t.Errorf("Verify = %v", err)
 	}
 }
+
+func TestKeyRing(t *testing.T) {
+	ctx := context.Background()
+	old, current, stranger := mustKey(t), mustKey(t), mustKey(t)
+	ring, err := NewKeyRing(&old.PublicKey, &current.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := ring.KeyIDs(); len(ids) != 2 {
+		t.Errorf("KeyIDs = %v", ids)
+	}
+	data := []byte(`{"version":"v1"}`)
+	for name, key := range map[string]*ecdsa.PrivateKey{"old": old, "current": current} {
+		signer, _ := NewLocalSigner(key)
+		sig, err := signer.Sign(ctx, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ring.Verify(ctx, data, sig); err != nil {
+			t.Errorf("signed by the %s key: %v", name, err)
+		}
+		if err := ring.Verify(ctx, append(data, ' '), sig); err == nil {
+			t.Errorf("signed by the %s key: tampered data verified", name)
+		}
+	}
+	signer, _ := NewLocalSigner(stranger)
+	sig, _ := signer.Sign(ctx, data)
+	if err := ring.Verify(ctx, data, sig); err == nil || !strings.Contains(err.Error(), "not one of the 2 verification keys") {
+		t.Errorf("a stranger's signature: %v", err)
+	}
+	// A signature that names a ring key but was made by another fails the
+	// signature check, not the key lookup.
+	forged := *sig
+	forged.KeyID = ring.KeyIDs()[0]
+	if err := ring.Verify(ctx, data, &forged); err == nil || !strings.Contains(err.Error(), "does not verify") {
+		t.Errorf("a forged keyId: %v", err)
+	}
+	if err := ring.Verify(ctx, data, nil); err == nil {
+		t.Error("no signature verified")
+	}
+	if _, err := NewKeyRing(); err == nil {
+		t.Error("an empty key ring was made")
+	}
+	if _, err := NewKeyRing(&old.PublicKey, &old.PublicKey); err == nil || !strings.Contains(err.Error(), "listed twice") {
+		t.Errorf("a key listed twice: %v", err)
+	}
+}
+
+func TestParseECPublicKeys(t *testing.T) {
+	a, b := mustKey(t), mustKey(t)
+	pa, _ := EncodeECPublicKey(&a.PublicKey)
+	pb, _ := EncodeECPublicKey(&b.PublicKey)
+	keys, err := ParseECPublicKeys([]byte("# the old key\n" + string(pa) + "\n# the new key\n" + string(pb)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 2 || !keys[0].Equal(&a.PublicKey) || !keys[1].Equal(&b.PublicKey) {
+		t.Errorf("keys = %v", keys)
+	}
+	if _, err := ParseECPublicKeys([]byte("junk")); err == nil || !strings.Contains(err.Error(), "no PEM block") {
+		t.Errorf("error = %v", err)
+	}
+	priv, _ := EncodeECPrivateKey(b)
+	if _, err := ParseECPublicKeys(append(pa, priv...)); err == nil || !strings.Contains(err.Error(), "key 2") {
+		t.Errorf("error = %v", err)
+	}
+}

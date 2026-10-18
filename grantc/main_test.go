@@ -208,7 +208,26 @@ func TestCompileCommand(t *testing.T) {
 		}
 	}
 
-	code, _, errOut := runCLI(t, noAWS, "compile", src)
+	assignments, err := os.ReadFile(filepath.Join(work, grant.AssignmentsFile))
+	if err != nil {
+		t.Fatalf("no assignments beside the bundle: %v", err)
+	}
+	for _, want := range []string{`"version": "deadbeef"`, `"generatedAt": "2026-10-17T12:00:00Z"`, `"subject": "prod/billing/reports"`, `"name": "reports-r"`} {
+		if !strings.Contains(string(assignments), want) {
+			t.Errorf("assignments lack %s:\n%s", want, assignments)
+		}
+	}
+	elsewhere := filepath.Join(work, "elsewhere.json")
+	code, out, errOut := runCLI(t, noAWS, "compile", "-o", bundle, "-assignments", elsewhere, src)
+	if code != 0 || !strings.Contains(out, "compiled "+elsewhere+": version ") || !strings.Contains(out, "0 services, 1 workloads") {
+		t.Errorf("compile -assignments: %d\n%s%s", code, out, errOut)
+	}
+	code, _, errOut = runCLI(t, noAWS, "compile", "-o", bundle, "-assignments", bundle, src)
+	if code != 2 || !strings.Contains(errOut, "cannot both be written") {
+		t.Errorf("compile into one file: %d, %q", code, errOut)
+	}
+
+	code, _, errOut = runCLI(t, noAWS, "compile", src)
 	if code != 2 || !strings.Contains(errOut, "-o is required") {
 		t.Errorf("compile without -o: %d, %q", code, errOut)
 	}
@@ -217,7 +236,7 @@ func TestCompileCommand(t *testing.T) {
 		t.Errorf("compile with bad time: %d, %q", code, errOut)
 	}
 	bad := sourceTree(t, "arn:aws:s3:::other/*")
-	code, out, _ := runCLI(t, noAWS, "compile", "-o", filepath.Join(work, "bad.json"), bad)
+	code, out, _ = runCLI(t, noAWS, "compile", "-o", filepath.Join(work, "bad.json"), bad)
 	if code != 1 || !strings.Contains(out, "problems") {
 		t.Errorf("compile bad: %d\n%s", code, out)
 	}
@@ -393,5 +412,68 @@ func TestKeySource(t *testing.T) {
 	code, _, errOut = runCLI(t, noAWS, "sign", "-key", filepath.Join(work, "missing.pem"), bundle)
 	if code != 2 || !strings.Contains(errOut, "missing.pem") {
 		t.Errorf("sign with a missing key file: %d, %q", code, errOut)
+	}
+}
+
+// The whole version: the bundle and the assignments signed in one call,
+// verified with a key file holding the old and the new key, and published
+// together.
+func TestSignedVersion(t *testing.T) {
+	work := t.TempDir()
+	bundle, _ := compiledBundle(t, work)
+	assignments := filepath.Join(work, grant.AssignmentsFile)
+	priv, pub, other := keyPair(t, work)
+
+	code, out, errOut := runCLI(t, noAWS, "sign", "-key", priv, bundle, assignments)
+	if code != 0 || !strings.Contains(out, "signed "+assignments+" with sha256:") {
+		t.Fatalf("sign both: %d\n%s%s", code, out, errOut)
+	}
+	code, _, errOut = runCLI(t, noAWS, "sign", "-key", priv, "-o", filepath.Join(work, "x.sig"), bundle, assignments)
+	if code != 2 || !strings.Contains(errOut, "-o names one signature") {
+		t.Errorf("sign -o with two files: %d, %q", code, errOut)
+	}
+	notADocument := filepath.Join(work, "other.json")
+	writeFile(t, notADocument, `{"version":"v1"}`)
+	code, _, errOut = runCLI(t, noAWS, "sign", "-key", priv, notADocument)
+	if code != 2 || !strings.Contains(errOut, "neither a bundle") {
+		t.Errorf("sign a stranger: %d, %q", code, errOut)
+	}
+
+	// Rotation: the key file trusts the unrelated key and the signing one.
+	pubs, err := os.ReadFile(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPEM, _ := os.ReadFile(other)
+	ring := filepath.Join(work, "ring.pem")
+	writeFile(t, ring, string(otherPEM)+string(pubs))
+	code, out, errOut = runCLI(t, noAWS, "verify", "-pub", ring, bundle, assignments)
+	if code != 0 || !strings.Contains(out, "verified "+bundle) || !strings.Contains(out, "verified "+assignments) {
+		t.Errorf("verify with a key ring: %d\n%s%s", code, out, errOut)
+	}
+	code, _, errOut = runCLI(t, noAWS, "verify", "-pub", other, assignments)
+	if code != 1 || !strings.Contains(errOut, "not one of the 1 verification keys") {
+		t.Errorf("verify with another key: %d, %q", code, errOut)
+	}
+
+	dir := filepath.Join(work, "published")
+	code, out, errOut = runCLI(t, noAWS, "publish", "-dir", dir, assignments, bundle)
+	if code != 0 || !strings.Contains(out, "bundles/deadbeef/assignments.json, bundles/deadbeef/assignments.json.sig, latest") {
+		t.Errorf("publish both: %d\n%s%s", code, out, errOut)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bundles", "deadbeef", grant.AssignmentsSignatureFile)); err != nil {
+		t.Errorf("assignments signature not published: %v", err)
+	}
+	code, _, errOut = runCLI(t, noAWS, "publish", "-dir", dir, bundle, bundle)
+	if code != 2 || !strings.Contains(errOut, "a second bundle") {
+		t.Errorf("publish two bundles: %d, %q", code, errOut)
+	}
+	code, _, errOut = runCLI(t, noAWS, "publish", "-dir", dir, assignments)
+	if code != 2 || !strings.Contains(errOut, "no bundle") {
+		t.Errorf("publish assignments alone: %d, %q", code, errOut)
+	}
+	code, _, errOut = runCLI(t, noAWS, "publish", "-dir", dir, bundle)
+	if code != 0 || !strings.Contains(errOut, "has no assignments") {
+		t.Errorf("publish the bundle alone: %d, %q", code, errOut)
 	}
 }

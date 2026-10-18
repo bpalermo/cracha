@@ -184,6 +184,75 @@ func (v *LocalVerifier) Verify(_ context.Context, bundle []byte, sig *Signature)
 	return nil
 }
 
+// KeyRing verifies with any one of several public keys, the one whose key
+// identity the envelope names: what makes rotating the signing key
+// possible, since a reader trusts the old and the new key while the
+// publication moves from one to the other.
+type KeyRing struct {
+	keys map[string]*LocalVerifier
+	ids  []string
+}
+
+// NewKeyRing makes a key ring of P-256 public keys. Listing a key twice is
+// an error, as is an empty ring.
+func NewKeyRing(pubs ...*ecdsa.PublicKey) (*KeyRing, error) {
+	if len(pubs) == 0 {
+		return nil, errors.New("no verification key")
+	}
+	r := &KeyRing{keys: map[string]*LocalVerifier{}}
+	for _, pub := range pubs {
+		v, err := NewLocalVerifier(pub)
+		if err != nil {
+			return nil, err
+		}
+		if _, dup := r.keys[v.keyID]; dup {
+			return nil, fmt.Errorf("verification key %s listed twice", v.keyID)
+		}
+		r.keys[v.keyID] = v
+		r.ids = append(r.ids, v.keyID)
+	}
+	return r, nil
+}
+
+// KeyIDs returns the identities of the ring's keys, in the order given.
+func (r *KeyRing) KeyIDs() []string { return append([]string(nil), r.ids...) }
+
+// Verify implements Verifier: the envelope's keyId selects the key.
+func (r *KeyRing) Verify(ctx context.Context, data []byte, sig *Signature) error {
+	if sig == nil {
+		return errors.New("no signature")
+	}
+	v, ok := r.keys[sig.KeyID]
+	if !ok {
+		return fmt.Errorf("signature by key %q, which is not one of the %d verification keys", sig.KeyID, len(r.keys))
+	}
+	return v.Verify(ctx, data, sig)
+}
+
+// ParseECPublicKeys reads every PEM-encoded ("PUBLIC KEY", PKIX) ECDSA
+// public key in pemData, in order; at least one is required, and anything
+// but PEM blocks between them (comments, blank lines) is ignored.
+func ParseECPublicKeys(pemData []byte) ([]*ecdsa.PublicKey, error) {
+	var keys []*ecdsa.PublicKey
+	rest := pemData
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		key, err := ParseECPublicKey(pem.EncodeToMemory(block))
+		if err != nil {
+			return nil, fmt.Errorf("key %d: %w", len(keys)+1, err)
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return nil, errors.New("no PEM block")
+	}
+	return keys, nil
+}
+
 // KMSAPI is the part of the KMS client the signer and verifier use, so
 // tests can substitute a fake.
 type KMSAPI interface {
