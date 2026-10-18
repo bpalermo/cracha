@@ -109,6 +109,17 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- with .Values.broker.awsRegion }}
+            # The region --aws-region already pins, also in the SDK's own
+            # variables: a workload-identity webhook (the EKS pod identity
+            # webhook) injects its cluster-wide default into containers that
+            # do not set them, and the pod spec would then name a region the
+            # broker does not use.
+            - name: AWS_REGION
+              value: {{ . | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.broker.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

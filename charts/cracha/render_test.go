@@ -485,3 +485,35 @@ func TestDefaultResources(t *testing.T) {
 		}
 	}
 }
+
+// TestBrokerRegionEnv: broker.awsRegion is also the broker container's
+// AWS_REGION and AWS_DEFAULT_REGION, so a workload-identity webhook does not
+// inject another region; without it the chart sets neither.
+func TestBrokerRegionEnv(t *testing.T) {
+	for _, tc := range []struct {
+		rendering, name, want string
+	}{
+		{"defaults", "cracha-broker", ""},
+		{"overrides", "custom-broker", "eu-west-1"},
+	} {
+		deploy := object(t, rendered(t, tc.rendering), "Deployment", tc.name)
+		containers, _ := path(deploy, "spec", "template", "spec", "containers").([]any)
+		var env []any
+		for _, c := range containers {
+			if path(c, "name") == "broker" {
+				env, _ = path(c, "env").([]any)
+			}
+		}
+		for _, name := range []string{"AWS_REGION", "AWS_DEFAULT_REGION"} {
+			got := ""
+			for _, e := range env {
+				if path(e, "name") == name {
+					got, _ = path(e, "value").(string)
+				}
+			}
+			if got != tc.want {
+				t.Errorf("%s: %s = %q, want %q", tc.rendering, name, got, tc.want)
+			}
+		}
+	}
+}
