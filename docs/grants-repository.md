@@ -212,15 +212,20 @@ credentials).
 ## The AWS side
 
 In account `988966554486`, region `sa-east-1` (managed in Terraform, not
-here):
+here). The repositories use GitHub's immutable OIDC subjects, so a token's
+`sub` names the owner and the repository with their numeric IDs,
+`repo:<owner>@<owner id>/<repo>@<repo id>:...`, not the plain
+`repo:<owner>/<repo>:...`: a trust written in the plain form refuses every
+run with "Not authorized to perform sts:AssumeRoleWithWebIdentity". Read
+the prefix with `gh api repos/<owner>/<repo>/actions/oidc/customization/sub`.
 
 - **`gha-cracha-grants-check`**, trusted for the GitHub OIDC provider with
-  `sub` `repo:bpalermo/cracha-grants:pull_request` and `aud`
+  `sub` `repo:bpalermo@4821983/cracha-grants@1424650328:pull_request` and `aud`
   `sts.amazonaws.com`: `access-analyzer:ValidatePolicy` and
   `access-analyzer:CheckNoNewAccess`. Nothing else: a pull request can
   neither sign nor write.
 - **`gha-cracha-grants-publish`**, trusted with `sub`
-  `repo:bpalermo/cracha-grants:ref:refs/heads/main`: the same Access
+  `repo:bpalermo@4821983/cracha-grants@1424650328:ref:refs/heads/main`: the same Access
   Analyzer actions, `kms:Sign` and `kms:GetPublicKey` on the signing key,
   and
   `s3:PutObject` on `arn:aws:s3:::cracha-grants-988966554486/grants/*`.
