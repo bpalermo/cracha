@@ -157,32 +157,43 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer release()
 
 	start := h.cfg.Now()
-	log := h.cfg.Logger.With("pod", pod.String(), "path", r.URL.Path)
-	status, cache, err := h.serve(w, r, pod, log)
-	log.Info("request", "status", status, "cache", cache, "latency", h.cfg.Now().Sub(start).String(), "error", err)
+	out := h.serve(w, r, pod)
+	h.cfg.Logger.Info("request", "pod", pod.String(), "path", r.URL.Path, "spiffe_id", out.spiffeID,
+		"status", out.status, "cache", out.cache, "latency", h.cfg.Now().Sub(start).String(), "error", out.err)
 }
 
-// serve answers one request and returns what to log: the status sent, the
-// broker's Cracha-Cache and the error, if the agent answered itself.
-func (h *Handler) serve(w http.ResponseWriter, r *http.Request, pod listener.Pod, log *slog.Logger) (int, string, error) {
+// outcome is what one request's log line says: the status sent, the token's
+// SPIFFE ID once known, the broker's Cracha-Cache and the error, if the
+// agent answered itself.
+type outcome struct {
+	status   int
+	spiffeID string
+	cache    string
+	err      error
+}
+
+// serve answers one request.
+func (h *Handler) serve(w http.ResponseWriter, r *http.Request, pod listener.Pod) outcome {
 	tok, err := h.token(r.Context(), pod)
 	if err != nil {
 		reason := reasonOf(err)
 		fail(w, reason)
-		return http.StatusServiceUnavailable, "", fmt.Errorf("%s: %w", reason, err)
+		return outcome{status: http.StatusServiceUnavailable, err: fmt.Errorf("%s: %w", reason, err)}
 	}
-	log = log.With("spiffe_id", tok.id)
+	out := outcome{spiffeID: tok.id}
 	resp, err := h.broker.Get(r.Context(), r.URL.Path, tok.token)
 	if err != nil {
 		fail(w, ReasonBrokerUnavailable)
-		return http.StatusServiceUnavailable, "", fmt.Errorf("%s: %w", ReasonBrokerUnavailable, err)
+		out.status, out.err = http.StatusServiceUnavailable, fmt.Errorf("%s: %w", ReasonBrokerUnavailable, err)
+		return out
 	}
 	defer resp.Body.Close()
 	relay(w, resp)
 	if _, err := io.Copy(w, io.LimitReader(resp.Body, maxBody)); err != nil {
-		log.Warn("relaying the broker's body", "error", err)
+		h.cfg.Logger.Warn("relaying the broker's body", "pod", pod.String(), "error", err)
 	}
-	return resp.StatusCode, resp.Header.Get("Cracha-Cache"), nil
+	out.status, out.cache = resp.StatusCode, resp.Header.Get("Cracha-Cache")
+	return out
 }
 
 // relay writes the broker's status and headers: every Cracha-* header, and
