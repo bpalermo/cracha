@@ -451,3 +451,37 @@ func TestWebhookDeployment(t *testing.T) {
 		}
 	})
 }
+
+// TestDefaultResources: with the defaults no component is BestEffort and
+// none has a CPU limit.
+func TestDefaultResources(t *testing.T) {
+	docs := rendered(t, "defaults")
+	for _, tc := range []struct{ kind, name, container string }{
+		{"Deployment", "cracha-broker", "broker"},
+		{"Deployment", "cracha-webhook", "webhook"},
+		{"DaemonSet", "cracha-agent", "agent"},
+	} {
+		obj := object(t, docs, tc.kind, tc.name)
+		containers, _ := path(obj, "spec", "template", "spec", "containers").([]any)
+		var c any
+		for _, x := range containers {
+			if path(x, "name") == tc.container {
+				c = x
+			}
+		}
+		if c == nil {
+			t.Fatalf("%s %s has no container %s", tc.kind, tc.name, tc.container)
+		}
+		for _, r := range []string{"cpu", "memory"} {
+			if path(c, "resources", "requests", r) == nil {
+				t.Errorf("%s: no %s request", tc.name, r)
+			}
+		}
+		if path(c, "resources", "limits", "memory") == nil {
+			t.Errorf("%s: no memory limit", tc.name)
+		}
+		if v := path(c, "resources", "limits", "cpu"); v != nil {
+			t.Errorf("%s: CPU limit %v, want none", tc.name, v)
+		}
+	}
+}

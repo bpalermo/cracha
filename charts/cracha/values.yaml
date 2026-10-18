@@ -224,7 +224,16 @@ broker:
   priorityClassName: ""
   nodeSelector: {}
   tolerations: []
-  resources: {}
+  # Requests, so the broker is never BestEffort: a starved probe on a busy
+  # node restarts it. Measured idle use is a few millicores and ~10Mi;
+  # memory grows with the credential cache holds up to cache.maxEntries sessions. No CPU limit: CFS throttling stalls short
+  # bursts (startup, a refresh wave) for no benefit.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
   podAnnotations: {}
 
 # The node agent (design 7), one pod per node, in the host network: binds a
@@ -346,7 +355,16 @@ agent:
     - operator: Exists
 
   nodeSelector: {}
-  resources: {}
+  # Requests, so the agent is never BestEffort: a starved probe on a busy
+  # node restarts it. Measured idle use is a few millicores and ~10Mi;
+  # memory grows with one listener and one cached JWT-SVID per enrolled pod of the node. No CPU limit: CFS throttling stalls short
+  # bursts (startup, a refresh wave) for no benefit.
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
   podAnnotations: {}
 
 # The mutating webhook (design 7.5): for pods whose ServiceAccount opts in,
@@ -450,5 +468,14 @@ webhook:
   priorityClassName: ""
   nodeSelector: {}
   tolerations: []
-  resources: {}
+  # Requests, so the webhook is never BestEffort: a starved probe on a busy
+  # node restarts it. Measured idle use is a few millicores and ~10Mi;
+  # memory grows with a ServiceAccount and Namespace cache. No CPU limit: CFS throttling stalls short
+  # bursts (startup, a refresh wave) for no benefit.
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
   podAnnotations: {}
