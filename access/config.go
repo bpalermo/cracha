@@ -43,21 +43,33 @@ func (e env) duration(flag string, def time.Duration) time.Duration {
 // spicedbFlags is how cracha-access reaches SpiceDB: through the gateway,
 // over SPIFFE mTLS with its own SVID (design 6.9).
 type spicedbFlags struct {
-	endpoint string
-	serverID string
-	timeout  time.Duration
-	id       spiffeid.ID
+	endpoint       string
+	serverID       string
+	namespace      string
+	serviceAccount string
+	timeout        time.Duration
+	// id is --spicedb-spiffe-id parsed; zero when it is derived from the
+	// caller's own trust domain (resolve).
+	id spiffeid.ID
 }
 
 func (f *spicedbFlags) bind(fs *flag.FlagSet, e env) {
 	fs.StringVar(&f.endpoint, "spicedb-endpoint", e.str("spicedb-endpoint", ""), "the SpiceDB gateway's gRPC address, host:port")
-	fs.StringVar(&f.serverID, "spicedb-spiffe-id", e.str("spicedb-spiffe-id", ""), "the SpiceDB gateway's SPIFFE ID, which its certificate must carry")
+	fs.StringVar(&f.serverID, "spicedb-spiffe-id", e.str("spicedb-spiffe-id", ""), "the SpiceDB gateway's SPIFFE ID, which its certificate must carry; empty derives spiffe://<own trust domain>/ns/<--namespace>/sa/<--spicedb-service-account>")
+	fs.StringVar(&f.namespace, "namespace", e.str("namespace", ""), "the namespace the SpiceDB gateway runs in, for its derived SPIFFE ID")
+	fs.StringVar(&f.serviceAccount, "spicedb-service-account", e.str("spicedb-service-account", "cracha-spicedb"), "the SpiceDB gateway's service account, for its derived SPIFFE ID")
 	fs.DurationVar(&f.timeout, "spicedb-timeout", e.duration("spicedb-timeout", 10*time.Second), "deadline of one SpiceDB call")
 }
 
 func (f *spicedbFlags) validate() error {
-	if f.endpoint == "" || f.serverID == "" {
-		return errors.New("--spicedb-endpoint and --spicedb-spiffe-id are required")
+	if f.endpoint == "" {
+		return errors.New("--spicedb-endpoint is required")
+	}
+	if f.serverID == "" {
+		if f.namespace == "" || f.serviceAccount == "" {
+			return errors.New("--spicedb-spiffe-id, or --namespace and --spicedb-service-account to derive it, are required")
+		}
+		return nil
 	}
 	id, err := spiffeid.FromString(f.serverID)
 	if err != nil {
@@ -65,6 +77,19 @@ func (f *spicedbFlags) validate() error {
 	}
 	f.id = id
 	return nil
+}
+
+// resolve is the gateway's SPIFFE ID: --spicedb-spiffe-id, or derived in
+// the trust domain of cracha-access's own SVID.
+func (f *spicedbFlags) resolve(td spiffeid.TrustDomain) (spiffeid.ID, error) {
+	if !f.id.IsZero() {
+		return f.id, nil
+	}
+	id, err := spiffeid.FromSegments(td, "ns", f.namespace, "sa", f.serviceAccount)
+	if err != nil {
+		return spiffeid.ID{}, fmt.Errorf("the SpiceDB gateway's SPIFFE ID in namespace %q: %w", f.namespace, err)
+	}
+	return id, nil
 }
 
 // serveConfig is the server's configuration.

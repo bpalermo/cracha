@@ -44,7 +44,15 @@ func newLogger(level string) (*slog.Logger, error) {
 // with cracha-access's own SVID, the gateway verified by its SPIFFE ID
 // (design 6.9). The connection is lazy.
 func dialSpiceDB(f spicedbFlags, src *workloadapi.X509Source) (*authzed.Client, error) {
-	creds := grpccredentials.MTLSClientCredentials(src, src, tlsconfig.AuthorizeID(f.id))
+	own, err := src.GetX509SVID()
+	if err != nil {
+		return nil, fmt.Errorf("own X.509-SVID: %w", err)
+	}
+	server, err := f.resolve(own.ID.TrustDomain())
+	if err != nil {
+		return nil, err
+	}
+	creds := grpccredentials.MTLSClientCredentials(src, src, tlsconfig.AuthorizeID(server))
 	c, err := authzed.NewClient(f.endpoint, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		return nil, fmt.Errorf("spicedb: dial %s: %w", f.endpoint, err)
@@ -58,7 +66,7 @@ func runServe(ctx context.Context, cfg serveConfig) error {
 		return err
 	}
 	slog.SetDefault(log)
-	log.Info("starting", "version", version.Version, "listen", cfg.listen, "spicedb", cfg.spicedb.endpoint, "spicedb_spiffe_id", cfg.spicedb.serverID,
+	log.Info("starting", "version", version.Version, "listen", cfg.listen, "spicedb", cfg.spicedb.endpoint,
 		"bundle_source", cfg.bundleSource, "access_analyzer", cfg.accessAnalyzer, "break_glass_max", cfg.breakGlassMax, "pending_ttl", cfg.pendingTTL)
 	probes := &probes{}
 	health := &http.Server{Addr: cfg.healthListen, Handler: probes, ReadHeaderTimeout: 10 * time.Second}

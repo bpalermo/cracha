@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+
 	"github.com/bpalermo/cracha/access/internal/api"
 )
 
@@ -56,6 +58,18 @@ func TestParseServe(t *testing.T) {
 	}
 	if _, err := parseServe(nil, noEnv, &bytes.Buffer{}); err == nil {
 		t.Error("no SpiceDB accepted")
+	}
+	derived := []string{"--spicedb-endpoint", "s:1", "--namespace", "cracha", "--bundle-source", "local:/b", "--bundle-verify-key", "/k"}
+	c, err = parseServe(derived, noEnv, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	td := spiffeid.RequireTrustDomainFromString("example.org")
+	if id, err := c.spicedb.resolve(td); err != nil || id.String() != "spiffe://example.org/ns/cracha/sa/cracha-spicedb" {
+		t.Errorf("derived gateway ID = %v, %v", id, err)
+	}
+	if _, err := parseServe(append(derived, "--spicedb-service-account", ""), noEnv, &bytes.Buffer{}); err == nil {
+		t.Error("no way to name the gateway accepted")
 	}
 }
 
