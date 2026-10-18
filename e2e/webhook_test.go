@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // What the webhook injects for enrolment in init mode (docs/design.md,
@@ -411,4 +412,78 @@ func deleteNamespace(ctx context.Context, name string, wait bool) error {
 		}
 		return fmt.Errorf("namespace %s still terminating", name)
 	})
+}
+
+// The webhook's Deployment, as e2e/run.sh installs it.
+const webhookDeployment = "cracha-webhook"
+
+// restartWebhook rolls the webhook's Deployment the way kubectl rollout
+// restart does (a new restartedAt annotation on the pod template) and
+// waits for what kubectl rollout status waits for: the new template on
+// every replica, every replica available and no old one left (the old
+// pod may still be draining: it is terminating, which the status does
+// not count).
+func restartWebhook(ctx context.Context, t *testing.T) {
+	t.Helper()
+	deployments := client.AppsV1().Deployments(systemNamespace)
+	patch := fmt.Sprintf(`{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":%q}}}}}`, time.Now().Format(time.RFC3339))
+	if _, err := deployments.Patch(ctx, webhookDeployment, types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{}); err != nil {
+		t.Fatalf("restarting the webhook: %v", err)
+	}
+	started := time.Now()
+	err := eventually(ctx, func() error {
+		d, err := deployments.Get(ctx, webhookDeployment, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		s, want := d.Status, int32(1)
+		if d.Spec.Replicas != nil {
+			want = *d.Spec.Replicas
+		}
+		switch {
+		case s.ObservedGeneration < d.Generation:
+			return fmt.Errorf("generation %d not observed yet (%d)", d.Generation, s.ObservedGeneration)
+		case s.UpdatedReplicas < want:
+			return fmt.Errorf("%d of %d replicas updated", s.UpdatedReplicas, want)
+		case s.Replicas > s.UpdatedReplicas:
+			return fmt.Errorf("%d old replicas pending termination", s.Replicas-s.UpdatedReplicas)
+		case s.AvailableReplicas < s.UpdatedReplicas:
+			return fmt.Errorf("%d of %d updated replicas available", s.AvailableReplicas, s.UpdatedReplicas)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("the webhook did not roll out: %v", err)
+	}
+	t.Logf("the webhook rolled out in %s", time.Since(started).Round(time.Millisecond))
+}
+
+// A rollout of the webhook loses no pod (design 7.5): the new pod is
+// Ready before the old one is told to stop, and the old one drains,
+// reporting not ready and closing the apiserver's connections to it,
+// before it goes. So once the rollout is through, every create of the
+// next 15 s, as fast as the apiserver takes them, is admitted at the
+// first attempt: none hangs on a connection to the pod that went until
+// the apiserver's timeout fails it closed.
+func TestWebhookRolloutLosesNoPod(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	restartWebhook(ctx, t)
+
+	pods := client.CoreV1().Pods(testNamespace)
+	grace := int64(0)
+	started := time.Now()
+	n := 0
+	for ; time.Since(started) < 15*time.Second; n++ {
+		name := fmt.Sprintf("rollout-%d", n)
+		at := time.Since(started).Round(time.Millisecond)
+		created, err := createPod(ctx, sleeper(name, "default"))
+		if err != nil {
+			t.Fatalf("create %d (%s), %s after the rollout, failed at the first attempt: %v", n, name, at, err)
+		}
+		if err := pods.Delete(ctx, created.Name, metav1.DeleteOptions{GracePeriodSeconds: &grace}); err != nil {
+			t.Fatalf("deleting pod %s: %v", name, err)
+		}
+	}
+	t.Logf("%d pods created in the 15 s after the rollout, every one at the first attempt", n)
 }

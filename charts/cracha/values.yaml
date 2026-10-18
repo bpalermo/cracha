@@ -400,6 +400,17 @@ webhook:
   # How long the apiserver waits for an answer before failing the pod.
   timeoutSeconds: 10
 
+  # Stopping (design 7.5). Told to stop, a webhook pod reports not ready at
+  # once, keeps answering for `drain` while the apiserver stops sending to
+  # it, then shuts down, waiting up to `shutdownTimeout` for the admissions
+  # in flight; the pod's termination grace period is the two plus a margin.
+  # A rollout brings a new pod up and keeps it Ready for `minReadySeconds`
+  # before the old one is told to stop, so no admission is lost to a
+  # pod that is gone. Durations are whole seconds (5s, 1m).
+  drain: 5s
+  shutdownTimeout: 10s
+  minReadySeconds: 5
+
   # Namespaces the webhook never sees, besides the release's own namespace,
   # which is always excluded: a pod of the webhook's own namespace must not
   # depend on the webhook to start, and the identity issuer's agent, which

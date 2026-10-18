@@ -11,6 +11,10 @@
 // its X.509-SVID source (go-spiffe's tlsconfig.TLSServerConfig, design
 // 7.5), which serves the current SVID to every handshake and so follows the
 // Workload API's rotation. The server only insists on TLS 1.2 or later.
+//
+// Told to stop, the server drains before it shuts down (Serve): readiness
+// goes false at once, the requests of the next Drain are still answered,
+// each with Connection: close, and only then is the listener closed.
 package server
 
 import (
@@ -24,6 +28,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -45,11 +50,24 @@ type Config struct {
 	// DefaultMaxRequestBytes.
 	MaxRequestBytes int64
 	// Ready, when set, is consulted by /readyz: an error makes the server
-	// report not ready with the error's text.
+	// report not ready with the error's text. While the server drains,
+	// /readyz reports not ready without consulting it.
 	Ready func(ctx context.Context) error
-	// ShutdownTimeout bounds the drain on shutdown. Zero means
-	// DefaultShutdownTimeout.
+	// Drain is how long the server keeps serving after its context is done,
+	// reporting not ready and asking every client to close its connection
+	// after the response, before it shuts down: the time the endpoints
+	// controller and kube-proxy take to stop sending it new connections once
+	// the pod is not ready, so that no apiserver is left with a connection
+	// to a webhook that is gone. Zero means no drain.
+	Drain time.Duration
+	// ShutdownTimeout bounds how long shutdown waits for the requests in
+	// flight after the drain. Zero means DefaultShutdownTimeout.
 	ShutdownTimeout time.Duration
+	// IdleTimeout is how long a keep-alive connection may sit idle before
+	// the server closes it. It is kept under Drain, so that every idle
+	// connection the apiserver holds to a draining webhook is closed by the
+	// webhook, gracefully, before it stops. Zero means DefaultIdleTimeout.
+	IdleTimeout time.Duration
 	// Logger receives one record per admission. Nil means slog.Default().
 	Logger *slog.Logger
 }
@@ -60,6 +78,11 @@ const (
 	// on a pod, which an AdmissionReview carries once (twice on UPDATE).
 	DefaultMaxRequestBytes = 8 << 20
 	DefaultShutdownTimeout = 10 * time.Second
+	// DefaultIdleTimeout is under the binary's default drain of 5s: an
+	// apiserver's idle connection is closed, and reopened to another
+	// webhook, before the draining one stops. HTTP/2 connections get a
+	// GOAWAY first.
+	DefaultIdleTimeout = 3 * time.Second
 )
 
 const admissionReviewAPIVersion = "admission.k8s.io/v1"
@@ -71,6 +94,10 @@ type Server struct {
 	log      *slog.Logger
 	tls      *tls.Config
 	handler  http.Handler
+	// draining is set when the context Serve was given ends, and never
+	// cleared: /readyz then answers 503 and every response asks the
+	// client to close the connection.
+	draining atomic.Bool
 }
 
 // New validates the configuration and returns the server.
@@ -90,6 +117,12 @@ func New(cfg Config, admitter Admitter) (*Server, error) {
 	if cfg.ShutdownTimeout <= 0 {
 		cfg.ShutdownTimeout = DefaultShutdownTimeout
 	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = DefaultIdleTimeout
+	}
+	if cfg.Drain < 0 {
+		cfg.Drain = 0
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -102,9 +135,22 @@ func New(cfg Config, admitter Admitter) (*Server, error) {
 	mux.HandleFunc("/mutate", s.handleMutate)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
-	s.handler = mux
+	s.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// While draining, every response asks the client to open its next
+		// connection elsewhere: a plain close on HTTP/1.1, a GOAWAY on
+		// HTTP/2 (which is what the apiserver speaks).
+		if s.draining.Load() {
+			w.Header().Set("Connection", "close")
+		}
+		mux.ServeHTTP(w, r)
+	})
 	return s, nil
 }
+
+// Draining reports whether the server has been told to stop: it is
+// reporting not ready and closing the connections of the requests it still
+// answers.
+func (s *Server) Draining() bool { return s.draining.Load() }
 
 // Handler is the server's routes, for tests.
 func (s *Server) Handler() http.Handler { return s.handler }
@@ -118,9 +164,25 @@ func (s *Server) Run(ctx context.Context) error {
 	return s.Serve(ctx, ln)
 }
 
-// Serve serves TLS on ln until ctx is done, then drains for at most
-// ShutdownTimeout. It returns nil after a clean shutdown.
+// Serve serves TLS on ln until ctx is done. It then drains: readiness goes
+// false at once, requests are answered as before for Drain, each with
+// Connection: close, and only then is the listener closed and the
+// requests still in flight waited for, up to ShutdownTimeout. It returns
+// nil after a clean shutdown.
+//
+// The order matters to a rollout (design 7.5): the pod is told to stop and
+// taken out of the Service's endpoints at the same time, and an apiserver
+// that has not seen the removal yet keeps sending to the pod. A webhook
+// that stopped at once would leave such an apiserver holding a connection
+// to nothing, which hangs until the apiserver's own timeout fails the pod
+// closed. The drain keeps answering while the removal propagates, and
+// closes every connection of its own accord before it goes.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	// The requests' context ends when the server has stopped, not when ctx
+	// does: an admission in flight at that moment, and the ones of the
+	// drain, are still looked up and answered.
+	requests, stopRequests := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopRequests()
 	srv := &http.Server{
 		Addr:      s.cfg.Listen,
 		Handler:   s.handler,
@@ -130,9 +192,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       2 * time.Minute,
+		IdleTimeout:       s.cfg.IdleTimeout,
 		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
-		BaseContext:       func(net.Listener) context.Context { return ctx },
+		BaseContext:       func(net.Listener) context.Context { return requests },
 	}
 
 	s.log.Info("serving", "listen", ln.Addr().String())
@@ -144,6 +206,14 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	case err := <-served:
 		return fmt.Errorf("serve: %w", err)
 	case <-ctx.Done():
+	}
+
+	s.draining.Store(true)
+	s.log.Info("draining: not ready, still serving", "drain", s.cfg.Drain)
+	select {
+	case err := <-served:
+		return fmt.Errorf("serve: %w", err)
+	case <-time.After(s.cfg.Drain):
 	}
 
 	s.log.Info("shutting down", "timeout", s.cfg.ShutdownTimeout)
@@ -171,6 +241,11 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if s.draining.Load() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintln(w, "not ready: draining")
+		return
+	}
 	if s.cfg.Ready != nil {
 		if err := s.cfg.Ready(r.Context()); err != nil {
 			s.log.Warn("not ready", "error", err)

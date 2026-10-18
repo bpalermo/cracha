@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
@@ -332,5 +333,148 @@ func TestPodName(t *testing.T) {
 		if got := podName(&tc.req); got != tc.want {
 			t.Errorf("podName = %q, want %q", got, tc.want)
 		}
+	}
+}
+
+// gate is an echoAdmitter that, while hold is set, reports entering an
+// admission and waits to be released, and that records an admission whose
+// context was already cancelled.
+type gate struct {
+	echoAdmitter
+	hold      atomic.Bool
+	entered   chan struct{}
+	release   chan struct{}
+	cancelled atomic.Bool
+}
+
+func (g *gate) Admit(ctx context.Context, req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
+	if ctx.Err() != nil {
+		g.cancelled.Store(true)
+	}
+	if g.hold.Load() {
+		g.entered <- struct{}{}
+		<-g.release
+	}
+	return g.echoAdmitter.Admit(ctx, req)
+}
+
+// TestDrain holds the server to the order a rollout relies on (design
+// 7.5): told to stop, it reports not ready before anything else, keeps
+// answering for Drain with Connection: close and a live request context,
+// and shuts down only once the drain is over, waiting for a request in
+// flight.
+func TestDrain(t *testing.T) {
+	const drain = 750 * time.Millisecond
+	cert, parsed := selfSigned(t, 1)
+	admitter := &gate{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	s := newServer(t, Config{
+		TLS:             &tls.Config{Certificates: []tls.Certificate{cert}},
+		Drain:           drain,
+		ShutdownTimeout: 5 * time.Second,
+		Ready:           func(context.Context) error { return nil },
+	}, admitter)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- s.Serve(ctx, ln) }()
+	url := "https://" + ln.Addr().String()
+	pool := x509.NewCertPool()
+	pool.AddCert(parsed)
+	client := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}},
+	}
+	get := func(path string) (code int, body string, closed bool) {
+		t.Helper()
+		resp, err := client.Get(url + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b), resp.Close
+	}
+
+	if code, _, closed := get("/readyz"); code != http.StatusOK || closed {
+		t.Fatalf("/readyz while serving: %d, connection closed %t", code, closed)
+	}
+
+	told := time.Now()
+	cancel()
+
+	// Readiness goes false first, while Serve is still going.
+	for code, body, _ := get("/readyz"); code != http.StatusServiceUnavailable; code, body, _ = get("/readyz") {
+		if time.Since(told) > drain/2 {
+			t.Fatalf("/readyz %s after the stop: %d %s, want 503 draining", time.Since(told), code, body)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, body, _ := get("/readyz"); !strings.Contains(body, "draining") {
+		t.Errorf("/readyz while draining: %q, want draining", body)
+	}
+	select {
+	case err := <-served:
+		t.Fatalf("Serve returned (%v) before the drain", err)
+	default:
+	}
+
+	// An admission during the drain is answered, with Connection: close
+	// and a request context that is still live.
+	resp, err := client.Post(url+"/mutate", "application/json", bytes.NewReader(review(t, "uid-drain", "web-drain")))
+	if err != nil {
+		t.Fatalf("POST during the drain: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("POST during the drain: %d", resp.StatusCode)
+	}
+	// Connection: close, which the client reads into Close and strips.
+	if !resp.Close {
+		t.Error("the response of the drain does not close the connection")
+	}
+	if admitter.cancelled.Load() {
+		t.Error("the admission of the drain ran with a cancelled context")
+	}
+
+	// A request in flight when the drain ends is waited for.
+	admitter.hold.Store(true)
+	inFlight := make(chan error, 1)
+	go func() {
+		resp, err := client.Post(url+"/mutate", "application/json", bytes.NewReader(review(t, "uid-held", "web-held")))
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				err = fmt.Errorf("status %d", resp.StatusCode)
+			}
+		}
+		inFlight <- err
+	}()
+	<-admitter.entered
+	select {
+	case err := <-served:
+		t.Fatalf("Serve returned (%v) with an admission in flight", err)
+	case <-time.After(time.Until(told.Add(drain + 200*time.Millisecond))):
+	}
+	close(admitter.release)
+	if err := <-inFlight; err != nil {
+		t.Errorf("the admission in flight at shutdown: %v", err)
+	}
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("Serve: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve did not return after the request in flight was answered")
+	}
+	if took := time.Since(told); took < drain {
+		t.Errorf("Serve returned %s after the stop, before the %s drain", took, drain)
+	}
+	if !s.Draining() {
+		t.Error("Draining is false after the shutdown")
 	}
 }

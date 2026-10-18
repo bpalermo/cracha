@@ -47,6 +47,8 @@ type options struct {
 	saCacheTTL        time.Duration
 	kubeconfig        string
 	maxRequestBytes   int64
+	drain             time.Duration
+	shutdownTimeout   time.Duration
 	logLevel          slog.Level
 }
 
@@ -74,6 +76,8 @@ func main() {
 	flag.DurationVar(&opts.saCacheTTL, "sa-cache-ttl", 30*time.Second, "how long a ServiceAccount lookup is remembered; 0 disables the cache")
 	flag.StringVar(&opts.kubeconfig, "kubeconfig", "", "kubeconfig to reach the apiserver with; the default is the in-cluster configuration")
 	flag.Int64Var(&opts.maxRequestBytes, "max-request-bytes", server.DefaultMaxRequestBytes, "largest admission request accepted")
+	flag.DurationVar(&opts.drain, "drain", 5*time.Second, "how long the webhook keeps answering admissions after it is told to stop, reporting not ready, before it shuts down: the time the apiserver takes to stop sending to it")
+	flag.DurationVar(&opts.shutdownTimeout, "shutdown-timeout", server.DefaultShutdownTimeout, "how long the shutdown after the drain waits for the admissions in flight")
 	flag.Parse()
 
 	if *showVersion {
@@ -126,10 +130,16 @@ func run(ctx context.Context, opts options, logger *slog.Logger) error {
 		return err
 	}
 
+	// What the admissions rely on runs until the server has stopped, not
+	// until ctx is done: told to stop, the server drains, and the
+	// admissions of the drain still need the overrides and the bundle.
+	background, stopBackground := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopBackground()
+
 	// The per-namespace region overrides, watched for as long as the
 	// webhook runs. Until the first list the hook serves the default.
 	regions := nsregion.New(client)
-	go regions.Run(ctx)
+	go regions.Run(background)
 
 	// The caBundle of the webhook's own configuration, kept at the trust
 	// bundle for as long as the webhook runs.
@@ -137,7 +147,7 @@ func run(ctx context.Context, opts options, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	go publisher.Run(ctx)
+	go publisher.Run(background)
 
 	mutator, err := mutate.New(opts.mutate, sacache.New(client, opts.saCacheTTL), mutate.WithRegions(regions))
 	if err != nil {
@@ -149,6 +159,8 @@ func run(ctx context.Context, opts options, logger *slog.Logger) error {
 		TLS:             tlsconfig.TLSServerConfig(source),
 		MaxRequestBytes: opts.maxRequestBytes,
 		Ready:           ready(client, regions, source, publisher),
+		Drain:           opts.drain,
+		ShutdownTimeout: opts.shutdownTimeout,
 		Logger:          logger,
 	}, mutator)
 	if err != nil {
@@ -161,7 +173,10 @@ func run(ctx context.Context, opts options, logger *slog.Logger) error {
 		"conflicting_env", cfg.ConflictingEnv.String(), "enrol", cfg.Enrol.String(),
 		"agent_image", cfg.AgentImage, "enrol_port", cfg.EnrolPort, "enrol_timeout", cfg.EnrolTimeout,
 		"enrol_cpu", cfg.EnrolCPU.String(), "enrol_memory", cfg.EnrolMemory.String(),
-		"webhook_config", opts.webhookConfigName, "sa_cache_ttl", opts.saCacheTTL)
+		"webhook_config", opts.webhookConfigName, "sa_cache_ttl", opts.saCacheTTL,
+		"drain", opts.drain, "shutdown_timeout", opts.shutdownTimeout)
+	// Run returns once the server has drained and shut down (design 7.5);
+	// ctx ending is what starts the drain.
 	return srv.Run(ctx)
 }
 

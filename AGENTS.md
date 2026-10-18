@@ -222,7 +222,10 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   `internal/mutate/testdata/*.golden.json` (refresh with
   `--test_env=UPDATE_GOLDEN=1`). `internal/server` serves HTTPS with the
   `*tls.Config` it is given, which `main.go` builds from the webhook's
-  X.509-SVID (`--workload-api-socket`); `internal/cabundle` keeps the
+  X.509-SVID (`--workload-api-socket`), and drains when told to stop
+  (readiness false, then `--drain` of answering with `Connection: close`,
+  then the shutdown; `main.go` keeps the informers and the Workload API
+  source alive until the server has returned); `internal/cabundle` keeps the
   `caBundle` of the chart's `MutatingWebhookConfiguration`
   (`--webhook-config-name`) at the trust bundle of the webhook's trust
   domain, on start, on every Workload API update and on a resync.
@@ -386,6 +389,19 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   `agent.enrolPort`, `agent.enrolTimeout` and `agent.enrolResources`;
   `render_test.go` asserts the
   configuration and the Deployment's arguments in both modes.
+- The webhook's rollout loses no admission (design 7.5): `webhook.drain`
+  (`--drain`, default `5s`) is how long a pod told to stop keeps
+  answering, not ready, before it shuts down, and `webhook.shutdownTimeout`
+  (`--shutdown-timeout`, `10s`) how long the shutdown then waits for the
+  admissions in flight; the Deployment's `terminationGracePeriodSeconds`
+  is the two plus 5 s of margin (`cracha.seconds` of `_helpers.tpl` turns
+  the durations, whole seconds only, into the number), its strategy is
+  `RollingUpdate` with `maxUnavailable: 0` and `maxSurge: 1`, and
+  `webhook.minReadySeconds` (5) keeps the new pod Ready that long before
+  the old one is told to stop. The binary drains; there is no `preStop`
+  hook. The e2e's `TestWebhookRolloutLosesNoPod` restarts the Deployment
+  and requires every create of the next 15 s to be admitted at the first
+  attempt.
 - The chart is published to `chart_registry_url("cracha")` of
   `bazel/registry.bzl` by the publish workflow (below).
 

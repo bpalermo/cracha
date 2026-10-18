@@ -15,6 +15,15 @@ metadata:
     app.kubernetes.io/component: webhook
 spec:
   replicas: {{ .Values.webhook.replicas }}
+  # A rollout loses no admission (design 7.5): the new pod is Ready, and
+  # has been for minReadySeconds (time for the apiserver to see its
+  # endpoint), before the old one is told to stop and drains.
+  minReadySeconds: {{ int .Values.webhook.minReadySeconds }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       {{- include "cracha.selectorLabels" $selector | nindent 6 }}
@@ -32,6 +41,10 @@ spec:
       priorityClassName: {{ . }}
       {{- end }}
       serviceAccountName: {{ include "cracha.name" . }}-webhook
+      # The drain, the shutdown's wait for the admissions in flight and a
+      # margin for the process to exit: the binary does the draining, no
+      # preStop hook is involved.
+      terminationGracePeriodSeconds: {{ add (include "cracha.seconds" .Values.webhook.drain | int) (include "cracha.seconds" .Values.webhook.shutdownTimeout | int) 5 }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -65,6 +78,8 @@ spec:
             - --default-region={{ required "webhook.defaultRegion is required: AWS_REGION for the pods that do not set their own" .Values.webhook.defaultRegion }}
             - --conflicting-env={{ .Values.webhook.conflictingEnv }}
             - --sa-cache-ttl={{ .Values.webhook.saCacheTTL }}
+            - --drain={{ .Values.webhook.drain }}
+            - --shutdown-timeout={{ .Values.webhook.shutdownTimeout }}
             - --log-level={{ include "cracha.logLevel" .Values.webhook.logLevel }}
           ports:
             - name: https
