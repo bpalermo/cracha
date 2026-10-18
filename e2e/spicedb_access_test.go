@@ -171,6 +171,36 @@ func seedSpiceDB() error {
 	if err != nil {
 		return err
 	}
-	_, err = write(ctx, v1.RelationshipUpdate_OPERATION_DELETE, clientSuspension)
-	return err
+	if _, err = write(ctx, v1.RelationshipUpdate_OPERATION_DELETE, clientSuspension); err != nil {
+		return err
+	}
+	return awaitVisible(ctx)
+}
+
+// awaitVisible waits until the client's membership is visible at the
+// consistency the broker asks with, minimize_latency, which SpiceDB serves
+// from a revision up to its quantization interval (five seconds by default)
+// old: the first tests must not see the store as it was before the write.
+func awaitVisible(ctx context.Context) error {
+	c, err := dialAs(identityBroker)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	for {
+		resp, err := c.CheckPermission(ctx, &v1.CheckPermissionRequest{
+			Consistency: &v1.Consistency{Requirement: &v1.Consistency_MinimizeLatency{MinimizeLatency: true}},
+			Resource:    &v1.ObjectReference{ObjectType: schema.TypeGrant, ObjectId: clientAssignment.GetResource().GetObjectId()},
+			Permission:  schema.PermissionAssume,
+			Subject:     &v1.SubjectReference{Object: &v1.ObjectReference{ObjectType: schema.TypeWorkload, ObjectId: workloadID(assignedSA)}},
+		})
+		if err == nil && resp.GetPermissionship() == v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("the suite's relationships are not visible at minimize_latency: %v (last: %v)", ctx.Err(), err)
+		case <-time.After(time.Second):
+		}
+	}
 }
