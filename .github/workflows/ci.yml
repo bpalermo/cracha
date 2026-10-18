@@ -276,9 +276,22 @@ jobs:
           repository-cache: true
           cache-save: ${{ github.ref == 'refs/heads/main' }}
 
-      # e2e/run.sh uses a cluster of this name if one exists.
+      # The node image is the one e2e/run.sh creates a cluster from, read
+      # from the same file (e2e/kind-node-image, which says how to bump it),
+      # so the Kubernetes CI tests on is the one the suite is developed against.
+      - name: the kind node image
+        id: kind
+        run: echo "node_image=$(grep -v '^#' e2e/kind-node-image)" >> "${GITHUB_OUTPUT}"
+
+      # e2e/run.sh uses a cluster of this name if one exists. kind is pinned
+      # to the release whose default node image e2e/kind-node-image is (the
+      # action would otherwise take its own default, a newer kind and a newer
+      # Kubernetes than the suite is developed against); bump the two
+      # together.
       - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
+          version: v0.31.0
+          node_image: ${{ steps.kind.outputs.node_image }}
           cluster_name: cracha-e2e
 
       - name: e2e/run.sh

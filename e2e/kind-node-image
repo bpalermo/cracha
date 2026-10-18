@@ -1,0 +1,15 @@
+# The kind node image the end-to-end suite runs on: the one reference both
+# e2e/run.sh (kind create cluster --image) and the e2e job of ci.yml
+# (helm/kind-action's node_image) read, so the two cannot drift. One
+# non-comment line, by tag AND digest: kind's release notes say the digest is
+# what guarantees an image built for that kind release.
+#
+# Source: the default node image of kind v0.31.0, the kind version ci.yml
+# pins, from its release notes
+# (https://github.com/kubernetes-sigs/kind/releases/tag/v0.31.0), for the
+# Kubernetes minor the suite is developed against. To bump it, take the new
+# kind release's image for the wanted minor from its notes, write it here and
+# move the `version` of helm/kind-action in ci.yml to that kind release; a
+# kept cluster (E2E_KEEP_CLUSTER=1) made from the old image is reused as is
+# until it is deleted.
+kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f
