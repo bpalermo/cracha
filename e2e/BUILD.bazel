@@ -14,10 +14,11 @@ go_test(
     ],
     # What e2e/run.sh deploys beside the chart and runs: the manifests, the
     # values files, the grant sources it compiles into the bundle and, in
-    # spicedb mode, reconciles into SpiceDB, spire.sh, run.sh itself and
-    # the reconciler. They are its data so that a change to any of them
-    # impacts the test in the Bazel graph, which is how CI decides whether
-    # to run the kind job (bazel/ci-impacted-targets.sh). The test reads
+    # spicedb mode, reconciles into SpiceDB, spire.sh, run.sh itself, the
+    # kind node image it creates the cluster from and the reconciler. They
+    # are its data so that a change to any of them impacts the test in the
+    # Bazel graph, which is how CI decides whether to run the kind job
+    # (bazel/ci-impacted-targets.sh). The test reads
     # the grant sources and values.yaml (assignments_test.go) and runs the
     # reconciler (spicedb_test.go); the rest it never opens.
     data = glob([
@@ -25,7 +26,10 @@ go_test(
         "manifests/*",
         "*.sh",
         "*.yaml",
-    ]) + ["//reconciler"],
+    ]) + [
+        "kind-node-image",
+        "//reconciler",
+    ],
     # Needs a cluster: excluded from `bazel test //...` by the e2e tag (see
     # .bazelrc) and run unsandboxed by e2e/run.sh, so it can read the
     # kubeconfig KUBECONFIG names.

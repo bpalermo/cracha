@@ -18,7 +18,8 @@
 # mode, the port-forward and the key from the environment (.bazelrc's
 # test:e2e); those that need SpiceDB skip in static mode.
 #
-# Needs docker, kind, kubectl and openssl on PATH; helm, grantc and the
+# Needs docker, kind, kubectl and openssl on PATH (the cluster is created
+# from the node image in e2e/kind-node-image); helm, grantc and the
 # reconciler come from Bazel (@helm//:helm, the version MODULE.bazel pins,
 # //grantc and //reconciler). Extra arguments are passed to every bazel
 # invocation, e.g. --config=ci.
@@ -63,8 +64,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The node image is e2e/kind-node-image, the one ci.yml gives
+# helm/kind-action too. An existing cluster (one kept with E2E_KEEP_CLUSTER=1,
+# or the one CI creates) is reused as it is, whatever image it was made from.
 if ! kind get clusters | grep -qx "${cluster}"; then
-	kind create cluster --name "${cluster}" --wait 120s
+	node_image="$(grep -v '^#' e2e/kind-node-image)"
+	kind create cluster --name "${cluster}" --image "${node_image}" --wait 120s
 	created=1
 fi
 

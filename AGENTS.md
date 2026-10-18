@@ -52,9 +52,15 @@ relationships of `e2e/grants`, and installs the chart with
 `e2e/values-spicedb.yaml` on top. The tests that need SpiceDB (revocation
 through Watch, suspension, the cache's mode) skip in static mode; the rest
 run in both, and one of them checks that the static document and the grant
-tree assign the same things. CI runs the script once per backend. Every
-change that adds user-visible behaviour extends the suite, and a change to
-how Crachá is deployed goes in the chart, not in a manifest.
+tree assign the same things. CI runs the script once per backend. The
+cluster is created from the node image in `e2e/kind-node-image`, by tag and
+digest; CI's `e2e` job gives `helm/kind-action` the same file and pins the
+kind release it is the default of. To move to another Kubernetes, write the
+image for that minor from the kind release notes into the file and the kind
+release into `ci.yml`; a kept cluster made from the old image is reused as
+is until it is deleted. Every change that adds user-visible behaviour
+extends the suite, and a change to how Crachá is deployed goes in the
+chart, not in a manifest.
 
 Bazel is the only build. Never run the host `go` tool: not `go mod tidy`, not
 `go get`, not `go test`. Change a Go dependency through rules_go's SDK:
