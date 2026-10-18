@@ -6,6 +6,7 @@
 {{- $bundleKey := include "cracha.bundleKey" . -}}
 {{- $bundleDir := include "cracha.bundleDir" . -}}
 {{- $backend := include "cracha.authzBackend" . -}}
+{{- $assignments := include "cracha.assignmentsSource" . -}}
 {{- $spicedb := .Values.broker.authz.spicedb -}}
 {{- with .Values.broker.agentSpiffeID -}}
 {{- if not (hasPrefix "spiffe://" .) }}{{ fail (printf "broker.agentSpiffeID must be a SPIFFE ID, not %q" .) }}{{ end -}}
@@ -70,7 +71,10 @@ spec:
             {{- end }}
             - --authz-backend={{ $backend }}
             {{- if eq $backend "static" }}
+            - --assignments-source={{ $assignments }}
+            {{- if eq $assignments "file" }}
             - --assignments=/etc/cracha/assignments/{{ .Values.broker.assignments.key }}
+            {{- end }}
             {{- else }}
             - --spicedb-endpoint={{ $spicedb.endpoint }}
             - --spicedb-token-file=/etc/cracha/spicedb/token/{{ $spicedb.tokenSecret.key }}
@@ -153,11 +157,11 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
-            {{- if eq $backend "static" }}
+            {{- if eq $assignments "file" }}
             - name: assignments
               mountPath: /etc/cracha/assignments
               readOnly: true
-            {{- else }}
+            {{- else if eq $backend "spicedb" }}
             - name: spicedb-token
               mountPath: /etc/cracha/spicedb/token
               readOnly: true
@@ -203,11 +207,11 @@ spec:
             matchLabels:
               {{- include "cracha.selectorLabels" $selector | nindent 14 }}
       volumes:
-        {{- if eq $backend "static" }}
+        {{- if eq $assignments "file" }}
         - name: assignments
           configMap:
             name: {{ .Values.broker.assignments.existingConfigMap | default (printf "%s-assignments" (include "cracha.name" .)) }}
-        {{- else }}
+        {{- else if eq $backend "spicedb" }}
         # SpiceDB's preshared key, from the Secret the install keeps, read
         # by the broker as a file.
         - name: spicedb-token

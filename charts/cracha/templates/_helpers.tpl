@@ -121,6 +121,42 @@ Secret holding its preshared key, and takes at most one of a CA and insecure.
 {{- end -}}
 
 {{/*
+Where the static backend's assignments come from, from
+broker.assignments.source, checked: "file" (the document or an existing
+ConfigMap, mounted and read once) or "published" (the assignments of the
+version broker.bundle.source serves, verified and swapped with its bundle;
+nothing is mounted). "" for the spicedb backend, which takes only the default.
+*/}}
+{{- define "cracha.assignmentsSource" -}}
+{{- $source := .Values.broker.assignments.source | default "file" -}}
+{{- if not (has $source (list "file" "published")) -}}
+{{- fail (printf "broker.assignments.source must be file or published, not %q" $source) -}}
+{{- end -}}
+{{- if eq (include "cracha.authzBackend" .) "spicedb" -}}
+{{- if eq $source "published" }}{{ fail "broker.assignments.source published needs broker.authz.backend static" }}{{ end -}}
+{{- else -}}
+{{- if and (eq $source "published") (not .Values.broker.bundle.source) -}}
+{{- fail "broker.assignments.source published needs broker.bundle.source: the assignments come from the publication the bundle does" -}}
+{{- end -}}
+{{ $source }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The PEM of the bundle's verification keys (broker.bundle.verifyKey): a
+string of one or more PUBLIC KEY blocks, or a list of them, joined.
+*/}}
+{{- define "cracha.bundleVerifyKey" -}}
+{{- $k := .Values.broker.bundle.verifyKey -}}
+{{- if kindIs "slice" $k -}}
+{{- range $k }}{{ trim . }}
+{{ end -}}
+{{- else -}}
+{{ $k }}
+{{- end -}}
+{{- end -}}
+
+{{/*
 A component's Workload API volume source (<component>.workloadAPI.volume):
 the one of hostPath and csi that `type` names. Helm merges an install's
 values into the defaults, so rendering the whole map would give a volume

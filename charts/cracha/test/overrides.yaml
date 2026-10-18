@@ -52,14 +52,21 @@ broker:
   grants:
     existingConfigMap: my-grants
     key: my-grants.yaml
-  # A local bundle source with the chart-made key Secret; test/bundle-kms.yaml
-  # and test/bundle-secret.yaml render the S3 source with the other two keys.
+  # A local bundle source with the chart-made key Secret, of two keys (a
+  # rotation); test/bundle-kms.yaml and test/bundle-secret.yaml render the
+  # S3 source with the other two key sources, and
+  # test/assignments-published.yaml the keys as a list. The overrides render
+  # SpiceDB, which takes no assignments.source; that file renders published.
   bundle:
     source: local:/var/lib/cracha/bundle
     verifyKey: |
       -----BEGIN PUBLIC KEY-----
       MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0000000000000000000000000000
       0000000000000000000000000000000000000000000000000000000000000000
+      -----END PUBLIC KEY-----
+      -----BEGIN PUBLIC KEY-----
+      MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE9999999999999999999999999999
+      9999999999999999999999999999999999999999999999999999999999999999
       -----END PUBLIC KEY-----
     pollInterval: 5m
     volume:
@@ -72,6 +79,10 @@ broker:
             path: bundles/abc123/bundle.json
           - key: bundle.json.sig
             path: bundles/abc123/bundle.json.sig
+          - key: assignments.json
+            path: bundles/abc123/assignments.json
+          - key: assignments.json.sig
+            path: bundles/abc123/assignments.json.sig
   serviceAccount:
     annotations:
       eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/cracha-broker

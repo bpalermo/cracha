@@ -109,7 +109,8 @@ helm_lint_test(
 # install keeps (test/overrides.yaml renders the inline key); the SpiceDB
 # backend over plaintext (overrides renders it with a CA); the static backend
 # with an assignments ConfigMap the install keeps (the defaults render the
-# chart's own).
+# chart's own), and with its assignments from the publication (the
+# overrides render SpiceDB, which takes none).
 [
     helm_template_test(
         name = "cracha_%s_template_test" % name,
@@ -118,6 +119,7 @@ helm_lint_test(
         values = REQUIRED_VALUES + ["test/%s.yaml" % name],
     )
     for name in [
+        "assignments-published",
         "bundle-kms",
         "bundle-secret",
         "spicedb-insecure",
@@ -157,6 +159,10 @@ helm_template_test(
             "pod_labels",
             REQUIRED_VALUES + ["test/pod-labels.yaml"],
         ),
+        (
+            "published",
+            REQUIRED_VALUES + ["test/assignments-published.yaml"],
+        ),
     ]
 ]
 
@@ -165,6 +171,7 @@ go_test(
     size = "small",
     srcs = [
         "agent_test.go",
+        "assignments_test.go",
         "rbac_test.go",
         "render_test.go",
         "volumes_test.go",
@@ -174,6 +181,7 @@ go_test(
         ":rendered_defaults",
         ":rendered_overrides",
         ":rendered_pod_labels",
+        ":rendered_published",
     ],
     deps = [
         "@in_gopkg_yaml_v3//:yaml_v3",
