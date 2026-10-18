@@ -1,0 +1,28 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "cni_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/bpalermo/cracha/agent/cni",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//agent/cni/internal/plugin",
+        "//common/version",
+        "@com_github_containernetworking_cni//pkg/skel",
+        "@com_github_containernetworking_cni//pkg/version",
+    ],
+)
+
+# cracha-cni, the chained plugin (design 7.2). Not an image of its own: the
+# agent image carries it at /opt/cracha/cni/cracha-cni (//agent:image), and
+# `cracha-agent cni-install` copies it onto the node.
+go_binary(
+    name = "cni",
+    basename = "cracha-cni",
+    embed = [":cni_lib"],
+    # Pure Go and static: the runtime execs it on the host, outside any
+    # image, so it can depend on nothing of the node.
+    pure = "on",
+    static = "on",
+    visibility = ["//agent:__subpackages__"],
+)

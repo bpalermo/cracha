@@ -27,6 +27,7 @@ def go_image(
         registry = None,
         repository = None,
         user = None,
+        files = {},
         default_tag = "dev",
         platforms = DEFAULT_PLATFORMS,
         visibility = ["//visibility:public"]):
@@ -56,6 +57,9 @@ def go_image(
         of //bazel:registry.bzl, or None with registry.
       default_tag: value of the tag flag when nothing overrides it.
       user: user the container runs as; None keeps the base image's user.
+      files: other files of the layer, {path in the image: label}, such as
+        a second pure-Go binary the entrypoint installs somewhere; each gets
+        the binary's mode (0755).
       platforms: platform labels, one manifest per platform.
       visibility: visibility of the index and load targets.
     """
@@ -65,9 +69,11 @@ def go_image(
         visibility = visibility,
     )
 
+    srcs = {path: binary}
+    srcs.update(files)
     image_layer(
         name = name + "_layer",
-        srcs = {path: binary},
+        srcs = srcs,
         compress = "zstd",
         default_metadata = file_metadata(mode = "0755"),
         include_runfiles = False,
