@@ -43,7 +43,7 @@ on:
         type: string
         default: ""
       kms-key:
-        description: The KMS signing key, a key or alias ARN (publish only). The broker's broker.bundle.kmsKey must be the same string.
+        description: The KMS signing key, a key or alias ARN (publish only).
         type: string
         default: ""
       destination:
@@ -268,8 +268,10 @@ jobs:
               -o "${GRANTC_OUT}/${f}.sig" "${GRANTC_OUT}/${f}"
           done
 
-      # What the broker will do, through kms:Verify with the same key ID,
-      # before anything is written to the bucket.
+      # What the broker will do, before anything is written to the bucket:
+      # grantc fetches the key's public key (kms:GetPublicKey) and checks
+      # the signature locally, against the keyId the broker computes from
+      # its verifyKey PEM.
       - name: Verify the signatures
         if: inputs.mode == 'publish'
         run: |

@@ -41,8 +41,10 @@ private too.
 8. `grantc compile`, the bundle's version being the commit
    (`-version <sha>`). In `publish` mode compile repeats the full lint, so
    the bundle signed is the one that passed it.
-9. `publish` mode only: `grantc sign -kms-key`, `grantc verify -kms-key` (what
-   the broker will do, before anything is written), then
+9. `publish` mode only: `grantc sign -kms-key` (kms:Sign; the signature's
+   `keyId` is the sha256 of the key's public key), `grantc verify -kms-key`
+   (the key's public key from kms:GetPublicKey, checked locally, as the
+   broker will check it, before anything is written), then
    `grantc publish -s3 <destination>`, which writes
    `bundles/<version>/bundle.json`, its `.sig` and then `latest`.
 
@@ -73,6 +75,12 @@ Pin the reusable workflow by the commit SHA of a Crachá release tag, with the
 tag in a comment, and give the same release as `grantc-version`. Moving to a
 new release is changing both together. `<sha>` is
 `gh api repos/bpalermo/cracha/git/ref/tags/<tag> --jq .object.sha`.
+
+The workflow needs a `grantc` that writes the KMS key's public-key hash as
+the signature's `keyId` and verifies `-kms-key` locally after
+kms:GetPublicKey: a Crachá release that includes that change, `v0.1.0-rc.3`
+or later. Earlier releases have no `grants.yml` and no `grantc` assets
+either.
 
 `.github/workflows/check.yml`:
 
@@ -213,33 +221,49 @@ here):
   neither sign nor write.
 - **`gha-cracha-grants-publish`**, trusted with `sub`
   `repo:bpalermo/cracha-grants:ref:refs/heads/main`: the same Access
-  Analyzer actions, `kms:Sign` and `kms:Verify` on the signing key, and
+  Analyzer actions, `kms:Sign` and `kms:GetPublicKey` on the signing key,
+  and
   `s3:PutObject` on `arn:aws:s3:::cracha-grants-988966554486/grants/*`.
 - **The signing key**, alias `alias/cracha-grants-signing`
   (`arn:aws:kms:sa-east-1:988966554486:alias/cracha-grants-signing`), an
   asymmetric `ECC_NIST_P256` `SIGN_VERIFY` key. Its key policy lets only the
-  publish role `kms:Sign` and denies it to every other principal; the
-  brokers' roles may `kms:Verify`.
+  publish role `kms:Sign` and denies it to every other principal. Nothing
+  else needs the key: the brokers verify with its public key.
 - **The bucket** `cracha-grants-988966554486`, private, the bundles under
   the prefix `grants/`.
 
 ## Pointing a cluster's broker at it
 
-The chart's `broker.bundle` (see `charts/cracha/values.yaml`):
+The chart's `broker.bundle` (see `charts/cracha/values.yaml`), with the
+signing key's public key as the verification key:
 
 ```yaml
 broker:
   bundle:
     source: s3://cracha-grants-988966554486/grants
-    kmsKey: arn:aws:kms:sa-east-1:988966554486:alias/cracha-grants-signing
+    verifyKey: |
+      -----BEGIN PUBLIC KEY-----
+      ...
+      -----END PUBLIC KEY-----
     pollInterval: 60s
 ```
 
-The broker's own AWS credentials need `s3:GetObject` on
-`arn:aws:s3:::cracha-grants-988966554486/grants/*` and `kms:Verify` on the
-key. `kmsKey` must be **the same string** the workflow's `kms-key` is: the
-signature envelope carries the key ID it was signed with, and the broker
-refuses a signature by any other ID. For the same reason the broker cannot
-verify these bundles with `verifyKey` (a PEM public key is identified by its
-hash, not the ARN). Until a bundle has verified the broker is not ready
-(`/readyz`), and it keeps the last good version on any failure.
+The PEM is the KMS key's public key: the tf-palermo-dev output `cracha`, or
+
+```bash
+aws kms get-public-key --region sa-east-1 --key-id alias/cracha-grants-signing \
+  --query PublicKey --output text | base64 -d |
+  openssl pkey -pubin -inform DER -outform PEM
+```
+
+A signature's `keyId` is the sha256 of that public key, the identity the
+broker computes from `verifyKey`, so the broker verifies locally and needs
+no KMS permission at all. Its own AWS credentials need only `s3:GetObject`
+on `arn:aws:s3:::cracha-grants-988966554486/grants/*` and `s3:ListBucket`
+on the bucket for that prefix. Until a bundle has verified the broker is
+not ready (`/readyz`), and it keeps the last good version on any failure.
+
+To rotate the signing key, list both public keys in `verifyKey` (the old
+PEM and the new one, one after the other) for the overlap, switch the
+workflow's `kms-key` to the new key, and drop the old PEM once a bundle
+signed with the new key has been published and every broker serves it.
