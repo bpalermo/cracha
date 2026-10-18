@@ -88,6 +88,12 @@ type EnvelopeReport struct {
 // against an allowlist. Deny statements are not checked, since they only
 // narrow.
 func LintEnvelope(name, policy string, envelope []string) *EnvelopeReport {
+	return lintEnvelope(name, policy, envelope, nil)
+}
+
+// lintEnvelope is LintEnvelope leaving out the resources skip reports,
+// when it is set.
+func lintEnvelope(name, policy string, envelope []string, skip func(string) bool) *EnvelopeReport {
 	r := &EnvelopeReport{Grant: name}
 	statements, err := policyStatements(policy)
 	if err != nil {
@@ -104,7 +110,9 @@ func LintEnvelope(name, policy string, envelope []string) *EnvelopeReport {
 			continue
 		}
 		for _, res := range resources {
-			r.checkResource(i, res, envelope)
+			if skip == nil || !skip(res) {
+				r.checkResource(i, res, envelope)
+			}
 		}
 	}
 	return r
@@ -161,6 +169,14 @@ type Composition struct {
 	// name, or "service <name>" for a membership.
 	Sources []string
 	Grants  []string
+	// Resources are, per lookup grant, the resources its Access documents
+	// relate the subject to, which the composed policy was rendered with.
+	Resources map[string][]string
+	// Dropped are the lookup grants left out because no resource is
+	// related, as the broker leaves them out. When every grant is, the
+	// broker refuses the subject with no_resources; that is reported here,
+	// not a problem.
+	Dropped []string
 	// BaseRoles are the distinct base roles of the grants; exactly one is
 	// the shape (design 6.2).
 	BaseRoles []string
@@ -177,7 +193,8 @@ type Composition struct {
 type CompositionReport struct {
 	Compositions []Composition
 	// Expired are the holdings left out because their expiresAt has
-	// passed: "assignment <name>" or "service <name> grant <grant>".
+	// passed: "assignment <name>", "service <name> grant <grant>" or
+	// "access <name>".
 	Expired []string
 	// Problems are every composition's problems, prefixed with the subject.
 	Problems Problems
@@ -223,6 +240,44 @@ func holdings(src *Source) []holding {
 	return out
 }
 
+// accessHolding is one Access document as it applies to one subject:
+// directly, or through the subject's service.
+type accessHolding struct {
+	resource Resource
+	relation string
+	clusters []string
+}
+
+// accessBySubject lists, per subject, the Access documents that relate it
+// to a resource, directly or through its service, leaving out and
+// recording the expired ones.
+func (r *CompositionReport) accessBySubject(src *Source, now time.Time) map[string][]accessHolding {
+	out := map[string][]accessHolding{}
+	for _, a := range src.Accesses {
+		exp, err := parseExpiry(a.Spec.ExpiresAt)
+		if err != nil {
+			r.Problems.addf("access %s: %v", a.Name(), err)
+			continue
+		}
+		if !exp.IsZero() && !exp.After(now) {
+			r.Expired = append(r.Expired, "access "+a.Name())
+			continue
+		}
+		h := accessHolding{resource: a.Spec.Resource, relation: a.Spec.Relation, clusters: a.Spec.Clusters}
+		subjects := []string{a.Spec.Subject}
+		if a.Spec.Service != "" {
+			subjects = nil
+			if svc := src.Service(a.Spec.Service); svc != nil {
+				subjects = svc.Spec.Members
+			}
+		}
+		for _, sub := range subjects {
+			out[sub] = append(out[sub], h)
+		}
+	}
+	return out
+}
+
 // LintComposition checks, for every subject with grants known in Git, that
 // the union of its grants stays within one shape, the size budget and the
 // union envelope (design 6.2, step 5): one base role, a composed policy of
@@ -233,17 +288,25 @@ func holdings(src *Source) []holding {
 // suspension must not surprise.
 //
 // rendered maps a grant's name to its rendered policy (empty for a grant
-// without one). Holdings expired at now are left out and reported. When a
-// subject's holdings name clusters, one union is checked per named
-// cluster, taking in the holdings that are not cluster-bound; otherwise one
-// union covers every cluster.
-func LintComposition(src *Source, rendered map[string]string, now time.Time) *CompositionReport {
+// without one); lookups maps a lookup grant's name to what the bundle
+// carries for it. A lookup grant is rendered, as the broker renders it,
+// with the resources the tree's Access documents relate the subject to in
+// that scope, and each of its resources must match that grant's envelope
+// (the broker refuses resource_outside_envelope otherwise), within its
+// compiled maximum; one with no resource is left out of the union, as the
+// broker leaves it out. Holdings and access expired at now are left out
+// and reported. When a subject's holdings or access name clusters, one
+// union is checked per named cluster, taking in those that are not
+// cluster-bound; otherwise one union covers every cluster.
+func LintComposition(src *Source, rendered map[string]string, lookups map[string]*BundleLookup, now time.Time) *CompositionReport {
 	r := &CompositionReport{}
 	bySubject := r.liveBySubject(holdings(src), now)
+	access := r.accessBySubject(src, now)
+	c := composer{src: src, rendered: rendered, lookups: lookups}
 	for _, subject := range sortedKeys(bySubject) {
-		hs := bySubject[subject]
-		for _, cluster := range clusterScopes(hs) {
-			r.add(composeSubject(src, rendered, subject, cluster, holdingsInCluster(hs, cluster)))
+		hs, as := bySubject[subject], access[subject]
+		for _, cluster := range clusterScopes(hs, as) {
+			r.add(c.compose(subject, cluster, holdingsInCluster(hs, cluster), accessInCluster(as, cluster)))
 		}
 	}
 	return r
@@ -269,12 +332,17 @@ func (r *CompositionReport) liveBySubject(hs []holding, now time.Time) map[strin
 }
 
 // clusterScopes returns the clusters a subject's unions are checked for:
-// every cluster its holdings name, sorted, or the one unnamed scope when
-// they name none.
-func clusterScopes(hs []holding) []string {
+// every cluster its holdings and access name, sorted, or the one unnamed
+// scope when they name none.
+func clusterScopes(hs []holding, as []accessHolding) []string {
 	clusters := map[string]bool{}
 	for _, h := range hs {
 		for _, c := range h.clusters {
+			clusters[c] = true
+		}
+	}
+	for _, a := range as {
+		for _, c := range a.clusters {
 			clusters[c] = true
 		}
 	}
@@ -296,6 +364,18 @@ func holdingsInCluster(hs []holding, cluster string) []holding {
 	return in
 }
 
+// accessInCluster returns the access that applies in cluster, as
+// holdingsInCluster does.
+func accessInCluster(as []accessHolding, cluster string) []accessHolding {
+	var in []accessHolding
+	for _, a := range as {
+		if len(a.clusters) == 0 || slices.Contains(a.clusters, cluster) {
+			in = append(in, a)
+		}
+	}
+	return in
+}
+
 // add records a composition and its problems, prefixed with the subject
 // and the cluster scope.
 func (r *CompositionReport) add(c Composition) {
@@ -309,18 +389,29 @@ func (r *CompositionReport) add(c Composition) {
 	}
 }
 
-func composeSubject(src *Source, rendered map[string]string, subject, cluster string, hs []holding) Composition {
+// composer composes one subject's grants in one cluster scope.
+type composer struct {
+	src      *Source
+	rendered map[string]string
+	lookups  map[string]*BundleLookup
+}
+
+func (cp composer) compose(subject, cluster string, hs []holding, as []accessHolding) Composition {
 	c := Composition{Subject: subject, Cluster: cluster, SessionTags: map[string]string{}}
 	c.Sources, c.Grants = heldGrants(hs)
 	u := newGrantUnion()
 	for _, name := range c.Grants {
-		g := src.Grant(name)
+		g := cp.src.Grant(name)
 		if g == nil {
 			c.Problems.addf("grant %q not found", name)
 			continue
 		}
-		u.add(&c, g, rendered[name])
+		policy, held := cp.policyOf(&c, g, as)
+		if held {
+			u.add(&c, g, policy)
+		}
 	}
+	c.Grants = slices.DeleteFunc(c.Grants, func(name string) bool { return slices.Contains(c.Dropped, name) })
 	c.BaseRoles = sortedKeys(u.baseRoles)
 	if len(c.BaseRoles) > 1 {
 		c.Problems.addf("grants span %d base roles (%s); a workload has exactly one shape", len(c.BaseRoles), strings.Join(c.BaseRoles, ", "))
@@ -333,6 +424,50 @@ func composeSubject(src *Source, rendered map[string]string, subject, cluster st
 	size := LintSize(subject, "", c.SessionTags)
 	c.Problems = append(c.Problems, size.Problems...)
 	return c
+}
+
+// policyOf is a grant's policy in the subject's composition and whether
+// the grant takes part: a lookup grant's is rendered with the resources
+// its access relates the subject to, and with none the grant is dropped.
+func (cp composer) policyOf(c *Composition, g *Grant, as []accessHolding) (string, bool) {
+	l, ok := cp.lookups[g.Name()]
+	if !ok {
+		return cp.rendered[g.Name()], true
+	}
+	resources := relatedResources(as, l)
+	if len(resources) == 0 {
+		c.Dropped = append(c.Dropped, g.Name())
+		return "", false
+	}
+	if c.Resources == nil {
+		c.Resources = map[string][]string{}
+	}
+	c.Resources[g.Name()] = resources
+	if len(resources) > l.MaxResources {
+		c.Problems.addf("grant %s: %d %s resources, over its compiled maximum of %d (the broker refuses policy_too_large)", g.Name(), len(resources), l.Kind, l.MaxResources)
+	}
+	policy, err := l.Render(g.Spec.Account, resources)
+	if err != nil {
+		c.Problems.addf("grant %s: rendering for %s: %v", g.Name(), strings.Join(resources, ", "), err)
+		return "", true
+	}
+	for _, p := range LintEnvelope(g.Name(), policy, g.Spec.Envelope).Problems {
+		c.Problems.addf("grant %s: rendered for its resources: %s (the broker refuses resource_outside_envelope)", g.Name(), p)
+	}
+	return policy, true
+}
+
+// relatedResources are the names of the resources of the lookup's kind
+// that the access gives its permission on, sorted.
+func relatedResources(as []accessHolding, l *BundleLookup) []string {
+	relations, _ := RelationsOf(l.Permission)
+	var names []string
+	for _, a := range as {
+		if a.resource.Kind == l.Kind && slices.Contains(relations, a.relation) {
+			names = append(names, a.resource.Name)
+		}
+	}
+	return sortedUnique(names)
 }
 
 // heldGrants returns the holdings' origins, in order without repeats, and

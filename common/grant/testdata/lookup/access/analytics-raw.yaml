@@ -1,0 +1,8 @@
+# Every member of the service may read the bucket.
+kind: Access
+metadata:
+  name: analytics-raw
+spec:
+  service: analytics
+  resource: { kind: s3_bucket, name: data-raw }
+  relation: reader

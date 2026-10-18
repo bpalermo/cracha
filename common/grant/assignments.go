@@ -21,6 +21,29 @@ type Assignments struct {
 	GeneratedAt string             `json:"generatedAt"`
 	Services    []AssignedService  `json:"services"`
 	Workloads   []AssignedWorkload `json:"workloads"`
+	// Access relates workloads and services' members to resources (Level
+	// 3). Absent when the tree has no Access document, so a tree without
+	// them compiles to the bytes, and the version, it did before them.
+	Access []AssignedAccess `json:"access,omitempty"`
+}
+
+// AssignedAccess is one relation of a workload, or of a service's
+// members, to a resource: every Access document naming the same holder,
+// resource and relation, merged, with the union of their bounds.
+type AssignedAccess struct {
+	// Subject or Service: exactly one is set.
+	Subject   string   `json:"subject,omitempty"`
+	Service   string   `json:"service,omitempty"`
+	Resource  Resource `json:"resource"`
+	Relation  string   `json:"relation"`
+	ExpiresAt string   `json:"expiresAt,omitempty"`
+	Clusters  []string `json:"clusters,omitempty"`
+}
+
+// holderKey identifies the holder, resource and relation of an access,
+// which documents that agree on all three merge into.
+func (a AssignedAccess) holderKey() string {
+	return a.Subject + "\x00" + a.Service + "\x00" + a.Resource.Kind + "\x00" + a.Resource.Name + "\x00" + a.Relation
 }
 
 // AssignedService is one Service: its team, its members and the grants
@@ -71,6 +94,43 @@ func ResolveAssignments(src *Source) ([]AssignedService, []AssignedWorkload, err
 		return nil, nil, err
 	}
 	return services, workloads, nil
+}
+
+// ResolveAccess is the one mapping from a tree's Access documents to the
+// relations of workloads and services to resources, which the published
+// assignments document carries and the reconciler writes to SpiceDB
+// (design 6.4): documents that give one holder (a subject, or a service's
+// members) the same relation to the same resource are one, with the bounds
+// that allow what either allows, and a union no single bound can express
+// is refused, as for assignments. Bounds are normalized as
+// ResolveAssignments normalizes them; the result is sorted by holder,
+// resource and relation.
+func ResolveAccess(src *Source) ([]AssignedAccess, error) {
+	byKey := map[string][]assigned{}
+	shapes := map[string]AssignedAccess{}
+	for _, a := range src.Accesses {
+		b, err := newBounds(a.Spec.ExpiresAt, a.Spec.Clusters)
+		if err != nil {
+			return nil, fmt.Errorf("access %s: %w", a.Name(), err)
+		}
+		shape := AssignedAccess{Subject: a.Spec.Subject, Service: a.Spec.Service, Resource: a.Spec.Resource, Relation: a.Spec.Relation}
+		key := shape.holderKey()
+		shapes[key] = shape
+		byKey[key] = append(byKey[key], assigned{a.Name(), b})
+	}
+	out := make([]AssignedAccess, 0, len(byKey))
+	for key, as := range byKey {
+		merged, err := mergeAssigned(as)
+		if err != nil {
+			return nil, fmt.Errorf("access to %s: %w", shapes[key].Resource, err)
+		}
+		acc := shapes[key]
+		g := merged.grant("")
+		acc.ExpiresAt, acc.Clusters = g.ExpiresAt, g.Clusters
+		out = append(out, acc)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].holderKey() < out[j].holderKey() })
+	return out, nil
 }
 
 func resolveService(s *Service) (AssignedService, error) {

@@ -27,6 +27,8 @@ type Source struct {
 	Assignments []*Assignment
 	// Services, sorted by name.
 	Services []*Service
+	// Accesses, sorted by name.
+	Accesses []*Access
 	// Templates by name.
 	Templates map[string]*Template
 }
@@ -45,6 +47,16 @@ func (s *Source) Grant(name string) *Grant {
 func (s *Source) ServiceOf(subject string) *Service {
 	for _, svc := range s.Services {
 		if slices.Contains(svc.Spec.Members, subject) {
+			return svc
+		}
+	}
+	return nil
+}
+
+// Service returns the service with the given name, or nil.
+func (s *Source) Service(name string) *Service {
+	for _, svc := range s.Services {
+		if svc.Name() == name {
 			return svc
 		}
 	}
@@ -80,7 +92,7 @@ const (
 )
 
 // Load reads a source tree (see the package documentation): every *.yaml and
-// *.yml file under dir is a Grant, an Assignment or a Service, and every *.json file
+// *.yml file under dir is a Grant, an Assignment, a Service or an Access, and every *.json file
 // under dir/templates is a template. Hidden directories under dir (.git,
 // .github) are skipped. It reports every problem it finds, not
 // only the first.
@@ -91,6 +103,7 @@ func Load(dir string) (*Source, error) {
 	sort.Slice(src.Grants, func(i, j int) bool { return src.Grants[i].Name() < src.Grants[j].Name() })
 	sort.Slice(src.Assignments, func(i, j int) bool { return src.Assignments[i].Name() < src.Assignments[j].Name() })
 	sort.Slice(src.Services, func(i, j int) bool { return src.Services[i].Name() < src.Services[j].Name() })
+	sort.Slice(src.Accesses, func(i, j int) bool { return src.Accesses[i].Name() < src.Accesses[j].Name() })
 	if len(l.errs) > 0 {
 		return nil, errors.Join(l.errs...)
 	}
@@ -104,11 +117,12 @@ type loader struct {
 	templatesDir string
 	src          *Source
 	errs         errList
-	// seenGrants, seenAssignments and seenServices map a name to the file
-	// that defined it, to report a second definition.
+	// seenGrants, seenAssignments, seenServices and seenAccesses map a
+	// name to the file that defined it, to report a second definition.
 	seenGrants      map[string]string
 	seenAssignments map[string]string
 	seenServices    map[string]string
+	seenAccesses    map[string]string
 }
 
 func newLoader(dir string) *loader {
@@ -119,6 +133,7 @@ func newLoader(dir string) *loader {
 		seenGrants:      map[string]string{},
 		seenAssignments: map[string]string{},
 		seenServices:    map[string]string{},
+		seenAccesses:    map[string]string{},
 	}
 }
 
@@ -174,8 +189,8 @@ func (l *loader) loadTemplate(path, rel string) {
 	l.src.Templates[t.Name] = t
 }
 
-// loadDocument loads one YAML file as the Grant, Assignment or Service it
-// declares.
+// loadDocument loads one YAML file as the Grant, Assignment, Service or
+// Access it declares.
 func (l *loader) loadDocument(path, rel string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -194,7 +209,21 @@ func (l *loader) loadDocument(path, rel string) {
 		l.addAssignment(o, rel)
 	case *Service:
 		l.addService(o, rel)
+	case *Access:
+		l.addAccess(o, rel)
 	}
+}
+
+// addAccess records an access document loaded from rel, which must not
+// redefine a name.
+func (l *loader) addAccess(a *Access, rel string) {
+	a.Path = rel
+	if prev, dup := l.seenAccesses[a.Name()]; dup {
+		l.errs.addf("%s: access %q already defined in %s", rel, a.Name(), prev)
+		return
+	}
+	l.seenAccesses[a.Name()] = rel
+	l.src.Accesses = append(l.src.Accesses, a)
 }
 
 // addGrant records a grant loaded from rel, which must not redefine a name.
@@ -232,8 +261,8 @@ func (l *loader) addService(s *Service, rel string) {
 	l.src.Services = append(l.src.Services, s)
 }
 
-// ParseDocument parses one YAML document into a *Grant, an *Assignment or a
-// *Service, chosen by its kind. Unknown fields are an error.
+// ParseDocument parses one YAML document into a *Grant, an *Assignment, a
+// *Service or an *Access, chosen by its kind. Unknown fields are an error.
 func ParseDocument(data []byte) (any, error) {
 	var head struct {
 		Kind string `json:"kind"`
@@ -248,10 +277,12 @@ func ParseDocument(data []byte) (any, error) {
 		return parseStrict(data, func(a *Assignment) *Metadata { return &a.Metadata })
 	case KindService:
 		return parseStrict(data, func(s *Service) *Metadata { return &s.Metadata })
+	case KindAccess:
+		return parseStrict(data, func(a *Access) *Metadata { return &a.Metadata })
 	case "":
 		return nil, errors.New("kind is required")
 	default:
-		return nil, fmt.Errorf("unknown kind %q (want %s, %s or %s)", head.Kind, KindGrant, KindAssignment, KindService)
+		return nil, fmt.Errorf("unknown kind %q (want %s, %s, %s or %s)", head.Kind, KindGrant, KindAssignment, KindService, KindAccess)
 	}
 }
 
@@ -266,6 +297,29 @@ func parseStrict[T any](data []byte, meta func(*T) *Metadata) (*T, error) {
 		return nil, errors.New("metadata.name is required")
 	}
 	return obj, nil
+}
+
+// validateParamSpec checks one parameter a template declares.
+func validateParamSpec(name string, spec ParamSpec) error {
+	if err := validateParamName(name); err != nil {
+		return err
+	}
+	if name == implicitAccountParam {
+		return fmt.Errorf("parameter %q is implicit and cannot be declared", name)
+	}
+	switch spec.Type {
+	case ParamString, ParamList:
+	default:
+		return fmt.Errorf("parameter %q: type must be %q or %q, got %q", name, ParamString, ParamList, spec.Type)
+	}
+	switch {
+	case spec.Default == nil:
+	case spec.Default.Lookup != nil:
+		return fmt.Errorf("parameter %q: a default cannot be a lookup; the grant gives the lookup", name)
+	case spec.Default.IsList != (spec.Type == ParamList):
+		return fmt.Errorf("parameter %q: default does not match type %s", name, spec.Type)
+	}
+	return nil
 }
 
 // LoadTemplate reads one template file. The template's name is the file's
@@ -306,19 +360,8 @@ func ParseTemplate(data []byte) (*Template, error) {
 		return nil, fmt.Errorf("policy must be a JSON object: %w", err)
 	}
 	for name, spec := range t.Params {
-		if err := validateParamName(name); err != nil {
+		if err := validateParamSpec(name, spec); err != nil {
 			return nil, err
-		}
-		if name == implicitAccountParam {
-			return nil, fmt.Errorf("parameter %q is implicit and cannot be declared", name)
-		}
-		switch spec.Type {
-		case ParamString, ParamList:
-		default:
-			return nil, fmt.Errorf("parameter %q: type must be %q or %q, got %q", name, ParamString, ParamList, spec.Type)
-		}
-		if spec.Default != nil && spec.Default.IsList != (spec.Type == ParamList) {
-			return nil, fmt.Errorf("parameter %q: default does not match type %s", name, spec.Type)
 		}
 	}
 	return &t, nil

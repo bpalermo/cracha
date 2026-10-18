@@ -1,0 +1,119 @@
+{
+  "generatedAt": "2026-10-17T12:34:56Z",
+  "grants": [
+    {
+      "account": "111122223333",
+      "baseRole": "arn:aws:iam::111122223333:role/broker/shape-data",
+      "duration": 3600,
+      "envelope": [
+        "arn:aws:s3:::data-*",
+        "arn:aws:s3:::data.*"
+      ],
+      "lookup": {
+        "kind": "s3_bucket",
+        "maxResources": 14,
+        "param": "bucket",
+        "params": {},
+        "permission": "read",
+        "template": {
+          "name": "s3-object-read",
+          "params": {
+            "bucket": {
+              "description": "the bucket whose objects may be read",
+              "type": "string"
+            }
+          },
+          "policy": {
+            "Statement": [
+              {
+                "Action": [
+                  "s3:GetObject"
+                ],
+                "Effect": "Allow",
+                "Resource": "arn:aws:s3:::${bucket}/*"
+              }
+            ],
+            "Version": "2012-10-17"
+          }
+        }
+      },
+      "managedPolicyArns": [],
+      "name": "data-read",
+      "sessionPolicy": "",
+      "sessionTags": {
+        "team": "data"
+      }
+    },
+    {
+      "account": "111122223333",
+      "baseRole": "arn:aws:iam::111122223333:role/broker/shape-data",
+      "duration": 3600,
+      "envelope": [
+        "arn:aws:s3:::data-static",
+        "arn:aws:s3:::data-static/*"
+      ],
+      "managedPolicyArns": [],
+      "name": "data-static",
+      "sessionPolicy": "{\"Statement\":[{\"Action\":[\"s3:GetObject\"],\"Effect\":\"Allow\",\"Resource\":\"arn:aws:s3:::data-static/*\"}],\"Version\":\"2012-10-17\"}",
+      "sessionTags": {}
+    },
+    {
+      "account": "111122223333",
+      "baseRole": "arn:aws:iam::111122223333:role/broker/shape-data",
+      "duration": 3600,
+      "envelope": [
+        "arn:aws:s3:::data-*",
+        "arn:aws:s3:::data.*"
+      ],
+      "lookup": {
+        "kind": "s3_bucket",
+        "maxResources": 10,
+        "param": "buckets",
+        "params": {
+          "prefix": "incoming/"
+        },
+        "permission": "write",
+        "template": {
+          "name": "s3-bucket-write",
+          "params": {
+            "buckets": {
+              "description": "the buckets that may be written",
+              "type": "list"
+            },
+            "prefix": {
+              "default": "",
+              "type": "string"
+            }
+          },
+          "policy": {
+            "Statement": [
+              {
+                "Action": [
+                  "s3:PutObject",
+                  "s3:GetObject"
+                ],
+                "Effect": "Allow",
+                "Resource": "arn:aws:s3:::${buckets}/${prefix}*",
+                "Sid": "Write"
+              },
+              {
+                "Action": [
+                  "s3:ListBucket"
+                ],
+                "Effect": "Allow",
+                "Resource": "arn:aws:s3:::${buckets}",
+                "Sid": "List"
+              }
+            ],
+            "Version": "2012-10-17"
+          }
+        }
+      },
+      "managedPolicyArns": [],
+      "name": "data-write",
+      "sessionPolicy": "",
+      "sessionTags": {}
+    }
+  ],
+  "version": "lookup1"
+}

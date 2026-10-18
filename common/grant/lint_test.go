@@ -131,7 +131,7 @@ var lintNow = time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
 
 func TestLintCompositionGood(t *testing.T) {
 	src := loadGood(t)
-	r := LintComposition(src, renderAll(t, src), lintNow)
+	r := LintComposition(src, renderAll(t, src), nil, lintNow)
 	if !r.Problems.OK() {
 		t.Fatalf("problems = %v", r.Problems)
 	}
@@ -178,7 +178,7 @@ func TestLintCompositionProblems(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			r := LintComposition(src, renderAll(t, src), lintNow)
+			r := LintComposition(src, renderAll(t, src), nil, lintNow)
 			if r.Problems.OK() || !strings.Contains(strings.Join(r.Problems, "\n"), tt.want) {
 				t.Errorf("problems = %v, want one containing %q", r.Problems, tt.want)
 			}
@@ -232,7 +232,7 @@ func TestLintCompositionSynthetic(t *testing.T) {
 		"c": `{"Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::c/*"}]}`,
 		"d": `{"Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::elsewhere/*"}]}`,
 	}
-	r := LintComposition(src, rendered, lintNow)
+	r := LintComposition(src, rendered, nil, lintNow)
 	// x is checked once per named cluster, each taking in the unbounded c;
 	// w, a member of the service alone, in the service grant's cluster; s,
 	// suspended with no grants, not at all. The service's expired grant is
@@ -264,7 +264,7 @@ func TestLintCompositionSynthetic(t *testing.T) {
 	}
 	// Eleven managed policies in one cluster union is too many.
 	src.Assignments[0].Spec.Grants = []string{"a", "b"}
-	r = LintComposition(src, rendered, lintNow)
+	r = LintComposition(src, rendered, nil, lintNow)
 	if !strings.Contains(strings.Join(r.Problems, "\n"), "subject x in cluster east: 12 managed policy ARNs in total") {
 		t.Errorf("problems = %v, want the managed policy total", r.Problems)
 	}
@@ -302,7 +302,7 @@ func TestLintCompositionComposedPolicy(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r := LintComposition(src, tt.rendered, lintNow)
+			r := LintComposition(src, tt.rendered, nil, lintNow)
 			all := strings.Join(r.Problems, "\n")
 			if tt.want == "" && all != "" {
 				t.Errorf("problems = %v, want none", r.Problems)

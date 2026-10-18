@@ -1,0 +1,10 @@
+# One workload writes the bucket (and so reads it), in two clusters by two
+# documents, which merge into one relation.
+kind: Access
+metadata:
+  name: etl-curated-a
+spec:
+  subject: prod/data/etl
+  resource: { kind: s3_bucket, name: data.curated }
+  relation: writer
+  clusters: [prod-a]

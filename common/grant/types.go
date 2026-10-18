@@ -1,7 +1,9 @@
 package grant
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -11,6 +13,7 @@ const (
 	KindGrant      = "Grant"
 	KindAssignment = "Assignment"
 	KindService    = "Service"
+	KindAccess     = "Access"
 )
 
 // STS limits the pipeline lints against (design 6.2 step 4 and 6.6).
@@ -98,12 +101,26 @@ type SessionPolicy struct {
 	Params   map[string]Param `json:"params,omitempty"`
 }
 
-// Param is a template parameter value: a string or a list of strings.
+// Param is a template parameter value: a string or a list of strings, or,
+// in a grant's sessionPolicy.params only, a lookup the broker fills at
+// issuance with the resources the workload is related to (Level 3).
 type Param struct {
 	// IsList says which of List and String holds the value.
 	IsList bool
 	List   []string
 	String string
+	// Lookup, when set, is a lookup parameter, and the other fields are
+	// unset.
+	Lookup *Lookup
+}
+
+// Lookup is a parameter left to the authorization store: the resources of
+// a kind the workload holds a permission on (design 6.2, Level 3).
+type Lookup struct {
+	// Kind is the resource kind (ResourceKinds), such as s3_bucket.
+	Kind string `json:"kind"`
+	// Permission is read or write.
+	Permission string `json:"permission"`
 }
 
 // StringParam makes a string parameter.
@@ -112,7 +129,13 @@ func StringParam(s string) Param { return Param{String: s} }
 // ListParam makes a list parameter.
 func ListParam(items ...string) Param { return Param{List: items, IsList: true} }
 
-// UnmarshalJSON accepts a JSON string or an array of strings.
+// LookupParam makes a lookup parameter.
+func LookupParam(kind, permission string) Param {
+	return Param{Lookup: &Lookup{Kind: kind, Permission: permission}}
+}
+
+// UnmarshalJSON accepts a JSON string, an array of strings, or an object
+// {"lookup": {"kind", "permission"}} with no other field.
 func (p *Param) UnmarshalJSON(data []byte) error {
 	var s string
 	if err := json.Unmarshal(data, &s); err == nil {
@@ -124,11 +147,36 @@ func (p *Param) UnmarshalJSON(data []byte) error {
 		*p = ListParam(list...)
 		return nil
 	}
-	return fmt.Errorf("parameter must be a string or a list of strings (quote numbers and booleans), got %s", string(data))
+	if bytes.HasPrefix(bytes.TrimSpace(data), []byte("{")) {
+		return p.unmarshalLookup(data)
+	}
+	return fmt.Errorf("parameter must be a string, a list of strings (quote numbers and booleans) or a lookup, got %s", string(data))
 }
 
-// MarshalJSON writes the value back as a string or an array.
+// unmarshalLookup decodes {"lookup": {...}} strictly.
+func (p *Param) unmarshalLookup(data []byte) error {
+	var obj struct {
+		Lookup *Lookup `json:"lookup"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&obj); err != nil {
+		return fmt.Errorf("lookup parameter: %w", err)
+	}
+	if obj.Lookup == nil {
+		return errors.New("an object parameter must be {lookup: {kind, permission}}")
+	}
+	*p = Param{Lookup: obj.Lookup}
+	return nil
+}
+
+// MarshalJSON writes the value back as a string, an array or a lookup.
 func (p Param) MarshalJSON() ([]byte, error) {
+	if p.Lookup != nil {
+		return json.Marshal(struct {
+			Lookup *Lookup `json:"lookup"`
+		}{p.Lookup})
+	}
 	if p.IsList {
 		if p.List == nil {
 			return []byte("[]"), nil
@@ -212,6 +260,48 @@ func (g *BoundedGrant) Expiry() (time.Time, error) {
 	return parseExpiry(g.ExpiresAt)
 }
 
+// Access is a kind: Access document: a workload, or every member of a
+// service, related to one resource by name (design 6.2, Level 3). A grant
+// whose template leaves a parameter to a lookup is filled, at issuance,
+// with the resources its holder is related to this way.
+type Access struct {
+	Kind     string     `json:"kind"`
+	Metadata Metadata   `json:"metadata"`
+	Spec     AccessSpec `json:"spec"`
+	// Path is the file the access was loaded from, relative to the source
+	// root, for messages.
+	Path string `json:"-"`
+}
+
+// Name returns the access document's name.
+func (a *Access) Name() string { return a.Metadata.Name }
+
+// AccessSpec is the body of an Access. Exactly one of Subject and Service
+// is set.
+type AccessSpec struct {
+	// Subject is a workload's authorization subject encoding (design 4.3).
+	Subject string `json:"subject,omitempty"`
+	// Service names a Service whose members are related.
+	Service string `json:"service,omitempty"`
+	// Resource is the resource related to.
+	Resource Resource `json:"resource"`
+	// Relation is the relation of the resource's kind: reader or writer.
+	Relation string `json:"relation"`
+	// ExpiresAt, when set, bounds the access in time (RFC 3339).
+	ExpiresAt string `json:"expiresAt,omitempty"`
+	// Clusters, when set, bounds the access to these clusters.
+	Clusters []string `json:"clusters,omitempty"`
+}
+
+// Resource names one resource of a kind.
+type Resource struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+}
+
+// String is kind:name, for messages.
+func (r Resource) String() string { return r.Kind + ":" + r.Name }
+
 // parseExpiry parses an expiresAt field; empty is the zero time.
 func parseExpiry(s string) (time.Time, error) {
 	if s == "" {
@@ -243,4 +333,43 @@ type BundleGrant struct {
 	SessionTags       map[string]string `json:"sessionTags"`
 	Duration          int               `json:"duration"`
 	Envelope          []string          `json:"envelope"`
+	// Lookup is set on a grant that leaves a template parameter to the
+	// authorization store: its SessionPolicy is then empty and the broker
+	// renders the policy at issuance. Absent on every other grant, so a
+	// bundle without lookup grants is what it was before them.
+	Lookup *BundleLookup `json:"lookup,omitempty"`
+}
+
+// BundleLookup is what the broker needs to render a lookup grant's policy
+// at issuance: the template, the parameters the grant gives it, and the
+// one parameter the resources fill.
+type BundleLookup struct {
+	// Param is the template parameter the resources fill.
+	Param string `json:"param"`
+	// Kind and Permission are what the broker asks the store for.
+	Kind       string `json:"kind"`
+	Permission string `json:"permission"`
+	// MaxResources is the most resources the rendered policy can hold
+	// within MaxPolicyChars whatever their names, computed at compile time
+	// with names of the kind's longest length. The broker denies
+	// policy_too_large beyond it.
+	MaxResources int `json:"maxResources"`
+	// Template is the session policy template; Params the grant's other
+	// parameters.
+	Template BundleTemplate   `json:"template"`
+	Params   map[string]Param `json:"params"`
+}
+
+// BundleTemplate is a template as the bundle carries it.
+type BundleTemplate struct {
+	Name   string               `json:"name"`
+	Params map[string]ParamSpec `json:"params"`
+	Policy json.RawMessage      `json:"policy"`
+}
+
+// Render renders the lookup grant's policy for the resources (see
+// RenderLookup). account is the grant's.
+func (l *BundleLookup) Render(account string, resources []string) (string, error) {
+	t := &Template{Name: l.Template.Name, Params: l.Template.Params, Policy: l.Template.Policy}
+	return t.RenderLookup(account, l.Params, l.Param, resources)
 }
