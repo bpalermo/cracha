@@ -258,7 +258,8 @@ agent:
 
   # With enrol init: the port of the enrolment endpoint on every node's
   # address, and how long the init container keeps trying before it exits
-  # non-zero and kubelet restarts it (fail closed).
+  # non-zero and kubelet restarts it (fail closed). The webhook reads the
+  # timeout when it injects the init container; the agent does not.
   enrolPort: 9798
   enrolTimeout: 2m
 

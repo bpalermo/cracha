@@ -2,6 +2,7 @@ package tokenreview
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
@@ -59,6 +60,17 @@ func TestReviewRefusals(t *testing.T) {
 				t.Fatal("Review accepted the token")
 			}
 		})
+	}
+}
+
+func TestReviewUnavailable(t *testing.T) {
+	client := fake.NewClientset()
+	client.PrependReactor("create", "tokenreviews", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("the server is currently unable to handle the request")
+	})
+	_, err := NewKubernetes(client).Review(context.Background(), "tok", "cracha-agent")
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Review = %v, want ErrUnavailable", err)
 	}
 }
 

@@ -120,7 +120,8 @@ func TestRequestsResolveToTheListenersPod(t *testing.T) {
 
 func TestBindIsIdempotentAndRebindsOnANewNamespace(t *testing.T) {
 	b := &loopback{}
-	r := New(b)
+	var closed []Pod
+	r := New(b, WithCloseHook(func(p Pod) { closed = append(closed, p) }))
 	defer r.CloseAll()
 
 	if err := r.Bind(podA, "/run/netns/one"); err != nil {
@@ -151,6 +152,9 @@ func TestBindIsIdempotentAndRebindsOnANewNamespace(t *testing.T) {
 	}
 	if e, _ := r.Lookup(podA.UID); e.NetnsPath != "/run/netns/two" {
 		t.Errorf("entry = %+v", e)
+	}
+	if len(closed) != 1 || closed[0] != podA {
+		t.Errorf("the close hook saw %v, want the rebound pod once", closed)
 	}
 }
 

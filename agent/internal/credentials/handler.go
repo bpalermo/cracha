@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/bpalermo/cracha/agent/internal/issuer"
 	"github.com/bpalermo/cracha/agent/internal/listener"
@@ -97,6 +98,8 @@ type Handler struct {
 	mu     sync.Mutex
 	tokens map[string]*cached       // by pod UID
 	slots  map[string]chan struct{} // by pod UID
+	// fetches coalesces concurrent fetches for one pod into one call.
+	fetches singleflight.Group
 }
 
 // cached is a pod's JWT-SVID.
@@ -238,6 +241,17 @@ func (h *Handler) token(ctx context.Context, pod listener.Pod) (*cached, error) 
 	if ok && tok.expiry.After(now.Add(refreshBefore)) {
 		return tok, nil
 	}
+	// One fetch per pod at a time: the requests a pod fires together share
+	// it, and the retries within the deadline happen once.
+	v, err, _ := h.fetches.Do(pod.UID, func() (any, error) { return h.fetch(ctx, pod) })
+	if err != nil {
+		return nil, err
+	}
+	return v.(*cached), nil
+}
+
+// fetch asks the issuer and caches the answer.
+func (h *Handler) fetch(ctx context.Context, pod listener.Pod) (*cached, error) {
 	ref := issuer.PodRef{Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID}
 	raw, expiry, err := h.issuer.FetchJWTSVID(ctx, ref, h.cfg.Audience)
 	if err != nil {
@@ -247,7 +261,7 @@ func (h *Handler) token(ctx context.Context, pod listener.Pod) (*cached, error) 
 	if err != nil {
 		return nil, issuer.NewError(issuer.Permanent, err)
 	}
-	tok = &cached{token: raw, id: id, expiry: expiry}
+	tok := &cached{token: raw, id: id, expiry: expiry}
 	h.mu.Lock()
 	h.tokens[pod.UID] = tok
 	h.mu.Unlock()

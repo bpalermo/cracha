@@ -132,6 +132,9 @@ func (r *Registry) Bind(pod Pod, netnsPath string) error {
 			"pod", pod.String(), "old_netns", old.NetnsPath, "netns", netnsPath)
 		delete(r.byUID, pod.UID)
 		old.close()
+		if r.onClose != nil {
+			r.onClose(old.Pod)
+		}
 	}
 	lis, err := r.binder.Bind(netnsPath)
 	if err != nil {

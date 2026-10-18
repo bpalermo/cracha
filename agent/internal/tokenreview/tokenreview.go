@@ -65,8 +65,14 @@ func splitServiceAccount(username string) (ns, sa string, ok bool) {
 	return ns, sa, true
 }
 
+// ErrUnavailable wraps a review that could not be made: the API server did
+// not answer, or refused the review itself (RBAC). It is not a verdict on
+// the token, and the caller retries.
+var ErrUnavailable = errors.New("TokenReview unavailable")
+
 // Reviewer verifies a token for an audience. It returns an error when the
-// token is not authenticated for that audience.
+// token is not authenticated for that audience, wrapping ErrUnavailable
+// when it could not find out.
 type Reviewer interface {
 	Review(ctx context.Context, token, audience string) (Result, error)
 }
@@ -89,7 +95,7 @@ func (k *Kubernetes) Review(ctx context.Context, token, audience string) (Result
 	}
 	tr, err := k.client.AuthenticationV1().TokenReviews().Create(ctx, tr, metav1.CreateOptions{})
 	if err != nil {
-		return Result{}, fmt.Errorf("TokenReview: %w", err)
+		return Result{}, fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
 	if tr.Status.Error != "" {
 		return Result{}, fmt.Errorf("TokenReview: %s", tr.Status.Error)

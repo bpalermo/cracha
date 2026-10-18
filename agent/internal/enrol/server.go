@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -23,13 +24,16 @@ import (
 const (
 	DefaultRate  = rate.Limit(1) // enrolments per second, per pod
 	DefaultBurst = 5
-	// The endpoint-wide bound, applied before the token is reviewed: the
-	// per-pod limit is keyed on what the TokenReview says, so without this
-	// a flood of garbage bearers would cost one TokenReview each. A node
-	// enrols pods at kubelet's pace, far below it.
+	// The bounds applied before the token is reviewed, since the per-pod
+	// limit is keyed on what the review says and a flood of garbage bearers
+	// would otherwise cost one TokenReview each: per source address, so one
+	// pod's flood holds back that pod alone, and for the endpoint as a
+	// whole. A node enrols pods at kubelet's pace, far below either.
+	DefaultSourceRate  = rate.Limit(5)
+	DefaultSourceBurst = 20
 	DefaultGlobalRate  = rate.Limit(50)
 	DefaultGlobalBurst = 100
-	// limiterTTL is how long an idle pod's limiter is kept.
+	// limiterTTL is how long an idle key's limiter is kept.
 	limiterTTL = 5 * time.Minute
 )
 
@@ -41,8 +45,11 @@ type ServerConfig struct {
 	// Rate and Burst bound enrolments per pod UID; the defaults when zero.
 	Rate  rate.Limit
 	Burst int
-	// GlobalRate and GlobalBurst bound requests to the endpoint as a whole,
-	// before any token is reviewed; the defaults when zero.
+	// SourceRate and SourceBurst bound requests per source address, and
+	// GlobalRate and GlobalBurst the endpoint as a whole, before any token
+	// is reviewed; the defaults when zero.
+	SourceRate  rate.Limit
+	SourceBurst int
 	GlobalRate  rate.Limit
 	GlobalBurst int
 	// Logger; the default logger when nil.
@@ -59,16 +66,10 @@ type Server struct {
 	resolver cri.Resolver
 	cfg      ServerConfig
 
-	global *rate.Limiter
-
-	mu       sync.Mutex
-	limiters map[string]*limiter
+	global   *rate.Limiter
+	bySource *keyedLimiter
+	byPod    *keyedLimiter
 	now      func() time.Time
-}
-
-type limiter struct {
-	*rate.Limiter
-	seen time.Time
 }
 
 // NewServer returns the endpoint.
@@ -78,6 +79,12 @@ func NewServer(reviewer tokenreview.Reviewer, enroller *Enroller, resolver cri.R
 	}
 	if cfg.Burst <= 0 {
 		cfg.Burst = DefaultBurst
+	}
+	if cfg.SourceRate <= 0 {
+		cfg.SourceRate = DefaultSourceRate
+	}
+	if cfg.SourceBurst <= 0 {
+		cfg.SourceBurst = DefaultSourceBurst
 	}
 	if cfg.GlobalRate <= 0 {
 		cfg.GlobalRate = DefaultGlobalRate
@@ -91,7 +98,9 @@ func NewServer(reviewer tokenreview.Reviewer, enroller *Enroller, resolver cri.R
 	return &Server{
 		reviewer: reviewer, enroller: enroller, resolver: resolver, cfg: cfg,
 		global:   rate.NewLimiter(cfg.GlobalRate, cfg.GlobalBurst),
-		limiters: map[string]*limiter{}, now: time.Now,
+		bySource: newKeyedLimiter(cfg.SourceRate, cfg.SourceBurst),
+		byPod:    newKeyedLimiter(cfg.Rate, cfg.Burst),
+		now:      time.Now,
 	}
 }
 
@@ -112,16 +121,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "a bearer token is required", http.StatusUnauthorized)
 		return
 	}
-	if !s.global.AllowN(s.now(), 1) {
+	now := s.now()
+	if !s.bySource.allow(sourceOf(r), now) || !s.global.AllowN(now, 1) {
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "too many enrolments", http.StatusTooManyRequests)
 		return
 	}
 	status, ref, err := s.enrol(r.Context(), token)
-	log := s.cfg.Logger.With("pod", ref.String(), "status", status)
+	log := s.cfg.Logger.With("pod", ref.String(), "status", status, "source", sourceOf(r))
 	if err != nil {
+		// The detail stays in the log: the caller is not authenticated.
 		log.Warn("enrolment refused", "error", err)
-		http.Error(w, err.Error(), status)
+		http.Error(w, answers[status], status)
 		return
 	}
 	log.Info("enrolled")
@@ -129,10 +140,32 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(enrolapi.Response{Port: s.cfg.Port})
 }
 
+// answers is what the caller is told per status; the reason is logged.
+var answers = map[int]string{
+	http.StatusUnauthorized:        "the token was refused",
+	http.StatusForbidden:           "the pod is not enrolled on this node",
+	http.StatusTooManyRequests:     "too many enrolments for this pod",
+	http.StatusServiceUnavailable:  "enrolment is not possible right now; retry",
+	http.StatusInternalServerError: "enrolment failed",
+}
+
+// sourceOf is the caller's address, without the port.
+func sourceOf(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 // enrol is the decision: the status to answer, the pod the token named (as
 // far as it was learnt) and the refusal, if any.
 func (s *Server) enrol(ctx context.Context, token string) (int, listener.Pod, error) {
 	res, err := s.reviewer.Review(ctx, token, enrolapi.Audience)
+	if errors.Is(err, tokenreview.ErrUnavailable) {
+		// Not a verdict on the token: the caller retries.
+		return http.StatusServiceUnavailable, listener.Pod{}, err
+	}
 	if err != nil {
 		return http.StatusUnauthorized, listener.Pod{}, err
 	}
@@ -140,7 +173,7 @@ func (s *Server) enrol(ctx context.Context, token string) (int, listener.Pod, er
 	if ref.Namespace == "" || ref.Name == "" || ref.UID == "" {
 		return http.StatusUnauthorized, ref, errors.New("the token is not bound to a pod")
 	}
-	if !s.allow(ref.UID) {
+	if !s.byPod.allow(ref.UID, s.now()) {
 		return http.StatusTooManyRequests, ref, errors.New("too many enrolments for this pod")
 	}
 	if _, err := s.enroller.Lookup(ctx, ref); err != nil {
@@ -172,20 +205,36 @@ func bearer(r *http.Request) (string, bool) {
 	return strings.TrimSpace(token), true
 }
 
-// allow applies the per-pod rate limit, dropping idle limiters as it goes.
-func (s *Server) allow(uid string) bool {
-	now := s.now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for k, l := range s.limiters {
+// keyedLimiter is one rate limiter per key, idle ones dropped as it goes.
+type keyedLimiter struct {
+	rate  rate.Limit
+	burst int
+	mu    sync.Mutex
+	by    map[string]*limiter
+}
+
+type limiter struct {
+	*rate.Limiter
+	seen time.Time
+}
+
+func newKeyedLimiter(r rate.Limit, burst int) *keyedLimiter {
+	return &keyedLimiter{rate: r, burst: burst, by: map[string]*limiter{}}
+}
+
+// allow applies the key's limit at now.
+func (k *keyedLimiter) allow(key string, now time.Time) bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	for key, l := range k.by {
 		if now.Sub(l.seen) > limiterTTL {
-			delete(s.limiters, k)
+			delete(k.by, key)
 		}
 	}
-	l, ok := s.limiters[uid]
+	l, ok := k.by[key]
 	if !ok {
-		l = &limiter{Limiter: rate.NewLimiter(s.cfg.Rate, s.cfg.Burst)}
-		s.limiters[uid] = l
+		l = &limiter{Limiter: rate.NewLimiter(k.rate, k.burst)}
+		k.by[key] = l
 	}
 	l.seen = now
 	return l.AllowN(now, 1)

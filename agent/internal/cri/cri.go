@@ -11,6 +11,7 @@
 package cri
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -125,7 +126,7 @@ func (c *Client) sandbox(ctx context.Context, podUID string) (string, error) {
 		return "", ErrNoSandbox
 	}
 	newest := slices.MaxFunc(items, func(a, b *runtimeapi.PodSandbox) int {
-		return int(a.GetCreatedAt() - b.GetCreatedAt())
+		return cmp.Compare(a.GetCreatedAt(), b.GetCreatedAt())
 	})
 	return newest.GetId(), nil
 }

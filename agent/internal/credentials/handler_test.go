@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -170,6 +171,45 @@ func TestTokenIsReusedUntilNearExpiry(t *testing.T) {
 	if n := len(iss.Calls()); n != 4 || iss.Calls()[3].Ref.UID != "uid-2" {
 		t.Fatalf("calls = %+v", iss.Calls())
 	}
+}
+
+func TestConcurrentRequestsShareOneFetch(t *testing.T) {
+	exp := time.Now().Add(time.Hour)
+	iss := &blockingIssuer{inner: issuer.NewFake(issuer.Result{Token: token(exp), Expiry: exp}), release: make(chan struct{})}
+	h := New(iss, &fakeBroker{status: http.StatusOK}, Config{})
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if rec := do(h, pod, http.MethodGet, CredentialsPath); rec.Code != http.StatusOK {
+				t.Errorf("status = %d", rec.Code)
+			}
+		}()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for iss.waiting.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond) // let the others reach the fetch
+	close(iss.release)
+	wg.Wait()
+	if n := len(iss.inner.Calls()); n != 1 {
+		t.Fatalf("4 concurrent requests fetched the token %d times, want once", n)
+	}
+}
+
+// blockingIssuer holds every fetch until release is closed.
+type blockingIssuer struct {
+	inner   *issuer.Fake
+	release chan struct{}
+	waiting atomic.Int32
+}
+
+func (b *blockingIssuer) FetchJWTSVID(ctx context.Context, ref issuer.PodRef, audience string) (string, time.Time, error) {
+	b.waiting.Add(1)
+	<-b.release
+	return b.inner.FetchJWTSVID(ctx, ref, audience)
 }
 
 func TestIssuerFailuresAre503WithAReason(t *testing.T) {

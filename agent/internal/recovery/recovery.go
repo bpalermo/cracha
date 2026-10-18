@@ -89,8 +89,8 @@ func New(client kubernetes.Interface, resolver cri.Resolver, registry Registry, 
 		informer: factory.Core().V1().Pods().Informer(),
 	}
 	_, err = r.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj any) { r.observe(obj) },
-		UpdateFunc: func(_, obj any) { r.observe(obj) },
+		AddFunc:    func(obj any) { r.observe(obj, false) },
+		UpdateFunc: func(_, obj any) { r.observe(obj, false) },
 		DeleteFunc: func(obj any) { r.gone(obj) },
 	})
 	if err != nil {
@@ -130,12 +130,15 @@ func (r *Reconciler) pass(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		r.observe(obj)
+		r.observe(obj, true)
 	}
 }
 
-// observe brings the registry in step with one pod object.
-func (r *Reconciler) observe(obj any) {
+// observe brings the registry in step with one pod object. An event about
+// a pod that is already bound costs no CRI call: only the periodic pass
+// (rebind) resolves every pod's namespace again, which is what catches a
+// sandbox recreated under the same pod.
+func (r *Reconciler) observe(obj any, rebind bool) {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok {
 		return
@@ -162,6 +165,9 @@ func (r *Reconciler) observe(obj any) {
 	}
 	if !sandboxed(pod) {
 		// No sandbox yet: enrolment (7.2) binds it when there is one.
+		return
+	}
+	if _, bound := r.registry.Lookup(ref.UID); bound && !rebind {
 		return
 	}
 	if err := r.bind(ref); err != nil {

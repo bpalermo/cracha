@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,6 +31,8 @@ var reviewer = &tokenreview.Fake{Fn: func(token, audience string) (tokenreview.R
 		return tokenreview.Result{Username: "system:serviceaccount:apps:api"}, nil
 	case "other-node":
 		return tokenreview.Result{Username: "system:serviceaccount:apps:far", PodName: "far", PodUID: "uid-far"}, nil
+	case "apiserver-down":
+		return tokenreview.Result{}, fmt.Errorf("%w: dial tcp: connection refused", tokenreview.ErrUnavailable)
 	}
 	return tokenreview.Result{}, errors.New("invalid token")
 }}
@@ -91,6 +95,7 @@ func TestEnrolEndpointRefusals(t *testing.T) {
 		"bad token":           {http.MethodPost, enrolapi.Path, "Bearer bad", http.StatusUnauthorized},
 		"unbound token":       {http.MethodPost, enrolapi.Path, "Bearer unbound", http.StatusUnauthorized},
 		"no sandbox here":     {http.MethodPost, enrolapi.Path, "Bearer other-node", http.StatusForbidden},
+		"apiserver down":      {http.MethodPost, enrolapi.Path, "Bearer apiserver-down", http.StatusServiceUnavailable},
 		"GET":                 {http.MethodGet, enrolapi.Path, "Bearer good", http.StatusMethodNotAllowed},
 		"other path":          {http.MethodPost, "/v1/other", "Bearer good", http.StatusNotFound},
 		"credentials path":    {http.MethodPost, "/v1/credentials", "Bearer good", http.StatusNotFound},
@@ -106,7 +111,42 @@ func TestEnrolEndpointRefusals(t *testing.T) {
 			if len(reg.bound) != 0 {
 				t.Error("a refused enrolment bound a listener")
 			}
+			for _, detail := range []string{"uid-", "connection refused", "invalid token", "no such pod"} {
+				if strings.Contains(rec.Body.String(), detail) {
+					t.Errorf("the body tells an unauthenticated caller %q: %s", detail, rec.Body.String())
+				}
+			}
 		})
+	}
+}
+
+func TestEnrolEndpointLimitsPerSourceBeforeTheReview(t *testing.T) {
+	reg := newFakeRegistry()
+	calls := &tokenreview.Fake{Fn: reviewer.Fn}
+	client := fake.NewClientset(enrolledPod("apps", "api", "uid-1"))
+	srv := NewServer(calls, NewEnroller(client, reg, nil), resolver, ServerConfig{Port: 1, SourceRate: rate.Every(time.Hour), SourceBurst: 2})
+	from := func(addr, auth string) int {
+		req := httptest.NewRequest(http.MethodPost, enrolapi.Path, nil)
+		req.RemoteAddr = addr
+		req.Header.Set("Authorization", auth)
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	for i := range 2 {
+		if code := from("10.0.0.7:4000", "Bearer garbage"); code != http.StatusUnauthorized {
+			t.Fatalf("request %d: %d", i, code)
+		}
+	}
+	if code := from("10.0.0.7:4001", "Bearer garbage"); code != http.StatusTooManyRequests {
+		t.Fatalf("third request from the flooding address: %d, want 429", code)
+	}
+	if calls.Calls() != 2 {
+		t.Errorf("%d TokenReviews, want the limited request to cost none", calls.Calls())
+	}
+	// Another address is not held back by the flood.
+	if code := from("10.0.0.8:4000", "Bearer good"); code != http.StatusOK {
+		t.Fatalf("another pod: %d, want 200", code)
 	}
 }
 
