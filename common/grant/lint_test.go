@@ -135,21 +135,27 @@ func TestLintCompositionGood(t *testing.T) {
 	if !r.Problems.OK() {
 		t.Fatalf("problems = %v", r.Problems)
 	}
-	if strings.Join(r.Expired, ",") != "legacy-expired" {
-		t.Errorf("expired = %v, want legacy-expired", r.Expired)
+	if strings.Join(r.Expired, ",") != "assignment legacy-expired" {
+		t.Errorf("expired = %v, want assignment legacy-expired", r.Expired)
 	}
-	if len(r.Compositions) != 2 {
-		t.Fatalf("compositions = %+v, want 2", r.Compositions)
+	if len(r.Compositions) != 3 {
+		t.Fatalf("compositions = %+v, want 3", r.Compositions)
 	}
-	billing, payments := r.Compositions[0], r.Compositions[1]
+	billing, api, payments := r.Compositions[0], r.Compositions[1], r.Compositions[2]
 	if billing.Subject != "prod/billing/reports" || billing.Cluster != "" || billing.Policy != "" ||
 		len(billing.ManagedPolicyArns) != 2 || len(billing.BaseRoles) != 1 {
 		t.Errorf("billing = %+v", billing)
 	}
-	// The payments subject has an unbounded assignment and one bound to a
-	// cluster: one union, for that cluster, takes in both.
+	// The api subject holds grants through its service alone.
+	if api.Subject != "prod/payments/api" || api.Cluster != "" || strings.Join(api.Sources, ",") != "service payments-api" ||
+		strings.Join(api.Grants, ",") != "payments-ledger-rw,payments-outbox-r" || api.PolicyChars == 0 {
+		t.Errorf("api = %+v", api)
+	}
+	// The payments subject has an unbounded assignment, one bound to a
+	// cluster and its service's grants: one union, for that cluster, takes
+	// in all three.
 	if payments.Subject != "prod/payments/ledger" || payments.Cluster != "prod-us-east-1" ||
-		strings.Join(payments.Assignments, ",") != "payments-ledger,payments-ledger-temp" ||
+		strings.Join(payments.Sources, ",") != "payments-ledger,payments-ledger-temp,service payments-api" ||
 		strings.Join(payments.Grants, ",") != "payments-ledger-rw,payments-outbox-r" ||
 		len(payments.BaseRoles) != 1 || payments.PolicyChars == 0 || payments.PolicyChars != len(payments.Policy) ||
 		payments.SessionTags["team"] != "payments" || payments.SessionTags["service"] != "outbox" {
@@ -163,6 +169,7 @@ func TestLintCompositionProblems(t *testing.T) {
 		want string
 	}{
 		{"two-shapes", "grants span 2 base roles"},
+		{"service-two-shapes", "grants span 2 base roles"},
 		{"tag-conflict", `session tag "team" is "billing" in grant payments-ledger-other and "payments" in grant payments-ledger-rw`},
 	}
 	for _, tt := range tests {
@@ -212,6 +219,13 @@ func TestLintCompositionSynthetic(t *testing.T) {
 			assign("x-all", "x", nil, "c"),
 			assign("y", "y", nil, "d", "ghost"),
 			{Kind: KindAssignment, Metadata: Metadata{Name: "z"}, Spec: AssignmentSpec{Subject: "z", Grants: []string{"d"}, ExpiresAt: "bad"}},
+			{Kind: KindAssignment, Metadata: Metadata{Name: "s"}, Spec: AssignmentSpec{Subject: "s", Suspended: true}},
+		},
+		Services: []*Service{
+			{Kind: KindService, Metadata: Metadata{Name: "svc"}, Spec: ServiceSpec{
+				Team: "t", Members: []string{"x", "w"},
+				Grants: []BoundedGrant{{Name: "c", Clusters: []string{"east"}}, {Name: "d", ExpiresAt: "2000-01-01T00:00:00Z"}},
+			}},
 		},
 	}
 	rendered := map[string]string{
@@ -219,13 +233,19 @@ func TestLintCompositionSynthetic(t *testing.T) {
 		"d": `{"Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::elsewhere/*"}]}`,
 	}
 	r := LintComposition(src, rendered, lintNow)
-	// x is checked once per named cluster, each taking in the unbounded c.
+	// x is checked once per named cluster, each taking in the unbounded c;
+	// w, a member of the service alone, in the service grant's cluster; s,
+	// suspended with no grants, not at all. The service's expired grant is
+	// left out for both members.
 	var scopes []string
 	for _, c := range r.Compositions {
-		scopes = append(scopes, c.Subject+"@"+c.Cluster+"="+strings.Join(c.Grants, "+"))
+		scopes = append(scopes, c.Subject+"@"+c.Cluster+"="+strings.Join(c.Grants, "+")+"<"+strings.Join(c.Sources, ","))
 	}
-	if got, want := strings.Join(scopes, " "), "x@east=a+c x@west=b+c y@=d+ghost"; got != want {
+	if got, want := strings.Join(scopes, " "), "w@east=c<service svc x@east=a+c<x-east,x-all,service svc x@west=b+c<x-west,x-all y@=d+ghost<y"; got != want {
 		t.Errorf("compositions = %s, want %s", got, want)
+	}
+	if got, want := strings.Join(r.Expired, ","), "service svc grant d,service svc grant d"; got != want {
+		t.Errorf("expired = %s, want %s", got, want)
 	}
 	all := strings.Join(r.Problems, "\n")
 	for _, want := range []string{

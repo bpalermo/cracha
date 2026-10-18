@@ -32,8 +32,21 @@ func TestLoadGood(t *testing.T) {
 	for _, a := range src.Assignments {
 		assignments = append(assignments, a.Name())
 	}
-	if got, want := strings.Join(assignments, ","), "billing-reports,legacy-expired,payments-ledger,payments-ledger-temp"; got != want {
+	if got, want := strings.Join(assignments, ","), "batch-suspended,billing-reports,legacy-expired,payments-ledger,payments-ledger-temp"; got != want {
 		t.Errorf("assignments = %s, want %s", got, want)
+	}
+	if len(src.Services) != 1 || src.Services[0].Name() != "payments-api" || src.Services[0].Path != filepath.Join("services", "payments-api.yaml") {
+		t.Errorf("services = %+v, want payments-api", src.Services)
+	}
+	if svc := src.ServiceOf("prod/payments/api"); svc == nil || svc.Spec.Team != "payments" || len(svc.Spec.Members) != 2 ||
+		len(svc.Spec.Grants) != 2 || svc.Spec.Grants[1].ExpiresAt != "2030-01-01T00:00:00Z" {
+		t.Errorf("ServiceOf(prod/payments/api) = %+v", svc)
+	}
+	if src.ServiceOf("prod/payments/batch") != nil {
+		t.Error("ServiceOf(prod/payments/batch) should be nil")
+	}
+	if suspended := src.Assignments[0]; !suspended.Spec.Suspended || len(suspended.Spec.Grants) != 0 {
+		t.Errorf("batch-suspended spec = %+v", suspended.Spec)
 	}
 	if got, want := len(src.Templates), 2; got != want {
 		t.Errorf("templates = %d, want %d", got, want)
@@ -61,7 +74,7 @@ func TestLoadGood(t *testing.T) {
 	if got := src.Grant("billing-reports").Spec.EffectiveDuration(); got != 1800 {
 		t.Errorf("billing-reports duration = %d, want 1800", got)
 	}
-	temp := src.Assignments[3]
+	temp := src.Assignments[4]
 	if temp.Spec.ExpiresAt != "2030-01-01T00:00:00Z" || len(temp.Spec.Clusters) != 1 {
 		t.Errorf("payments-ledger-temp spec = %+v", temp.Spec)
 	}
@@ -78,6 +91,8 @@ func TestLoadBad(t *testing.T) {
 		{"unknown-field", `unknown field "durationSeconds"`},
 		{"unknown-kind", `unknown kind "Shape"`},
 		{"duplicate-grant", `grant "payments-ledger-rw" already defined`},
+		{"duplicate-service", `service "payments-api" already defined`},
+		{"service-unknown-field", `unknown field "owner"`},
 		{"bad-template", `unknown field "extra"`},
 		{"no-name", "metadata.name is required"},
 		{"stray-template-file", "only *.json templates belong under templates"},
@@ -103,6 +118,8 @@ func TestValidateSourceReferences(t *testing.T) {
 	}{
 		{"missing-template", `template "dynamo-table-rw" not found`},
 		{"unknown-grant", `grant "nonexistent" not found`},
+		{"service-unknown-grant", `service payments-api (services/a.yaml): grant "nonexistent" not found`},
+		{"shared-member", `service payments-batch (services/b.yaml): "prod/payments/ledger" is already a member of service payments-api (services/a.yaml)`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.dir, func(t *testing.T) {

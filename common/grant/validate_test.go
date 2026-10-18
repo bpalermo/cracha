@@ -147,6 +147,8 @@ func TestValidateAssignment(t *testing.T) {
 		{"subject empty", func(a *Assignment) { a.Spec.Subject = "" }, "authorization subject encoding"},
 		{"subject long", func(a *Assignment) { a.Spec.Subject = strings.Repeat("a", 1025) }, "authorization subject encoding"},
 		{"no grants", func(a *Assignment) { a.Spec.Grants = nil }, "at least one grant"},
+		{"suspended without grants", func(a *Assignment) { a.Spec.Grants = nil; a.Spec.Suspended = true }, ""},
+		{"dotted name", func(a *Assignment) { a.Metadata.Name = "payments.ledger" }, "assignment name"},
 		{"grant twice", func(a *Assignment) { a.Spec.Grants = []string{"g", "g"} }, "listed twice"},
 		{"bad grant name", func(a *Assignment) { a.Spec.Grants = []string{"G"} }, "grant name"},
 		{"bad expiry", func(a *Assignment) { a.Spec.ExpiresAt = "tomorrow" }, "expiresAt"},
@@ -173,6 +175,57 @@ func TestValidateAssignment(t *testing.T) {
 
 // A document that does not validate on its own is reported by ValidateSource
 // with its name and path, and its references are not checked.
+func TestValidateService(t *testing.T) {
+	base := func() *Service {
+		return &Service{
+			Kind:     KindService,
+			Metadata: Metadata{Name: "payments-api"},
+			Spec: ServiceSpec{
+				Team:    "payments",
+				Members: []string{"prod/payments/ledger", "prod/payments/api"},
+				Grants: []BoundedGrant{
+					{Name: "payments-ledger-rw"},
+					{Name: "payments-outbox-r", ExpiresAt: "2030-01-01T00:00:00Z", Clusters: []string{"prod-us-east-1"}},
+				},
+			},
+		}
+	}
+	tests := []struct {
+		name   string
+		mutate func(s *Service)
+		want   string
+	}{
+		{"valid", func(*Service) {}, ""},
+		{"no members no grants", func(s *Service) { s.Spec.Members = nil; s.Spec.Grants = nil }, ""},
+		{"wrong kind", func(s *Service) { s.Kind = KindAssignment }, "kind must be Service"},
+		{"bad name", func(s *Service) { s.Metadata.Name = "Payments" }, "service name"},
+		{"no team", func(s *Service) { s.Spec.Team = "" }, "team \"\""},
+		{"bad team", func(s *Service) { s.Spec.Team = "Payments Team" }, "team \"Payments Team\""},
+		{"bad member", func(s *Service) { s.Spec.Members = []string{"spiffe://td/ns/sa"} }, "members: subject"},
+		{"member twice", func(s *Service) { s.Spec.Members = []string{"a/b/c", "a/b/c"} }, "members: \"a/b/c\" listed twice"},
+		{"grant twice", func(s *Service) { s.Spec.Grants = []BoundedGrant{{Name: "g"}, {Name: "g"}} }, "grants: \"g\" listed twice"},
+		{"bad grant name", func(s *Service) { s.Spec.Grants = []BoundedGrant{{Name: "G"}} }, "grants: grant name"},
+		{"bad expiry", func(s *Service) { s.Spec.Grants[0].ExpiresAt = "soon" }, "grants: payments-ledger-rw: expiresAt"},
+		{"empty cluster", func(s *Service) { s.Spec.Grants[0].Clusters = []string{""} }, "grants: payments-ledger-rw: clusters: empty name"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := base()
+			tt.mutate(s)
+			err := ValidateService(s)
+			if tt.want == "" {
+				if err != nil {
+					t.Errorf("ValidateService: %v, want valid", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error = %v, want it to contain %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestValidateSourceInvalidDocuments(t *testing.T) {
 	g := baseGrant()
 	g.Path = "grants/bad.yaml"
@@ -181,7 +234,11 @@ func TestValidateSourceInvalidDocuments(t *testing.T) {
 		Kind: KindAssignment, Metadata: Metadata{Name: "bad"}, Path: "assignments/bad.yaml",
 		Spec: AssignmentSpec{Subject: "prod/x/y", Grants: []string{"ghost"}, Clusters: []string{""}},
 	}
-	err := ValidateSource(&Source{Grants: []*Grant{g}, Assignments: []*Assignment{a}, Templates: map[string]*Template{}})
+	s := &Service{
+		Kind: KindService, Metadata: Metadata{Name: "bad"}, Path: "services/bad.yaml",
+		Spec: ServiceSpec{Members: []string{"prod/x/y"}, Grants: []BoundedGrant{{Name: "ghost"}}},
+	}
+	err := ValidateSource(&Source{Grants: []*Grant{g}, Assignments: []*Assignment{a}, Services: []*Service{s}, Templates: map[string]*Template{}})
 	if err == nil {
 		t.Fatal("ValidateSource succeeded, want an error")
 	}
@@ -190,6 +247,8 @@ func TestValidateSourceInvalidDocuments(t *testing.T) {
 		"must be 12 digits",
 		"assignment bad (assignments/bad.yaml): ",
 		"clusters: empty name",
+		"service bad (services/bad.yaml): ",
+		`team ""`,
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error = %v, want it to contain %q", err, want)

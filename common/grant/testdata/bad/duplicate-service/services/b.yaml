@@ -1,0 +1,5 @@
+kind: Service
+metadata:
+  name: payments-api
+spec:
+  team: billing

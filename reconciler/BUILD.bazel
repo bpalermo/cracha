@@ -1,0 +1,41 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "reconciler_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/bpalermo/cracha/reconciler",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//common/grant",
+        "//common/spicedb",
+        "//common/version",
+        "//reconciler/internal/reconcile",
+        "@com_github_authzed_authzed_go//proto/authzed/api/v1:api",
+        "@com_github_authzed_authzed_go//v1:authzed-go",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//credentials",
+        "@org_golang_google_grpc//credentials/insecure",
+    ],
+)
+
+go_binary(
+    name = "reconciler",
+    basename = "cracha-reconciler",
+    embed = [":reconciler_lib"],
+    # Pure Go, like the other binaries; the reconciler runs from CI or an
+    # operator's machine, not in an image.
+    pure = "on",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "reconciler_test",
+    srcs = ["main_test.go"],
+    data = glob(["testdata/**"]),
+    embed = [":reconciler_lib"],
+    deps = [
+        "//common/spicedb",
+        "//reconciler/internal/fakespicedb",
+        "@com_github_authzed_authzed_go//proto/authzed/api/v1:api",
+    ],
+)

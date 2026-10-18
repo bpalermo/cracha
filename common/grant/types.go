@@ -10,6 +10,7 @@ import (
 const (
 	KindGrant      = "Grant"
 	KindAssignment = "Assignment"
+	KindService    = "Service"
 )
 
 // STS limits the pipeline lints against (design 6.2 step 4 and 6.6).
@@ -161,14 +162,62 @@ type AssignmentSpec struct {
 	ExpiresAt string `json:"expiresAt,omitempty"`
 	// Clusters, when set, bounds the assignment to these clusters.
 	Clusters []string `json:"clusters,omitempty"`
+	// Suspended, when set, says the subject holds nothing, through this
+	// assignment or any other source, until it is cleared.
+	Suspended bool `json:"suspended,omitempty"`
 }
 
 // Expiry parses ExpiresAt. It returns the zero time when unset.
 func (s *AssignmentSpec) Expiry() (time.Time, error) {
-	if s.ExpiresAt == "" {
+	return parseExpiry(s.ExpiresAt)
+}
+
+// Service is a kind: Service document: a group of workloads that share an
+// owning team and a set of grants (see the package documentation).
+type Service struct {
+	Kind     string      `json:"kind"`
+	Metadata Metadata    `json:"metadata"`
+	Spec     ServiceSpec `json:"spec"`
+	// Path is the file the service was loaded from, relative to the source
+	// root, for messages.
+	Path string `json:"-"`
+}
+
+// Name returns the service's name.
+func (s *Service) Name() string { return s.Metadata.Name }
+
+// ServiceSpec is the body of a Service.
+type ServiceSpec struct {
+	// Team is the team that owns the service.
+	Team string `json:"team"`
+	// Members are the authorization subject encodings (design 4.3) of the
+	// service's workloads. A workload is a member of at most one service.
+	Members []string `json:"members,omitempty"`
+	// Grants are the grants every member holds.
+	Grants []BoundedGrant `json:"grants,omitempty"`
+}
+
+// BoundedGrant names a grant a service's members hold, optionally bounded
+// in time and to clusters the way an Assignment is.
+type BoundedGrant struct {
+	Name string `json:"name"`
+	// ExpiresAt, when set, bounds the grant in time (RFC 3339).
+	ExpiresAt string `json:"expiresAt,omitempty"`
+	// Clusters, when set, bounds the grant to these clusters.
+	Clusters []string `json:"clusters,omitempty"`
+}
+
+// Expiry parses ExpiresAt. It returns the zero time when unset.
+func (g *BoundedGrant) Expiry() (time.Time, error) {
+	return parseExpiry(g.ExpiresAt)
+}
+
+// parseExpiry parses an expiresAt field; empty is the zero time.
+func parseExpiry(s string) (time.Time, error) {
+	if s == "" {
 		return time.Time{}, nil
 	}
-	t, err := time.Parse(time.RFC3339, s.ExpiresAt)
+	t, err := time.Parse(time.RFC3339, s)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("expiresAt: %w", err)
 	}

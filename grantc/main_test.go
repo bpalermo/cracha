@@ -325,7 +325,7 @@ func TestPrintReport(t *testing.T) {
 				{Subject: "prod/billing/reports", Cluster: "eu-1", Grants: []string{"reports-r", "no-policy"}, PolicyChars: 130, Problems: grant.Problems{"two base roles"}},
 				{Subject: "prod/billing/other", Grants: []string{"no-policy"}},
 			},
-			Expired: []string{"old"},
+			Expired: []string{"assignment old"},
 		},
 		Skipped:  []string{"CheckNoNewAccess"},
 		Problems: grant.Problems{"reports-r: ValidatePolicy", "prod/billing/reports in cluster eu-1: two base roles"},

@@ -1,0 +1,7 @@
+# Two shapes for one subject: the composition lint rejects the tree.
+kind: Assignment
+metadata:
+  name: two-shapes
+spec:
+  subject: prod/payments/ledger
+  grants: [ledger-r, outbox-other]

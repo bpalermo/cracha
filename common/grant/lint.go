@@ -155,10 +155,12 @@ func matchEnvelope(res string, envelope []string) string {
 type Composition struct {
 	Subject string
 	// Cluster is the cluster the union applies to; empty when the subject's
-	// assignments name no cluster, so the union applies everywhere.
-	Cluster     string
-	Assignments []string
-	Grants      []string
+	// holdings name no cluster, so the union applies everywhere.
+	Cluster string
+	// Sources are where the grants come from, in order: an assignment's
+	// name, or "service <name>" for a membership.
+	Sources []string
+	Grants  []string
 	// BaseRoles are the distinct base roles of the grants; exactly one is
 	// the shape (design 6.2).
 	BaseRoles []string
@@ -174,63 +176,105 @@ type Composition struct {
 // CompositionReport is the result of LintComposition.
 type CompositionReport struct {
 	Compositions []Composition
-	// Expired are the assignments left out because their expiresAt has
-	// passed.
+	// Expired are the holdings left out because their expiresAt has
+	// passed: "assignment <name>" or "service <name> grant <grant>".
 	Expired []string
 	// Problems are every composition's problems, prefixed with the subject.
 	Problems Problems
 }
 
-// LintComposition checks, for every subject with assignments known in Git,
-// that the union of its grants stays within one shape, the size budget and
-// the union envelope (design 6.2, step 5): one base role, a composed policy
-// of at most MaxPolicyChars, at most MaxManagedPolicyArns managed policies,
-// and no session tag set to different values by two grants.
+// holding is one source of grants for a subject: an Assignment, or one
+// bounded grant of a service the subject is a member of.
+type holding struct {
+	// source is "assignment <name>" or "service <name> grant <grant>", for
+	// messages; origin is the assignment's name or "service <name>", for
+	// Composition.Sources.
+	source, origin string
+	subject        string
+	grants         []string
+	expiresAt      string
+	clusters       []string
+}
+
+// holdings lists every source of grants in the tree, assignments first and
+// then the services' grants for each member, in the tree's order. An
+// assignment that names no grant (a suspension alone) is no source.
+func holdings(src *Source) []holding {
+	var out []holding
+	for _, a := range src.Assignments {
+		if len(a.Spec.Grants) == 0 {
+			continue
+		}
+		out = append(out, holding{
+			source: "assignment " + a.Name(), origin: a.Name(), subject: a.Spec.Subject,
+			grants: a.Spec.Grants, expiresAt: a.Spec.ExpiresAt, clusters: a.Spec.Clusters,
+		})
+	}
+	for _, s := range src.Services {
+		for _, member := range s.Spec.Members {
+			for _, g := range s.Spec.Grants {
+				out = append(out, holding{
+					source: "service " + s.Name() + " grant " + g.Name, origin: "service " + s.Name(), subject: member,
+					grants: []string{g.Name}, expiresAt: g.ExpiresAt, clusters: g.Clusters,
+				})
+			}
+		}
+	}
+	return out
+}
+
+// LintComposition checks, for every subject with grants known in Git, that
+// the union of its grants stays within one shape, the size budget and the
+// union envelope (design 6.2, step 5): one base role, a composed policy of
+// at most MaxPolicyChars, at most MaxManagedPolicyArns managed policies,
+// and no session tag set to different values by two grants. A subject's
+// grants come from its Assignments and from the Service it is a member of;
+// a suspended subject is checked like any other, since lifting the
+// suspension must not surprise.
 //
 // rendered maps a grant's name to its rendered policy (empty for a grant
-// without one). Assignments expired at now are left out and reported. When
-// a subject's assignments name clusters, one union is checked per named
-// cluster, taking in the assignments that are not cluster-bound; otherwise
-// one union covers every cluster.
+// without one). Holdings expired at now are left out and reported. When a
+// subject's holdings name clusters, one union is checked per named
+// cluster, taking in the holdings that are not cluster-bound; otherwise one
+// union covers every cluster.
 func LintComposition(src *Source, rendered map[string]string, now time.Time) *CompositionReport {
 	r := &CompositionReport{}
-	bySubject := r.liveBySubject(src.Assignments, now)
+	bySubject := r.liveBySubject(holdings(src), now)
 	for _, subject := range sortedKeys(bySubject) {
-		assignments := bySubject[subject]
-		for _, cluster := range clusterScopes(assignments) {
-			in := assignmentsInCluster(assignments, cluster)
-			r.add(composeSubject(src, rendered, subject, cluster, in))
+		hs := bySubject[subject]
+		for _, cluster := range clusterScopes(hs) {
+			r.add(composeSubject(src, rendered, subject, cluster, holdingsInCluster(hs, cluster)))
 		}
 	}
 	return r
 }
 
-// liveBySubject groups the assignments by subject, leaving out and
-// recording the expired ones and those whose expiry does not parse.
-func (r *CompositionReport) liveBySubject(assignments []*Assignment, now time.Time) map[string][]*Assignment {
-	bySubject := map[string][]*Assignment{}
-	for _, a := range assignments {
-		exp, err := a.Spec.Expiry()
+// liveBySubject groups the holdings by subject, leaving out and recording
+// the expired ones and those whose expiry does not parse.
+func (r *CompositionReport) liveBySubject(hs []holding, now time.Time) map[string][]holding {
+	bySubject := map[string][]holding{}
+	for _, h := range hs {
+		exp, err := parseExpiry(h.expiresAt)
 		if err != nil {
-			r.Problems.addf("assignment %s: %v", a.Name(), err)
+			r.Problems.addf("%s: %v", h.source, err)
 			continue
 		}
 		if !exp.IsZero() && !exp.After(now) {
-			r.Expired = append(r.Expired, a.Name())
+			r.Expired = append(r.Expired, h.source)
 			continue
 		}
-		bySubject[a.Spec.Subject] = append(bySubject[a.Spec.Subject], a)
+		bySubject[h.subject] = append(bySubject[h.subject], h)
 	}
 	return bySubject
 }
 
 // clusterScopes returns the clusters a subject's unions are checked for:
-// every cluster its assignments name, sorted, or the one unnamed scope
-// when they name none.
-func clusterScopes(assignments []*Assignment) []string {
+// every cluster its holdings name, sorted, or the one unnamed scope when
+// they name none.
+func clusterScopes(hs []holding) []string {
 	clusters := map[string]bool{}
-	for _, a := range assignments {
-		for _, c := range a.Spec.Clusters {
+	for _, h := range hs {
+		for _, c := range h.clusters {
 			clusters[c] = true
 		}
 	}
@@ -240,13 +284,13 @@ func clusterScopes(assignments []*Assignment) []string {
 	return sortedKeys(clusters)
 }
 
-// assignmentsInCluster returns the assignments that apply in cluster: the
-// ones bound to it and the ones bound to no cluster.
-func assignmentsInCluster(assignments []*Assignment, cluster string) []*Assignment {
-	var in []*Assignment
-	for _, a := range assignments {
-		if len(a.Spec.Clusters) == 0 || slices.Contains(a.Spec.Clusters, cluster) {
-			in = append(in, a)
+// holdingsInCluster returns the holdings that apply in cluster: the ones
+// bound to it and the ones bound to no cluster.
+func holdingsInCluster(hs []holding, cluster string) []holding {
+	var in []holding
+	for _, h := range hs {
+		if len(h.clusters) == 0 || slices.Contains(h.clusters, cluster) {
+			in = append(in, h)
 		}
 	}
 	return in
@@ -265,9 +309,9 @@ func (r *CompositionReport) add(c Composition) {
 	}
 }
 
-func composeSubject(src *Source, rendered map[string]string, subject, cluster string, assignments []*Assignment) Composition {
+func composeSubject(src *Source, rendered map[string]string, subject, cluster string, hs []holding) Composition {
 	c := Composition{Subject: subject, Cluster: cluster, SessionTags: map[string]string{}}
-	c.Assignments, c.Grants = assignedGrants(assignments)
+	c.Sources, c.Grants = heldGrants(hs)
 	u := newGrantUnion()
 	for _, name := range c.Grants {
 		g := src.Grant(name)
@@ -291,17 +335,19 @@ func composeSubject(src *Source, rendered map[string]string, subject, cluster st
 	return c
 }
 
-// assignedGrants returns the assignments' names, in order, and the distinct
-// grants they name, sorted.
-func assignedGrants(assignments []*Assignment) (names, grants []string) {
+// heldGrants returns the holdings' origins, in order without repeats, and
+// the distinct grants they name, sorted.
+func heldGrants(hs []holding) (origins, grants []string) {
 	grantNames := map[string]bool{}
-	for _, a := range assignments {
-		names = append(names, a.Name())
-		for _, name := range a.Spec.Grants {
+	for _, h := range hs {
+		if !slices.Contains(origins, h.origin) {
+			origins = append(origins, h.origin)
+		}
+		for _, name := range h.grants {
 			grantNames[name] = true
 		}
 	}
-	return names, sortedKeys(grantNames)
+	return origins, sortedKeys(grantNames)
 }
 
 // grantUnion accumulates what a subject's grants put together, apart from

@@ -1,0 +1,34 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "reconcile",
+    srcs = [
+        "apply.go",
+        "desired.go",
+        "diff.go",
+        "relationship.go",
+    ],
+    importpath = "github.com/bpalermo/cracha/reconciler/internal/reconcile",
+    visibility = ["//reconciler:__subpackages__"],
+    deps = [
+        "//common/grant",
+        "//common/spicedb",
+        "@com_github_authzed_authzed_go//proto/authzed/api/v1:api",
+        "@org_golang_google_protobuf//types/known/structpb",
+    ],
+)
+
+go_test(
+    name = "reconcile_test",
+    srcs = [
+        "apply_test.go",
+        "desired_test.go",
+    ],
+    embed = [":reconcile"],
+    deps = [
+        "//common/grant",
+        "//common/spicedb",
+        "//reconciler/internal/fakespicedb",
+        "@com_github_authzed_authzed_go//proto/authzed/api/v1:api",
+    ],
+)
