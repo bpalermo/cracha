@@ -61,106 +61,6 @@ seccompProfile:
 {{ include "cracha.name" .root }}-{{ .component }}.{{ .root.Release.Namespace }}.svc
 {{- end -}}
 
-{{/* The URL the webhook points the pods' SDKs at. */}}
-{{- define "cracha.brokerUrl" -}}
-{{- if .Values.webhook.brokerUrl -}}
-{{ .Values.webhook.brokerUrl }}
-{{- else -}}
-https://{{ include "cracha.serviceHost" (dict "root" . "component" "broker") }}:{{ .Values.broker.port }}
-{{- end -}}
-{{- end -}}
-
-{{/*
-The Secret holding the webhook's certificate. Call with
-(dict "root" . "component" "webhook"); the webhook is the only component with
-a certificate from the chart, the broker serves its X.509-SVID.
-*/}}
-{{- define "cracha.tlsSecret" -}}
-{{- if eq .root.Values.tls.mode "existing" -}}
-{{ required (printf "tls.existingSecrets.%s is required with tls.mode existing" .component) (index .root.Values.tls.existingSecrets .component) }}
-{{- else -}}
-{{ include "cracha.name" .root }}-{{ .component }}-tls
-{{- end -}}
-{{- end -}}
-
-{{/* The TLS arguments of the webhook's container; the Secret is mounted at /etc/cracha/tls. */}}
-{{- define "cracha.tlsArgs" -}}
-- --tls-cert=/etc/cracha/tls/tls.crt
-- --tls-key=/etc/cracha/tls/tls.key
-{{- end -}}
-
-{{/* The volume mount and volume of the webhook's certificate. Same arguments as cracha.tlsSecret. */}}
-{{- define "cracha.tlsVolumeMount" -}}
-- name: tls
-  mountPath: /etc/cracha/tls
-  readOnly: true
-{{- end -}}
-
-{{- define "cracha.tlsVolume" -}}
-- name: tls
-  secret:
-    secretName: {{ include "cracha.tlsSecret" . }}
-{{- end -}}
-
-{{/*
-The MutatingWebhookConfiguration (design 7.4). Call with
-(dict "root" . "caBundle" <base64 PEM or ""> "annotations" <dict>): in the
-generated mode tls.yaml renders it with the authority it just made, so the
-two cannot disagree; the other modes render it from
-webhook-configuration.yaml.
-*/}}
-{{- define "cracha.webhookConfiguration" -}}
-{{- $root := .root -}}
-{{- $excluded := list $root.Release.Namespace "kube-system" -}}
-{{- range $ns := $root.Values.webhook.excludedNamespaces -}}
-{{- if not (has $ns $excluded) }}{{ $excluded = append $excluded $ns }}{{ end -}}
-{{- end -}}
-apiVersion: admissionregistration.k8s.io/v1
-kind: MutatingWebhookConfiguration
-metadata:
-  name: {{ include "cracha.name" $root }}-webhook
-  labels:
-    {{- include "cracha.labels" $root | nindent 4 }}
-    app.kubernetes.io/component: webhook
-  {{- with .annotations }}
-  annotations:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-webhooks:
-  - name: pods.cracha.dev
-    admissionReviewVersions: [v1]
-    sideEffects: None
-    # A pod must never be admitted unwired because the webhook was
-    # unreachable.
-    failurePolicy: Fail
-    timeoutSeconds: {{ $root.Values.webhook.timeoutSeconds }}
-    clientConfig:
-      service:
-        name: {{ include "cracha.name" $root }}-webhook
-        namespace: {{ $root.Release.Namespace }}
-        path: /mutate
-        port: 443
-      {{- with .caBundle }}
-      caBundle: {{ . }}
-      {{- end }}
-    rules:
-      - apiGroups: [""]
-        apiVersions: [v1]
-        operations: [CREATE]
-        resources: [pods]
-    # The release's own namespace is left out: a pod of the webhook's own
-    # namespace must not depend on the webhook to start. kube-system runs
-    # nothing the broker serves.
-    namespaceSelector:
-      matchExpressions:
-        - key: kubernetes.io/metadata.name
-          operator: NotIn
-          values:
-            {{- range $excluded }}
-            - {{ . }}
-            {{- end }}
-{{- end -}}
-
 {{/*
 How the grant bundle's signature is verified, from broker.bundle: "" when no
 bundle source is configured, else exactly one of "inline" (verifyKey, kept in
@@ -221,20 +121,21 @@ Secret holding its preshared key, and takes at most one of a CA and insecure.
 {{- end -}}
 
 {{/*
-The broker's Workload API volume source (broker.workloadAPI.volume): the one
-of hostPath and csi that `type` names. Helm merges an install's values into
-the defaults, so rendering the whole map would give a volume that sets the
-default hostPath beside the csi source an install chose, which the apiserver
-refuses; only the chosen source is rendered.
+A component's Workload API volume source (<component>.workloadAPI.volume):
+the one of hostPath and csi that `type` names. Helm merges an install's
+values into the defaults, so rendering the whole map would give a volume
+that sets the default hostPath beside the csi source an install chose, which
+the apiserver refuses; only the chosen source is rendered. Call with
+(dict "component" "broker" "volume" .Values.broker.workloadAPI.volume).
 */}}
 {{- define "cracha.workloadAPIVolumeSource" -}}
-{{- $v := .Values.broker.workloadAPI.volume -}}
+{{- $v := .volume -}}
 {{- if not (has $v.type (list "hostPath" "csi")) -}}
-{{- fail (printf "broker.workloadAPI.volume.type must be hostPath or csi, not %q" $v.type) -}}
+{{- fail (printf "%s.workloadAPI.volume.type must be hostPath or csi, not %q" .component $v.type) -}}
 {{- end -}}
 {{- $source := index $v $v.type -}}
 {{- if not $source -}}
-{{- fail (printf "broker.workloadAPI.volume.%s is required with broker.workloadAPI.volume.type %s" $v.type $v.type) -}}
+{{- fail (printf "%s.workloadAPI.volume.%s is required with %s.workloadAPI.volume.type %s" .component $v.type .component $v.type) -}}
 {{- end -}}
 {{ $v.type }}:
   {{- toYaml $source | nindent 2 }}

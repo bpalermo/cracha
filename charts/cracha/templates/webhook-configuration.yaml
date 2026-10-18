@@ -1,12 +1,51 @@
 {{- /*
-The webhook registration in the modes where the authority comes from outside
-the chart. In the generated mode tls.yaml renders it, with the authority it
-makes.
+The webhook registration (design 7.5). It carries no caBundle: the webhook
+serves its X.509-SVID, and patches the trust bundle it is issued under into
+this object at start and on every change (the ClusterRole grants it get and
+patch on this one object). Until that first patch the apiserver cannot reach
+the webhook, and with failurePolicy Fail admits no pod of the namespaces
+below; that window is the webhook's start.
 */ -}}
-{{- if eq .Values.tls.mode "existing" }}
-{{- $caBundle := required "tls.caBundle is required with tls.mode existing: the base64 PEM of the authority that signed the webhook's certificate" .Values.tls.caBundle }}
-{{- include "cracha.webhookConfiguration" (dict "root" . "caBundle" $caBundle "annotations" dict) }}
-{{- else if eq .Values.tls.mode "cert-manager" }}
-{{- $annotations := dict "cert-manager.io/inject-ca-from" (printf "%s/%s-webhook" .Release.Namespace (include "cracha.name" .)) }}
-{{- include "cracha.webhookConfiguration" (dict "root" . "caBundle" "" "annotations" $annotations) }}
-{{- end }}
+{{- $excluded := list .Release.Namespace -}}
+{{- range $ns := .Values.webhook.excludedNamespaces -}}
+{{- if not (has $ns $excluded) }}{{ $excluded = append $excluded $ns }}{{ end -}}
+{{- end -}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: {{ include "cracha.name" . }}-webhook
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webhook
+webhooks:
+  - name: pods.cracha.dev
+    admissionReviewVersions: [v1]
+    sideEffects: None
+    # A pod must never be admitted unwired because the webhook was
+    # unreachable.
+    failurePolicy: Fail
+    timeoutSeconds: {{ .Values.webhook.timeoutSeconds }}
+    clientConfig:
+      service:
+        name: {{ include "cracha.name" . }}-webhook
+        namespace: {{ .Release.Namespace }}
+        path: /mutate
+        port: 443
+    rules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+    # The release's own namespace is left out: a pod of the webhook's own
+    # namespace must not depend on the webhook to start. The identity
+    # issuer's namespaces (webhook.excludedNamespaces) are left out because
+    # the webhook's certificate comes from the issuer's agent, which must
+    # start without the webhook.
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            {{- range $excluded }}
+            - {{ . }}
+            {{- end }}

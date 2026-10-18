@@ -177,9 +177,8 @@ func TestBrokerServesSPIFFEMTLS(t *testing.T) {
 	}
 }
 
-// The broker has no certificate from the chart, in any TLS mode: no mount,
-// no Secret, no cert-manager Certificate; the webhook's are not asserted
-// here.
+// The broker has no certificate from the chart: no mount, no Secret, no
+// Certificate object; TestWebhookDeployment asserts the same of the webhook.
 func TestBrokerHasNoChartCertificate(t *testing.T) {
 	for rendering, name := range map[string]string{"defaults": "cracha", "overrides": "custom"} {
 		t.Run(rendering, func(t *testing.T) {
@@ -215,4 +214,139 @@ func stringListOf(v any, key string) []string {
 		}
 	}
 	return out
+}
+
+// The webhook configuration (design 7.5): rendered without a caBundle, which
+// the webhook publishes itself, with failurePolicy Fail, and excluding the
+// release's namespace and the namespaces the values list, each once.
+func TestWebhookConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		rendering, name string
+		excluded        []string
+	}{
+		{"defaults", "cracha-webhook", []string{"default", "spire-system", "spire-server", "spire-mgmt", "kube-system"}},
+		{"overrides", "custom-webhook", []string{"default", "spire", "kube-system"}},
+	} {
+		t.Run(tc.rendering, func(t *testing.T) {
+			cfg := object(t, rendered(t, tc.rendering), "MutatingWebhookConfiguration", tc.name)
+			if ann := path(cfg, "metadata", "annotations"); ann != nil {
+				t.Errorf("annotations %v, want none (no CA injector)", ann)
+			}
+			hooks, _ := path(cfg, "webhooks").([]any)
+			if len(hooks) != 1 {
+				t.Fatalf("%d webhooks, want 1", len(hooks))
+			}
+			hook := hooks[0]
+			if _, ok := path(hook, "clientConfig", "caBundle").(string); ok {
+				t.Error("the configuration carries a caBundle; the webhook publishes it itself")
+			}
+			if got := path(hook, "failurePolicy"); got != "Fail" {
+				t.Errorf("failurePolicy %v, want Fail", got)
+			}
+			if got := path(hook, "clientConfig", "service", "name"); got != tc.name {
+				t.Errorf("clientConfig.service.name %v, want %s", got, tc.name)
+			}
+			exprs, _ := path(hook, "namespaceSelector", "matchExpressions").([]any)
+			if len(exprs) != 1 {
+				t.Fatalf("%d selector expressions, want 1", len(exprs))
+			}
+			if key, op := path(exprs[0], "key"), path(exprs[0], "operator"); key != "kubernetes.io/metadata.name" || op != "NotIn" {
+				t.Errorf("selector is %v %v, want kubernetes.io/metadata.name NotIn", key, op)
+			}
+			if got := stringList(path(exprs[0], "values")); !slices.Equal(got, tc.excluded) {
+				t.Errorf("excluded namespaces %q, want %q", got, tc.excluded)
+			}
+		})
+	}
+}
+
+// webhookArgs are the webhook container's arguments in a rendering.
+func webhookArgs(t *testing.T, rendering, name string) []string {
+	t.Helper()
+	deploy := object(t, rendered(t, rendering), "Deployment", name)
+	containers, _ := path(deploy, "spec", "template", "spec", "containers").([]any)
+	if len(containers) != 1 {
+		t.Fatalf("%d containers, want 1", len(containers))
+	}
+	return stringList(path(containers[0], "args"))
+}
+
+// The webhook is told what the agent values say (design 7.5): the loopback
+// port, the enrolment mode and, in the init mode only, the agent image by
+// digest with the enrolment port and timeout; its serving identity comes
+// from the Workload API, not from a Secret.
+func TestWebhookDeployment(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		args := webhookArgs(t, "defaults", "cracha-webhook")
+		for _, want := range []string{
+			"--workload-api-socket=unix:///spiffe-workload-api/spire-agent.sock",
+			"--webhook-config-name=cracha-webhook",
+			"--service-dns-name=cracha-webhook.default.svc",
+			"--agent-port=8780",
+			"--enrol=init",
+			"--enrol-port=8781",
+			"--enrol-timeout=60s",
+			"--default-region=us-east-1",
+		} {
+			if !slices.Contains(args, want) {
+				t.Errorf("args %q lack %q", args, want)
+			}
+		}
+		image := ""
+		for _, a := range args {
+			if strings.HasPrefix(a, "--agent-image=") {
+				image = strings.TrimPrefix(a, "--agent-image=")
+			}
+			if strings.HasPrefix(a, "--tls-") || strings.HasPrefix(a, "--broker-url") {
+				t.Errorf("args carry %q, which the webhook no longer takes", a)
+			}
+		}
+		// The agent image's repository and digest are stamped at package
+		// time from //agent:image_push; the reference is by digest.
+		if image == "" || !strings.Contains(image, "@") {
+			t.Errorf("--agent-image=%q, want a reference by digest", image)
+		}
+	})
+	t.Run("overrides", func(t *testing.T) {
+		args := webhookArgs(t, "overrides", "custom-webhook")
+		for _, want := range []string{
+			"--workload-api-socket=unix:///spiffe-workload-api/socket",
+			"--webhook-config-name=custom-webhook",
+			"--service-dns-name=custom-webhook.default.svc",
+			"--agent-port=9780",
+			"--enrol=cni",
+			"--conflicting-env=strip",
+		} {
+			if !slices.Contains(args, want) {
+				t.Errorf("args %q lack %q", args, want)
+			}
+		}
+		for _, a := range args {
+			if strings.HasPrefix(a, "--agent-image=") || strings.HasPrefix(a, "--enrol-port=") || strings.HasPrefix(a, "--enrol-timeout=") {
+				t.Errorf("args carry %q in the cni mode", a)
+			}
+		}
+	})
+	t.Run("no TLS Secret", func(t *testing.T) {
+		for _, tc := range []struct{ rendering, name string }{{"defaults", "cracha-webhook"}, {"overrides", "custom-webhook"}} {
+			deploy := object(t, rendered(t, tc.rendering), "Deployment", tc.name)
+			volumes, _ := path(deploy, "spec", "template", "spec", "volumes").([]any)
+			var names []string
+			for _, v := range volumes {
+				name, _ := path(v, "name").(string)
+				names = append(names, name)
+				if path(v, "secret") != nil {
+					t.Errorf("%s: volume %s is a Secret; the webhook's certificate is its SVID", tc.rendering, name)
+				}
+			}
+			if !slices.Equal(names, []string{"spire-workload-api"}) {
+				t.Errorf("%s: volumes %q, want the Workload API only", tc.rendering, names)
+			}
+			for _, d := range rendered(t, tc.rendering) {
+				if d.kind() == "Secret" && strings.Contains(d.name(), "webhook") {
+					t.Errorf("%s: Secret %s rendered for the webhook", tc.rendering, d.name())
+				}
+			}
+		}
+	})
 }

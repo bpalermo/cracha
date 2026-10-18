@@ -3,11 +3,6 @@
 nameOverride: custom
 imagePullSecrets:
   - name: registry-credentials
-tls:
-  mode: existing
-  existingSecrets:
-    webhook: webhook-certs
-  caBundle: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCg==
 broker:
   image:
     repository: registry.example.com/cracha/broker
@@ -138,6 +133,17 @@ csi:
       memory: 128Mi
   podAnnotations:
     example.com/scrape: "true"
+# The values the webhook reads of the agent's (the agent slice owns the
+# block): the cni enrolment mode, which injects no init container.
+agent:
+  image:
+    repository: registry.example.com/cracha/agent
+    digest: sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+    pullPolicy: Always
+  port: 9780
+  enrol: cni
+  enrolPort: 9781
+  enrolTimeout: 2m
 webhook:
   image:
     repository: registry.example.com/cracha/webhook
@@ -146,7 +152,13 @@ webhook:
     pullPolicy: Always
   replicas: 1
   port: 9443
-  brokerUrl: https://credentials.example.org
+  workloadAPI:
+    volume:
+      type: csi
+      csi:
+        driver: csi.spiffe.io
+        readOnly: true
+    socket: socket
   defaultRegion: eu-west-1
   conflictingEnv: strip
   saCacheTTL: 0s

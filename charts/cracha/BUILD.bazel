@@ -87,10 +87,10 @@ helm_template_test(
     values = REQUIRED_VALUES,
 )
 
-# Every non-default knob: tls.mode existing with the webhook's Secret and CA
-# bundle, the broker's agent identity and health port, the SpiceDB backend,
-# existing ConfigMaps, every image overridden, trust-domain labels, the env
-# and envFrom, the scheduling knobs of each component.
+# Every non-default knob: the broker's agent identity and health port, the
+# SpiceDB backend, existing ConfigMaps, every image overridden, trust-domain
+# labels, the env and envFrom, the cni enrolment mode, the webhook's
+# Workload API source and exclusions, the scheduling knobs of each component.
 helm_template_test(
     name = "cracha_overrides_template_test",
     size = "small",
@@ -124,15 +124,6 @@ helm_lint_test(
         "static-configmap",
     ]
 ]
-
-# The webhook's third TLS mode, which renders a cert-manager Certificate
-# instead of a Secret.
-helm_template_test(
-    name = "cracha_cert_manager_template_test",
-    size = "small",
-    chart = ":cracha",
-    values = REQUIRED_VALUES + ["test/cert-manager.yaml"],
-)
 
 # The chart rendered with the pinned helm, for the assertions the Go tests
 # below make on the objects (render_test.go decodes them): helm_template_test

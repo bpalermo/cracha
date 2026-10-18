@@ -227,7 +227,7 @@ spec:
         # trust bundles the JWT-SVIDs are verified against come from its
         # Workload API connection (design 6.5).
         - name: spire-workload-api
-          {{- include "cracha.workloadAPIVolumeSource" . | nindent 10 }}
+          {{- include "cracha.workloadAPIVolumeSource" (dict "component" "broker" "volume" .Values.broker.workloadAPI.volume) | nindent 10 }}
 ---
 # The broker's service account exists for the platform identity (design 5):
 # an IAM role annotation, or an EKS Pod Identity association. It holds no

@@ -5,56 +5,6 @@ nameOverride: ""
 # Pull secrets added to every pod of the chart.
 imagePullSecrets: []
 
-# The serving certificate of the webhook, which the apiserver calls and
-# verifies by the webhook's Service name. The broker is not here: it serves
-# SPIFFE mTLS with its own X.509-SVID from the Workload API and accepts only
-# the node agent's SVID (design 6.5; broker.agentSpiffeID below), so nothing
-# in a pod has anything to trust. This block goes when the webhook serves its
-# X.509-SVID too (design 7.5).
-tls:
-  # generated     The chart creates a private certificate authority and the
-  #               webhook's certificate at render time, in Secrets it keeps
-  #               across upgrades, and puts the authority in the webhook
-  #               configuration's caBundle. A certificate close to expiring
-  #               is replaced by the next `helm upgrade` (see generated,
-  #               below); the authority itself, valid for ten years, is never
-  #               renewed.
-  # existing      You provide the Secret (type kubernetes.io/tls: tls.crt and
-  #               tls.key), for example from your PKI, and the CA bundle the
-  #               apiserver verifies the webhook's certificate with.
-  # cert-manager  The chart creates a cert-manager Certificate from the
-  #               issuer named below, and annotates the webhook configuration
-  #               for cert-manager's CA injector to fill in the caBundle.
-  #               Needs cert-manager, with its CA injector, in the cluster.
-  mode: generated
-
-  # With mode "generated": how long the certificate is valid, and how close
-  # to its expiry an upgrade replaces it. With these defaults, any upgrade in
-  # the certificate's last two months renews it.
-  generated:
-    validityDays: 365
-    renewBeforeDays: 60
-
-  # With mode "existing": the webhook's Secret. The certificate must carry
-  # <name>-webhook.<namespace>.svc.
-  existingSecrets:
-    webhook: ""
-
-  # With mode "existing": the PEM bundle, base64-encoded, of the authority
-  # that signed the webhook's certificate; the apiserver verifies the webhook
-  # with it (clientConfig.caBundle).
-  caBundle: ""
-
-  # With mode "cert-manager": the issuer of the certificate and its
-  # lifetime, as cert-manager's Certificate takes them.
-  certManager:
-    issuerRef:
-      name: ""
-      kind: ClusterIssuer
-      group: cert-manager.io
-    duration: 2160h
-    renewBefore: 360h
-
 # Every image of the chart is set the same way:
 #
 #   repository  Substituted at package time from the component's image_push
@@ -346,8 +296,45 @@ csi:
   resources: {}
   podAnnotations: {}
 
-# The mutating webhook (design 7.4): wires the CSI volume and the SDK's
-# environment into pods whose ServiceAccount opts in.
+# The node agent (design 7). These are the values the webhook reads; the
+# agent slice owns the block and its DaemonSet, and defines the rest of it.
+agent:
+  image:
+    repository: "{@//agent:image_push.repository}"
+    tag: ""
+    digest: "{@//agent:image_push.digest}"
+    pullPolicy: IfNotPresent
+
+  # The port of the loopback listener the agent binds inside every enrolled
+  # pod's network namespace (design 7.1), the same in every pod: the webhook
+  # writes http://127.0.0.1:<port>/v1/credentials into
+  # AWS_CONTAINER_CREDENTIALS_FULL_URI.
+  port: 8780
+
+  # How a new pod's listener gets bound (design 7.2):
+  #   init  the webhook injects the init container cracha-enrol, which calls
+  #         the agent on the node's address with a projected token; needs
+  #         nothing of the node but the agent.
+  #   cni   a chained CNI plugin the agent installs on every node enrols the
+  #         pod on its sandbox; nothing enters the pod spec but the
+  #         environment and the label.
+  enrol: init
+
+  # With enrol init: the port of the agent's enrolment endpoint on the
+  # node's address (host network), and how long the init container retries
+  # enrolment before it fails and kubelet restarts it.
+  enrolPort: 8781
+  enrolTimeout: 60s
+
+# The mutating webhook (design 7.5): for pods whose ServiceAccount opts in,
+# the loopback credentials endpoint in every container's environment, the
+# enrolment label and, with agent.enrol init, the enrolment init container.
+# It serves its X.509-SVID from the Workload API and keeps the caBundle of
+# its own webhook configuration at its trust bundle, so nothing but the
+# identity issuer signs anything here: the issuer must give the webhook's
+# service account an entry whose X.509-SVID carries the DNS SAN
+# <name>-webhook.<namespace>.svc (design 4.2; SPIRE: a ClusterSPIFFEID with
+# dnsNameTemplates).
 webhook:
   image:
     repository: "{@//webhook:image_push.repository}"
@@ -363,11 +350,19 @@ webhook:
   # The HTTPS port in the pod; the Service listens on 443.
   port: 8443
 
-  # The URL the SDK in every wired pod fetches credentials from: the broker.
-  # Empty is the broker Service of this release,
-  # https://<name>-broker.<namespace>.svc:<broker.port>. Set it when the
-  # broker is reached under another name, which its certificate must carry.
-  brokerUrl: ""
+  # The SPIFFE Workload API the webhook's X.509-SVID and trust bundle come
+  # from, shaped as the broker's: the volume holding the socket, chosen by
+  # `type` among the sources beside it, and the socket's file name in it.
+  workloadAPI:
+    volume:
+      type: hostPath
+      hostPath:
+        path: /run/spire/agent-sockets
+        type: Directory
+      csi:
+        driver: csi.spiffe.io
+        readOnly: true
+    socket: spire-agent.sock
 
   # AWS_REGION for the pods that do not set their own. Required.
   defaultRegion: ""
@@ -382,10 +377,17 @@ webhook:
   # How long the apiserver waits for an answer before failing the pod.
   timeoutSeconds: 10
 
-  # Namespaces the webhook never sees, besides the release's own namespace
-  # (a pod of the webhook's own namespace must not depend on the webhook to
-  # start) and kube-system: the identity issuer's, for example.
-  excludedNamespaces: []
+  # Namespaces the webhook never sees, besides the release's own namespace,
+  # which is always excluded: a pod of the webhook's own namespace must not
+  # depend on the webhook to start, and the identity issuer's agent, which
+  # the webhook's certificate comes from, must start without the webhook
+  # (design 7.5). The default is SPIRE's usual namespaces and kube-system;
+  # a list given here replaces it, so repeat what still applies.
+  excludedNamespaces:
+    - spire-system
+    - spire-server
+    - spire-mgmt
+    - kube-system
 
   # The log level: debug, info, warn or error.
   logLevel: info
