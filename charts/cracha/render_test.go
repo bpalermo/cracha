@@ -273,8 +273,9 @@ func webhookArgs(t *testing.T, rendering, name string) []string {
 
 // The webhook is told what the agent values say (design 7.5): the loopback
 // port, the enrolment mode and, in the init mode only, the agent image by
-// digest with the enrolment port and timeout; its serving identity comes
-// from the Workload API, not from a Secret.
+// digest with the enrolment port, timeout and the init container's
+// resources; its serving identity comes from the Workload API, not from a
+// Secret.
 func TestWebhookDeployment(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
 		args := webhookArgs(t, "defaults", "cracha-webhook")
@@ -286,6 +287,8 @@ func TestWebhookDeployment(t *testing.T) {
 			"--enrol=init",
 			"--enrol-port=9798",
 			"--enrol-timeout=2m",
+			"--enrol-cpu=100m",
+			"--enrol-memory=32Mi",
 			"--default-region=us-east-1",
 		} {
 			if !slices.Contains(args, want) {
@@ -318,6 +321,8 @@ func TestWebhookDeployment(t *testing.T) {
 			"--agent-image=registry.example.com/cracha/agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 			"--enrol-port=17172",
 			"--enrol-timeout=30s",
+			"--enrol-cpu=200m",
+			"--enrol-memory=64Mi",
 			"--conflicting-env=strip",
 		} {
 			if !slices.Contains(args, want) {
@@ -333,8 +338,10 @@ func TestWebhookDeployment(t *testing.T) {
 			}
 		}
 		for _, a := range args {
-			if strings.HasPrefix(a, "--agent-image=") || strings.HasPrefix(a, "--enrol-port=") || strings.HasPrefix(a, "--enrol-timeout=") {
-				t.Errorf("args carry %q in the cni mode", a)
+			for _, prefix := range []string{"--agent-image=", "--enrol-port=", "--enrol-timeout=", "--enrol-cpu=", "--enrol-memory="} {
+				if strings.HasPrefix(a, prefix) {
+					t.Errorf("args carry %q in the cni mode", a)
+				}
 			}
 		}
 	})

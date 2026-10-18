@@ -14,6 +14,7 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -90,6 +91,19 @@ const (
 
 	// enrolUID is distroless's nonroot user, which the agent image runs as.
 	enrolUID int64 = 65532
+
+	// DefaultEnrolCPU and DefaultEnrolMemory are the init container's
+	// resources (requests and limits alike) unless the deployment says
+	// otherwise: the chart's agent.enrolResources. The CPU is what keeps a
+	// process that lives for a second out of CFS throttling: with 10m,
+	// runc's init and the enrol binary were throttled to the point of
+	// holding a pod in Init for close to 30 seconds (measured on kind:
+	// 10m 28 s, 100m 2.7 s, 250m 1.5 s, 500m 1.2 s from pod creation to
+	// the container's exit). The request is also what the scheduler
+	// counts for the pod while it initialises, so it is the smallest
+	// value that does not throttle.
+	DefaultEnrolCPU    = "100m"
+	DefaultEnrolMemory = "32Mi"
 )
 
 // ConflictPolicy says what happens to a pod that sets a conflicting variable.
@@ -182,6 +196,33 @@ type Config struct {
 	// EnrolTimeout is how long the init container retries enrolment before
 	// it fails (agent.enrolTimeout); required in the init mode.
 	EnrolTimeout time.Duration
+	// EnrolCPU and EnrolMemory are the init container's resources, set as
+	// its requests and its limits alike (agent.enrolResources); required
+	// in the init mode. See DefaultEnrolCPU.
+	EnrolCPU    resource.Quantity
+	EnrolMemory resource.Quantity
+}
+
+// QuantityValue is a flag.Value that parses a resource quantity such as
+// 100m or 32Mi into the Quantity it points at.
+type QuantityValue struct{ Q *resource.Quantity }
+
+// String implements flag.Value.
+func (v QuantityValue) String() string {
+	if v.Q == nil {
+		return ""
+	}
+	return v.Q.String()
+}
+
+// Set implements flag.Value.
+func (v QuantityValue) Set(s string) error {
+	q, err := resource.ParseQuantity(s)
+	if err != nil {
+		return fmt.Errorf("%q is not a resource quantity such as 100m or 32Mi: %w", s, err)
+	}
+	*v.Q = q
+	return nil
 }
 
 // CredentialsURI is the value of AWS_CONTAINER_CREDENTIALS_FULL_URI.
@@ -208,6 +249,12 @@ func (c Config) validate() error {
 	}
 	if c.EnrolTimeout <= 0 {
 		return fmt.Errorf("enrolment timeout %s must be positive", c.EnrolTimeout)
+	}
+	if c.EnrolCPU.Sign() <= 0 {
+		return fmt.Errorf("enrolment container CPU %s must be positive", c.EnrolCPU.String())
+	}
+	if c.EnrolMemory.Sign() <= 0 {
+		return fmt.Errorf("enrolment container memory %s must be positive", c.EnrolMemory.String())
 	}
 	return nil
 }

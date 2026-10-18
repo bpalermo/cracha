@@ -17,6 +17,7 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -44,6 +45,8 @@ func config(mode EnrolMode, policy ConflictPolicy) Config {
 		AgentImage:     agentImage,
 		EnrolPort:      enrolPort,
 		EnrolTimeout:   enrolTimeout,
+		EnrolCPU:       resource.MustParse(DefaultEnrolCPU),
+		EnrolMemory:    resource.MustParse(DefaultEnrolMemory),
 	}
 }
 
@@ -754,9 +757,12 @@ func TestGolden(t *testing.T) {
 }
 
 // TestEnrolContainer pins what the init container asks of the pod: nothing
-// a restricted namespace refuses, and nothing but the token.
+// a restricted namespace refuses, nothing but the token, and the resources
+// the configuration gives, as requests and limits alike.
 func TestEnrolContainer(t *testing.T) {
-	pl := planner{cfg: config(EnrolInit, Reject)}
+	cfg := config(EnrolInit, Reject)
+	cfg.EnrolCPU, cfg.EnrolMemory = resource.MustParse("150m"), resource.MustParse("24Mi")
+	pl := planner{cfg: cfg}
 	c := pl.enrolContainer()
 	sc := c.SecurityContext
 	switch {
@@ -795,9 +801,9 @@ func TestEnrolContainer(t *testing.T) {
 			t.Errorf("%s = %q, want %q", name, got[name].Value, want)
 		}
 	}
-	if c.Resources.Limits.Cpu().IsZero() || !c.Resources.Limits.Cpu().Equal(*c.Resources.Requests.Cpu()) ||
-		c.Resources.Limits.Memory().IsZero() || !c.Resources.Limits.Memory().Equal(*c.Resources.Requests.Memory()) {
-		t.Errorf("resources %+v, want requests equal to limits", c.Resources)
+	if !c.Resources.Limits.Cpu().Equal(cfg.EnrolCPU) || !c.Resources.Requests.Cpu().Equal(cfg.EnrolCPU) ||
+		!c.Resources.Limits.Memory().Equal(cfg.EnrolMemory) || !c.Resources.Requests.Memory().Equal(cfg.EnrolMemory) {
+		t.Errorf("resources %+v, want requests and limits of %s CPU and %s memory", c.Resources, cfg.EnrolCPU.String(), cfg.EnrolMemory.String())
 	}
 
 	v := enrolVolume()
@@ -863,6 +869,9 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		"init without port":      func(c *Config) { c.EnrolPort = 0 },
 		"init without timeout":   func(c *Config) { c.EnrolTimeout = 0 },
 		"init negative timeout":  func(c *Config) { c.EnrolTimeout = -time.Second },
+		"init without cpu":       func(c *Config) { c.EnrolCPU = resource.Quantity{} },
+		"init negative cpu":      func(c *Config) { c.EnrolCPU = resource.MustParse("-100m") },
+		"init without memory":    func(c *Config) { c.EnrolMemory = resource.Quantity{} },
 		"cni without agent port": func(c *Config) { c.Enrol = EnrolCNI; c.AgentPort = 0 },
 	} {
 		cfg := good
@@ -913,6 +922,20 @@ func TestConflictPolicyFlag(t *testing.T) {
 	}
 	if err := p.Set("drop"); err == nil {
 		t.Error("Set(drop) succeeded")
+	}
+}
+
+func TestQuantityValue(t *testing.T) {
+	var q resource.Quantity
+	v := QuantityValue{Q: &q}
+	if err := v.Set("250m"); err != nil || v.String() != "250m" || !q.Equal(resource.MustParse("250m")) {
+		t.Errorf("Set(250m): %v, String() = %q, quantity %s", err, v.String(), q.String())
+	}
+	if err := v.Set("lots"); err == nil {
+		t.Error("Set accepted \"lots\"")
+	}
+	if (QuantityValue{}).String() != "" {
+		t.Error("the zero value does not print empty")
 	}
 }
 

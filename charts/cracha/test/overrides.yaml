@@ -103,6 +103,9 @@ agent:
   enrol: init
   enrolPort: 17172
   enrolTimeout: 30s
+  enrolResources:
+    cpu: 200m
+    memory: 64Mi
   cni:
     socket: /var/run/cracha/agent.sock
     binDir: /usr/libexec/cni

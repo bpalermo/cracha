@@ -205,7 +205,12 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   `cracha-agent`, at `mutate.EnrolTokenPath`, also in
   `CRACHA_ENROL_TOKEN_FILE`; `CRACHA_HOST_IP`, `CRACHA_ENROL_PORT`,
   `CRACHA_AGENT_PORT`, `CRACHA_ENROL_TIMEOUT`; every name is
-  `agent/enrolapi`'s, the one definition of the contract); the golden
+  `agent/enrolapi`'s, the one definition of the contract) with the
+  resources of `--enrol-cpu` and `--enrol-memory` as its requests and
+  limits alike (defaults `mutate.DefaultEnrolCPU`, 100m, and 32Mi: under
+  about 100m runc's init and the enrol binary are CFS-throttled and a pod
+  sits in Init for tens of seconds, which the e2e's first-fetch test
+  bounds at 5 s); the golden
   pods of each mode are
   `internal/mutate/testdata/*.golden.json` (refresh with
   `--test_env=UPDATE_GOLDEN=1`). `internal/server` serves HTTPS with the
@@ -304,7 +309,9 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   `values.yaml` by hand; `//charts/cracha:pin_test` checks the result with
   `bazel/chart-pin.sh`.
 - The agent's values are `agent.*` with the design's names: `port`,
-  `enrol` (`init` or `cni`), `enrolPort`, `enrolTimeout`, `fetchDeadline`,
+  `enrol` (`init` or `cni`), `enrolPort`, `enrolTimeout`, `enrolResources`
+  (`cpu` and `memory` of the `cracha-enrol` init container, passed to the
+  webhook as `--enrol-cpu` and `--enrol-memory`), `fetchDeadline`,
   `brokerUrl`, `brokerSpiffeID` (empty: the broker ServiceAccount's path in
   the agent's own trust domain), `criSocket`, `netnsDir`, `cni.socket`,
   `cni.binDir`, `cni.confDir`. The DaemonSet is in the host network with
@@ -357,7 +364,8 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   SPIRE's namespaces and `kube-system`). The webhook reads the agent's
   values `agent.image`, `agent.port`, `agent.enrol` (`init` injects the
   `cracha-enrol` init container, `cni` nothing but env and label),
-  `agent.enrolPort` and `agent.enrolTimeout`; `render_test.go` asserts the
+  `agent.enrolPort`, `agent.enrolTimeout` and `agent.enrolResources`;
+  `render_test.go` asserts the
   configuration and the Deployment's arguments in both modes.
 - The chart is published to `chart_registry_url("cracha")` of
   `bazel/registry.bzl` by the publish workflow (below).

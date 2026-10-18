@@ -34,6 +34,11 @@ const (
 	// hold the agent off the node: no node carries it.
 	holdLabel = "e2e.cracha.dev/agent-held"
 
+	// enrolBudget is how long from a pod's creation the enrolment init
+	// container may take to exit in init mode (design 7.2): the container
+	// is sized not to be CFS-throttled (the chart's agent.enrolResources),
+	// and at 10m CPU it took close to 30 s.
+	enrolBudget = 5 * time.Second
 	// restartBudget is how long after the restarted agent is ready a pod's
 	// fetches must be answered again (design 7.4: the restart is hitless
 	// for an SDK that retries a refused connection).
@@ -220,11 +225,12 @@ func holdAgent(ctx context.Context, t *testing.T) (release func()) {
 
 // Enrolment completes before the app containers start (design 7.2,
 // "Ordering"): the SDK's first request, with the provider's retries off,
-// is answered, so the listener was there at first use.
+// is answered, so the listener was there at first use. In init mode the
+// init container also exits within enrolBudget of the pod's creation.
 func TestFirstFetchNeedsNoRetry(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
-	_, rep := assignedWorkload(ctx, t)
+	pod, rep := assignedWorkload(ctx, t)
 	if rep.Error != "" {
 		t.Fatalf("the SDK's first request failed: %s (exchange: %+v)", rep.Error, rep.Exchange)
 	}
@@ -234,6 +240,37 @@ func TestFirstFetchNeedsNoRetry(t *testing.T) {
 	if rep.Exchange == nil || rep.Exchange.Status != 200 {
 		t.Errorf("the first request was answered %+v, want 200", rep.Exchange)
 	}
+	if enrolMode() == enrolInit {
+		// And it was quick about it: the init container exited within the
+		// budget of the pod's creation, so its resources did not throttle it.
+		current, err := client.CoreV1().Pods(testNamespace).Get(ctx, pod.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		took, err := enrolDuration(current)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("%s exited %s after the pod was created", enrolContainer, took)
+		if took > enrolBudget {
+			t.Errorf("%s took %s from the pod's creation to its exit, want under %s: its resources throttle it", enrolContainer, took, enrolBudget)
+		}
+	}
+}
+
+// enrolDuration is how long after the pod's creation its enrolment init
+// container exited, from the pod's status.
+func enrolDuration(pod *corev1.Pod) (time.Duration, error) {
+	for _, s := range pod.Status.InitContainerStatuses {
+		if s.Name != enrolContainer {
+			continue
+		}
+		if s.State.Terminated == nil {
+			return 0, fmt.Errorf("%s has not terminated: %+v", enrolContainer, s.State)
+		}
+		return s.State.Terminated.FinishedAt.Sub(pod.CreationTimestamp.Time), nil
+	}
+	return 0, fmt.Errorf("the pod has no %s init container status: %+v", enrolContainer, pod.Status.InitContainerStatuses)
 }
 
 // grantsLine is what e2e/client prints about GET /v1/grants.
