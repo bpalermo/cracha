@@ -1,0 +1,23 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "cri",
+    srcs = ["cri.go"],
+    importpath = "github.com/bpalermo/cracha/agent/internal/cri",
+    visibility = ["//agent:__subpackages__"],
+    deps = [
+        "@io_k8s_cri_api//pkg/apis/runtime/v1:runtime",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//credentials/insecure",
+    ],
+)
+
+go_test(
+    name = "cri_test",
+    srcs = ["cri_test.go"],
+    embed = [":cri"],
+    deps = [
+        "@io_k8s_cri_api//pkg/apis/runtime/v1:runtime",
+        "@org_golang_google_grpc//:grpc",
+    ],
+)

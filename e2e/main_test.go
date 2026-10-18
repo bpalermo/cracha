@@ -47,15 +47,41 @@ const (
 	pollInterval = time.Second
 )
 
-// What the webhook injects (docs/design.md, section 7.4).
+// What the webhook injects (docs/design.md, section 7.5): the loopback
+// endpoint of the agent's listener on agent.port of the chart's defaults,
+// the region of e2e/values.yaml, and the enrolment label the agent checks.
 const (
-	volumeName     = "cracha"
-	driverName     = "csi.cracha.dev"
-	mountPath      = "/var/run/cracha"
-	tokenPath      = mountPath + "/token"
-	credentialsURI = "https://cracha-broker.cracha-system.svc:8443/v1/credentials"
+	agentPort      = 9797
+	credentialsURI = "http://127.0.0.1:9797/v1/credentials"
 	region         = "us-east-1"
+	enrolLabel     = "cracha.dev/credentials"
 )
+
+// The enrolment mode e2e/run.sh installed the chart in (E2E_ENROL, design
+// 7.2): init, the cracha-enrol init container the webhook injects, or cni,
+// the cracha-cni plugin on the node. The suite runs in both; a test that
+// looks at one mode's wiring skips in the other.
+const (
+	enrolEnv  = "E2E_ENROL"
+	enrolInit = "init"
+	enrolCNI  = "cni"
+)
+
+// enrolMode is the mode the suite runs in; unset means the default, init.
+func enrolMode() string {
+	if mode := os.Getenv(enrolEnv); mode != "" {
+		return mode
+	}
+	return enrolInit
+}
+
+// requireEnrol skips the test outside the given mode.
+func requireEnrol(t *testing.T, mode string) {
+	t.Helper()
+	if got := enrolMode(); got != mode {
+		t.Skipf("%s=%q: this test looks at the %s enrolment mode; run E2E_ENROL=%s e2e/run.sh", enrolEnv, got, mode, mode)
+	}
+}
 
 var client *kubernetes.Clientset
 
@@ -261,7 +287,7 @@ func dumpDiagnostics(t *testing.T, pod string) {
 	}
 	for _, c := range []struct{ ns, selector, container string }{
 		{testNamespace, suiteLabel + "=true", ""},
-		{systemNamespace, "app.kubernetes.io/name=cracha,app.kubernetes.io/component=csi", "csi"},
+		{systemNamespace, agentSelector, agentContainer},
 		{systemNamespace, "app.kubernetes.io/name=cracha,app.kubernetes.io/component=broker", ""},
 		{systemNamespace, "app.kubernetes.io/name=cracha,app.kubernetes.io/component=webhook", ""},
 		{systemNamespace, "app.kubernetes.io/name=cracha-stsstub", ""},

@@ -1,70 +1,9 @@
 # Overrides the name used for the chart's resources (default: the chart name).
-# The Services are <name>-broker and <name>-webhook, the DaemonSet <name>-csi.
+# The Services are <name>-broker and <name>-webhook, the DaemonSet <name>-agent.
 nameOverride: ""
 
 # Pull secrets added to every pod of the chart.
 imagePullSecrets: []
-
-# The serving certificates of the broker (which every pod's AWS SDK calls over
-# HTTPS, design 6.5) and of the webhook (which the apiserver calls).
-#
-# The broker's certificate has to be trusted by the WORKLOAD images, which
-# verify it with their own trust store: a public CA, or the organisation's
-# PKI already in the images. The chart cannot put a CA into every image, so
-# only "existing" and "cert-manager", with a certificate the images trust,
-# are fit for production. The webhook's certificate only has to be trusted by
-# the apiserver, which the webhook configuration's caBundle takes care of in
-# every mode.
-tls:
-  # generated     The chart creates a private certificate authority and one
-  #               certificate per component at render time, in Secrets it
-  #               keeps across upgrades, and puts the authority in the
-  #               webhook configuration's caBundle. FOR DEVELOPMENT AND
-  #               KIND ONLY: nothing but this chart trusts that authority, so
-  #               a workload reaches the broker only if its image is given
-  #               the CA (the end-to-end suite mounts it and points
-  #               SSL_CERT_FILE at it). A certificate close to expiring is
-  #               replaced by the next `helm upgrade` (see generated, below);
-  #               the authority itself, valid for ten years, is never renewed.
-  # existing      You provide the Secrets (type kubernetes.io/tls: tls.crt
-  #               and tls.key), for example from your PKI, and the CA bundle
-  #               the apiserver verifies the webhook's certificate with.
-  # cert-manager  The chart creates a cert-manager Certificate per component
-  #               from the issuer named below, and annotates the webhook
-  #               configuration for cert-manager's CA injector to fill in the
-  #               caBundle. Needs cert-manager, with its CA injector, in the
-  #               cluster.
-  mode: generated
-
-  # With mode "generated": how long a component's certificate is valid, and
-  # how close to its expiry an upgrade replaces it. With these defaults, any
-  # upgrade in a certificate's last two months renews it.
-  generated:
-    validityDays: 365
-    renewBeforeDays: 60
-
-  # With mode "existing": the Secret of each component. The broker's
-  # certificate must carry <name>-broker.<namespace>.svc (the default
-  # webhook.brokerUrl) or whatever webhook.brokerUrl names; the webhook's must
-  # carry <name>-webhook.<namespace>.svc.
-  existingSecrets:
-    broker: ""
-    webhook: ""
-
-  # With mode "existing": the PEM bundle, base64-encoded, of the authority
-  # that signed the webhook's certificate; the apiserver verifies the webhook
-  # with it (clientConfig.caBundle).
-  caBundle: ""
-
-  # With mode "cert-manager": the issuer of both certificates and their
-  # lifetimes, as cert-manager's Certificate takes them.
-  certManager:
-    issuerRef:
-      name: ""
-      kind: ClusterIssuer
-      group: cert-manager.io
-    duration: 2160h
-    renewBefore: 360h
 
 # Every image of the chart is set the same way:
 #
@@ -94,8 +33,23 @@ broker:
   # all but one up is created when there is more than one.
   replicas: 3
 
-  # The HTTPS port, in the pod and on the Service.
+  # The API port, in the pod and on the Service: SPIFFE mTLS, served with
+  # the broker's own X.509-SVID from the Workload API below. The only client
+  # it admits is the node agent, by SPIFFE ID (design 6.5).
   port: 8443
+
+  # The plaintext port the kubelet's probes are answered on (/healthz and
+  # /readyz, nothing else): the kubelet cannot present an SVID. Not on the
+  # Service.
+  healthPort: 8081
+
+  # The SPIFFE ID of the node agent, the one client the broker accepts.
+  # Empty derives it from the broker's own SVID and namespace:
+  # spiffe://<trust domain>/ns/<release namespace>/sa/cracha-agent, which is
+  # the agent's identity under the issuer's default entries (design 4.2).
+  # Set it when the agent runs as another service account or namespace, or
+  # when the release name is overridden, which renames its service account.
+  agentSpiffeID: ""
 
   # The name of the cluster this broker serves, as it appears in the
   # SourceIdentity of every session it assumes (design 4.3). Required.
@@ -129,8 +83,8 @@ broker:
     maxEntries: 10000
     staleCheckMax: 10m
 
-  # The SPIFFE Workload API the broker reads the trust bundles from (design
-  # 6.5): the volume holding the socket and the socket's file name in it.
+  # The SPIFFE Workload API the broker gets its own X.509-SVID and the trust
+  # bundles from (design 6.5): the volume holding the socket and the socket's file name in it.
   # `type` chooses the volume's source, and only that source is rendered:
   #   hostPath  a SPIRE agent sharing its socket directory on the node, the
   #             directory under `hostPath` (the default);
@@ -273,32 +227,103 @@ broker:
   resources: {}
   podAnnotations: {}
 
-# The CSI node plugin (design 7), one pod per node: writes each pod's JWT-SVID
-# where the SDK reads it, before the pod's containers start, and rotates it.
-csi:
+# The node agent (design 7), one pod per node, in the host network: binds a
+# loopback listener inside each enrolled pod's network namespace before the
+# pod's app containers start, and serves the AWS SDK's credential requests
+# on it with what the broker issued for that pod's identity. Nothing in the
+# pod is trusted, mounted or protected.
+agent:
   image:
-    repository: "{@//csi:image_push.repository}"
+    repository: "{@//agent:image_push.repository}"
     tag: ""
-    digest: "{@//csi:image_push.digest}"
+    digest: "{@//agent:image_push.digest}"
     pullPolicy: IfNotPresent
 
-  # The sidecar that registers the plugin's socket with kubelet.
-  registrar:
-    image:
-      repository: registry.k8s.io/sig-storage/csi-node-driver-registrar
-      tag: v2.18.0
-      digest: sha256:b7fefd08651f00ac4df1a196ed4c621c2451fbb899297fe9fad9e36c667af0c0
-      pullPolicy: IfNotPresent
-    resources: {}
+  # The port of the loopback listener, the same in every pod; the webhook
+  # writes it into AWS_CONTAINER_CREDENTIALS_FULL_URI (design 7.1).
+  port: 9797
 
-  # kubelet's root directory on the nodes. /var/lib/kubelet on most
-  # distributions; some (k0s, MicroK8s, ...) use another path. The plugin
-  # directory and the pods directory under it are mounted into the plugin,
-  # the latter at the same path as on the host.
-  kubeletDir: /var/lib/kubelet
+  # How a new pod's listener is bound before its app containers start
+  # (design 7.2):
+  #   init  the webhook injects an init container, cracha-enrol, which calls
+  #         the agent's enrolment endpoint on the node's address with the
+  #         pod's bound ServiceAccount token. Needs nothing of the node but
+  #         the agent.
+  #   cni   a chained CNI plugin, cracha-cni, tells the agent over its Unix
+  #         socket on every sandbox's ADD and DEL. Nothing enters the pod
+  #         spec but the env and the label; the node's CNI configuration
+  #         is changed instead: an init container of the DaemonSet,
+  #         cni-install, copies the plugin from the agent image into
+  #         cni.binDir and chains it after the node's primary plugin in
+  #         the lexically first conflist of cni.confDir, the one the
+  #         runtime uses (kind: 10-kindnet.conflist). From then on every
+  #         new pod of the node, enrolled or not, waits for the agent
+  #         when it is down (design 7.2).
+  enrol: init
+
+  # With enrol init: the port of the enrolment endpoint on every node's
+  # address, and how long the init container keeps trying before it exits
+  # non-zero and kubelet restarts it (fail closed). The webhook reads the
+  # timeout when it injects the init container; the agent does not.
+  enrolPort: 9798
+  enrolTimeout: 2m
+
+  # With enrol init: the init container's resources, its requests and its
+  # limits alike (a Guaranteed pod stays Guaranteed). The CPU is what keeps
+  # a process that lives for a second out of CFS throttling: at 10m runc's
+  # init and the enrol binary were throttled into holding a pod in Init for
+  # close to 30 seconds; 100m is the smallest value measured not to (kind:
+  # 10m 28 s, 100m 2.7 s, 250m 1.5 s, 500m 1.2 s from pod creation to the
+  # container's exit). The request also counts for the pod's scheduling
+  # while it initialises.
+  enrolResources:
+    cpu: 100m
+    memory: 32Mi
+
+  # With enrol cni: the agent's Unix socket, in a host directory it owns
+  # (created 0700, the socket 0600, so only the node's root, which execs the
+  # plugin, reaches it), and the node's CNI bin and conf directories the
+  # installer writes to: the only host paths the agent image ever writes,
+  # in the cni-install init container and in the agent container's
+  # cni-retire preStop hook, which takes the plugin off the node again
+  # when the agent is not coming back in cni mode (the chart uninstalled,
+  # or enrol switched to init; a restart, a rollout or a drain leaves it).
+  # The entry it chains is
+  # {"type": "cracha-cni", "socket": <cni.socket>, "timeout": "5s"}.
+  cni:
+    socket: /run/cracha/cni.sock
+    binDir: /opt/cni/bin
+    confDir: /etc/cni/net.d
+
+  # How long one credential request retries a pod the issuer does not know
+  # yet (its entry on its way to the node's issuer agent) or an issuer that
+  # is unavailable, before answering 503 for the SDK to retry (design 7.3).
+  # Keep it under the SDKs' request timeouts.
+  fetchDeadline: 3s
+
+  # The broker (design 7.3): its URL, empty for the broker Service of this
+  # release, https://<name>-broker.<namespace>.svc:<broker.port>; the
+  # SPIFFE ID it must present, verified instead of any DNS name or CA: a
+  # full ID, or empty for /ns/<namespace>/sa/<name>-broker in the agent's
+  # own trust domain; and how long one call may take.
+  brokerUrl: ""
+  brokerSpiffeID: ""
+  brokerTimeout: 10s
+
+  # The container runtime's CRI socket, through which a pod's network
+  # namespace is resolved (design 7.2, init mode, and 7.4); mounted
+  # read-only. /run/containerd/containerd.sock for containerd,
+  # /var/run/crio/crio.sock for CRI-O.
+  criSocket: /run/containerd/containerd.sock
+
+  # The directory the runtime keeps the sandboxes' network namespaces in,
+  # which the paths it reports are under; mounted read-only, at the same
+  # path, following the host's mounts. /var/run/netns for containerd and
+  # CRI-O.
+  netnsDir: /var/run/netns
 
   # The identity issuer's two sockets on each node, from a SPIRE agent
-  # (design 4.2): the Workload API, for the plugin's own identity, and the
+  # (design 4.2): the Workload API, for the agent's own identity, and the
   # Broker API, which hands out the pods' JWT-SVIDs. Each is a host
   # directory and the socket's file name in it; both are mounted read-only.
   workloadAPI:
@@ -308,33 +333,15 @@ csi:
     hostPath: /run/spire/broker-sockets
     socket: broker.sock
 
-  # The longest JWT-SVID lifetime written to disk; a longer token is refused.
-  # The design caps it at 5m (section 11); the plugin refuses anything
-  # above, so this can only tighten it.
-  maxTokenTTL: 5m
-
-  # How long one NodePublishVolume retries a pod the issuer does not know yet
-  # or an issuer that is unavailable, before failing the mount (kubelet
-  # retries the mount itself after that).
-  publishDeadline: 30s
-
-  # The owner of the token file in each pod's volume. The file is 0640, and
-  # its group is the pod's fsGroup whenever the pod sets one: that is how a
-  # non-root workload reads it, so set securityContext.fsGroup on pods. These
-  # two are the fallback for a pod without an fsGroup, which then reads the
-  # file only as this uid or gid. 0 is root; -1 keeps the plugin's own.
-  tokenUid: 0
-  tokenGid: 0
-
-  # The port of the plugin's /healthz, for the liveness probe.
-  healthzPort: 9808
+  # The port of the agent's /healthz and /readyz, on the node's address.
+  healthzPort: 9799
 
   # The log level: debug, info, warn or error.
   logLevel: info
 
   priorityClassName: system-node-critical
 
-  # Tokens must be written on every node pods can run on.
+  # Listeners must be bound on every node pods can run on.
   tolerations:
     - operator: Exists
 
@@ -342,8 +349,15 @@ csi:
   resources: {}
   podAnnotations: {}
 
-# The mutating webhook (design 7.4): wires the CSI volume and the SDK's
-# environment into pods whose ServiceAccount opts in.
+# The mutating webhook (design 7.5): for pods whose ServiceAccount opts in,
+# the loopback credentials endpoint in every container's environment, the
+# enrolment label and, with agent.enrol init, the enrolment init container.
+# It serves its X.509-SVID from the Workload API and keeps the caBundle of
+# its own webhook configuration at its trust bundle, so nothing but the
+# identity issuer signs anything here: the issuer must give the webhook's
+# service account an entry whose X.509-SVID carries the DNS SAN
+# <name>-webhook.<namespace>.svc (design 4.2; SPIRE: a ClusterSPIFFEID with
+# dnsNameTemplates).
 webhook:
   image:
     repository: "{@//webhook:image_push.repository}"
@@ -359,11 +373,19 @@ webhook:
   # The HTTPS port in the pod; the Service listens on 443.
   port: 8443
 
-  # The URL the SDK in every wired pod fetches credentials from: the broker.
-  # Empty is the broker Service of this release,
-  # https://<name>-broker.<namespace>.svc:<broker.port>. Set it when the
-  # broker is reached under another name, which its certificate must carry.
-  brokerUrl: ""
+  # The SPIFFE Workload API the webhook's X.509-SVID and trust bundle come
+  # from, shaped as the broker's: the volume holding the socket, chosen by
+  # `type` among the sources beside it, and the socket's file name in it.
+  workloadAPI:
+    volume:
+      type: hostPath
+      hostPath:
+        path: /run/spire/agent-sockets
+        type: Directory
+      csi:
+        driver: csi.spiffe.io
+        readOnly: true
+    socket: spire-agent.sock
 
   # AWS_REGION for the pods that do not set their own. Required.
   defaultRegion: ""
@@ -378,10 +400,28 @@ webhook:
   # How long the apiserver waits for an answer before failing the pod.
   timeoutSeconds: 10
 
-  # Namespaces the webhook never sees, besides the release's own namespace
-  # (a pod of the webhook's own namespace must not depend on the webhook to
-  # start) and kube-system: the identity issuer's, for example.
-  excludedNamespaces: []
+  # Stopping (design 7.5). Told to stop, a webhook pod reports not ready at
+  # once, keeps answering for `drain` while the apiserver stops sending to
+  # it, then shuts down, waiting up to `shutdownTimeout` for the admissions
+  # in flight; the pod's termination grace period is the two plus a margin.
+  # A rollout brings a new pod up and keeps it Ready for `minReadySeconds`
+  # before the old one is told to stop, so no admission is lost to a
+  # pod that is gone. Durations are whole seconds (5s, 1m).
+  drain: 5s
+  shutdownTimeout: 10s
+  minReadySeconds: 5
+
+  # Namespaces the webhook never sees, besides the release's own namespace,
+  # which is always excluded: a pod of the webhook's own namespace must not
+  # depend on the webhook to start, and the identity issuer's agent, which
+  # the webhook's certificate comes from, must start without the webhook
+  # (design 7.5). The default is SPIRE's usual namespaces and kube-system;
+  # a list given here replaces it, so repeat what still applies.
+  excludedNamespaces:
+    - spire-system
+    - spire-server
+    - spire-mgmt
+    - kube-system
 
   # The log level: debug, info, warn or error.
   logLevel: info

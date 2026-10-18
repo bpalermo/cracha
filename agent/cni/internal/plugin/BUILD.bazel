@@ -1,0 +1,25 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "plugin",
+    srcs = ["plugin.go"],
+    importpath = "github.com/bpalermo/cracha/agent/cni/internal/plugin",
+    visibility = ["//agent/cni:__subpackages__"],
+    deps = [
+        "//agent/cni/netconf",
+        "//agent/cni/proto",
+        "@com_github_containernetworking_cni//pkg/skel",
+        "@com_github_containernetworking_cni//pkg/types",
+        "@com_github_containernetworking_cni//pkg/version",
+    ],
+)
+
+go_test(
+    name = "plugin_test",
+    srcs = ["plugin_test.go"],
+    embed = [":plugin"],
+    deps = [
+        "//agent/cni/proto",
+        "@com_github_containernetworking_cni//pkg/skel",
+    ],
+)

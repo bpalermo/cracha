@@ -10,17 +10,16 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,9 +41,9 @@ func (a *echoAdmitter) Admit(_ context.Context, req *admissionv1.AdmissionReques
 	return &admissionv1.AdmissionResponse{Allowed: true, Warnings: []string{"seen " + req.Name}}
 }
 
-// selfSigned writes a fresh self-signed certificate for 127.0.0.1 with the
-// given serial to dir, and returns its paths and the certificate.
-func selfSigned(t *testing.T, dir string, serial int64) (certFile, keyFile string, cert *x509.Certificate) {
+// selfSigned returns a fresh self-signed certificate for 127.0.0.1 with the
+// given serial, as a TLS certificate and parsed.
+func selfSigned(t *testing.T, serial int64) (tls.Certificate, *x509.Certificate) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -63,29 +62,18 @@ func selfSigned(t *testing.T, dir string, serial int64) (certFile, keyFile strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	cert, err = x509.ParseCertificate(der)
+	cert, err := x509.ParseCertificate(der)
 	if err != nil {
 		t.Fatal(err)
 	}
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	certFile = filepath.Join(dir, "tls.crt")
-	keyFile = filepath.Join(dir, "tls.key")
-	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return certFile, keyFile, cert
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: cert}, cert
 }
 
 func newServer(t *testing.T, cfg Config, admitter Admitter) *Server {
 	t.Helper()
-	if cfg.CertFile == "" {
-		cfg.CertFile, cfg.KeyFile, _ = selfSigned(t, t.TempDir(), 1)
+	if cfg.TLS == nil {
+		cert, _ := selfSigned(t, 1)
+		cfg.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
 	}
 	if cfg.Listen == "" {
 		cfg.Listen = "127.0.0.1:0"
@@ -226,18 +214,16 @@ func TestHealthAndReadiness(t *testing.T) {
 }
 
 func TestNewRejectsBadConfig(t *testing.T) {
-	dir := t.TempDir()
-	certFile, keyFile, _ := selfSigned(t, dir, 1)
+	cert, _ := selfSigned(t, 1)
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
 	for _, tc := range []struct {
 		name     string
 		cfg      Config
 		admitter Admitter
 	}{
-		{"no admitter", Config{Listen: ":0", CertFile: certFile, KeyFile: keyFile}, nil},
-		{"no listen", Config{CertFile: certFile, KeyFile: keyFile}, &echoAdmitter{}},
-		{"no key", Config{Listen: ":0", CertFile: certFile}, &echoAdmitter{}},
-		{"missing files", Config{Listen: ":0", CertFile: filepath.Join(dir, "nope.crt"), KeyFile: keyFile}, &echoAdmitter{}},
-		{"not a certificate", Config{Listen: ":0", CertFile: keyFile, KeyFile: keyFile}, &echoAdmitter{}},
+		{"no admitter", Config{Listen: ":0", TLS: tlsConfig}, nil},
+		{"no listen", Config{TLS: tlsConfig}, &echoAdmitter{}},
+		{"no TLS", Config{Listen: ":0"}, &echoAdmitter{}},
 	} {
 		if _, err := New(tc.cfg, tc.admitter); err == nil {
 			t.Errorf("%s: New succeeded", tc.name)
@@ -245,12 +231,37 @@ func TestNewRejectsBadConfig(t *testing.T) {
 	}
 }
 
-// TestServeTLS serves for real: TLS is on, the certificate is reloaded when
-// the files change, and cancelling the context shuts the server down.
+// TestMinTLSVersion: a configuration that allows older TLS is raised to
+// 1.2, and the caller's own is left alone.
+func TestMinTLSVersion(t *testing.T) {
+	cert, _ := selfSigned(t, 1)
+	given := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS10}
+	s := newServer(t, Config{TLS: given}, &echoAdmitter{})
+	if s.tls.MinVersion != tls.VersionTLS12 {
+		t.Errorf("MinVersion %x, want TLS 1.2", s.tls.MinVersion)
+	}
+	if given.MinVersion != tls.VersionTLS10 {
+		t.Error("the caller's configuration was modified")
+	}
+	given.MinVersion = tls.VersionTLS13
+	if s = newServer(t, Config{TLS: given}, &echoAdmitter{}); s.tls.MinVersion != tls.VersionTLS13 {
+		t.Errorf("MinVersion %x, want the caller's TLS 1.3", s.tls.MinVersion)
+	}
+}
+
+// TestServeTLS serves for real: TLS is on, the certificate the
+// configuration's GetCertificate returns is the one served (which is how
+// the SVID source rotates it), and cancelling the context shuts the server
+// down.
 func TestServeTLS(t *testing.T) {
-	dir := t.TempDir()
-	certFile, keyFile, first := selfSigned(t, dir, 1)
-	s := newServer(t, Config{CertFile: certFile, KeyFile: keyFile, ShutdownTimeout: 5 * time.Second}, &echoAdmitter{})
+	firstCert, first := selfSigned(t, 1)
+	secondCert, second := selfSigned(t, 2)
+	var current atomic.Pointer[tls.Certificate]
+	current.Store(&firstCert)
+	s := newServer(t, Config{
+		TLS:             &tls.Config{GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return current.Load(), nil }},
+		ShutdownTimeout: 5 * time.Second,
+	}, &echoAdmitter{})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -287,18 +298,11 @@ func TestServeTLS(t *testing.T) {
 		}
 	}
 
-	// Renew: the new certificate is served to the next handshake. The mtime
-	// is pushed forward so a same-second rewrite is still seen as a change.
-	_, _, second := selfSigned(t, dir, 2)
-	future := time.Now().Add(time.Hour)
-	for _, f := range []string{certFile, keyFile} {
-		if err := os.Chtimes(f, future, future); err != nil {
-			t.Fatal(err)
-		}
-	}
+	// Rotate: the next handshake gets the new certificate.
+	current.Store(&secondCert)
 	resp, err = client(second).Get(url + "/healthz")
 	if err != nil {
-		t.Fatalf("GET after renewal: %v", err)
+		t.Fatalf("GET after rotation: %v", err)
 	}
 	resp.Body.Close()
 	if _, err := client(first).Get(url + "/healthz"); err == nil {
@@ -329,5 +333,148 @@ func TestPodName(t *testing.T) {
 		if got := podName(&tc.req); got != tc.want {
 			t.Errorf("podName = %q, want %q", got, tc.want)
 		}
+	}
+}
+
+// gate is an echoAdmitter that, while hold is set, reports entering an
+// admission and waits to be released, and that records an admission whose
+// context was already cancelled.
+type gate struct {
+	echoAdmitter
+	hold      atomic.Bool
+	entered   chan struct{}
+	release   chan struct{}
+	cancelled atomic.Bool
+}
+
+func (g *gate) Admit(ctx context.Context, req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
+	if ctx.Err() != nil {
+		g.cancelled.Store(true)
+	}
+	if g.hold.Load() {
+		g.entered <- struct{}{}
+		<-g.release
+	}
+	return g.echoAdmitter.Admit(ctx, req)
+}
+
+// TestDrain holds the server to the order a rollout relies on (design
+// 7.5): told to stop, it reports not ready before anything else, keeps
+// answering for Drain with Connection: close and a live request context,
+// and shuts down only once the drain is over, waiting for a request in
+// flight.
+func TestDrain(t *testing.T) {
+	const drain = 750 * time.Millisecond
+	cert, parsed := selfSigned(t, 1)
+	admitter := &gate{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	s := newServer(t, Config{
+		TLS:             &tls.Config{Certificates: []tls.Certificate{cert}},
+		Drain:           drain,
+		ShutdownTimeout: 5 * time.Second,
+		Ready:           func(context.Context) error { return nil },
+	}, admitter)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- s.Serve(ctx, ln) }()
+	url := "https://" + ln.Addr().String()
+	pool := x509.NewCertPool()
+	pool.AddCert(parsed)
+	client := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}},
+	}
+	get := func(path string) (code int, body string, closed bool) {
+		t.Helper()
+		resp, err := client.Get(url + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b), resp.Close
+	}
+
+	if code, _, closed := get("/readyz"); code != http.StatusOK || closed {
+		t.Fatalf("/readyz while serving: %d, connection closed %t", code, closed)
+	}
+
+	told := time.Now()
+	cancel()
+
+	// Readiness goes false first, while Serve is still going.
+	for code, body, _ := get("/readyz"); code != http.StatusServiceUnavailable; code, body, _ = get("/readyz") {
+		if time.Since(told) > drain/2 {
+			t.Fatalf("/readyz %s after the stop: %d %s, want 503 draining", time.Since(told), code, body)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, body, _ := get("/readyz"); !strings.Contains(body, "draining") {
+		t.Errorf("/readyz while draining: %q, want draining", body)
+	}
+	select {
+	case err := <-served:
+		t.Fatalf("Serve returned (%v) before the drain", err)
+	default:
+	}
+
+	// An admission during the drain is answered, with Connection: close
+	// and a request context that is still live.
+	resp, err := client.Post(url+"/mutate", "application/json", bytes.NewReader(review(t, "uid-drain", "web-drain")))
+	if err != nil {
+		t.Fatalf("POST during the drain: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("POST during the drain: %d", resp.StatusCode)
+	}
+	// Connection: close, which the client reads into Close and strips.
+	if !resp.Close {
+		t.Error("the response of the drain does not close the connection")
+	}
+	if admitter.cancelled.Load() {
+		t.Error("the admission of the drain ran with a cancelled context")
+	}
+
+	// A request in flight when the drain ends is waited for.
+	admitter.hold.Store(true)
+	inFlight := make(chan error, 1)
+	go func() {
+		resp, err := client.Post(url+"/mutate", "application/json", bytes.NewReader(review(t, "uid-held", "web-held")))
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				err = fmt.Errorf("status %d", resp.StatusCode)
+			}
+		}
+		inFlight <- err
+	}()
+	<-admitter.entered
+	select {
+	case err := <-served:
+		t.Fatalf("Serve returned (%v) with an admission in flight", err)
+	case <-time.After(time.Until(told.Add(drain + 200*time.Millisecond))):
+	}
+	close(admitter.release)
+	if err := <-inFlight; err != nil {
+		t.Errorf("the admission in flight at shutdown: %v", err)
+	}
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("Serve: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve did not return after the request in flight was answered")
+	}
+	if took := time.Since(told); took < drain {
+		t.Errorf("Serve returned %s after the stop, before the %s drain", took, drain)
+	}
+	if !s.Draining() {
+		t.Error("Draining is false after the shutdown")
 	}
 }

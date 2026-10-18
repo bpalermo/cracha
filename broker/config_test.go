@@ -18,13 +18,16 @@ func envOf(m map[string]string) func(string) (string, bool) {
 func TestParseConfig(t *testing.T) {
 	c, err := parseConfig([]string{
 		"--cluster", "prod-a", "--assignments", "a.yaml", "--grants-fixture", "g.yaml",
-		"--tls-cert", "c.pem", "--tls-key", "k.pem", "--trust-domain-labels", "example.org=prod",
+		"--namespace", "cracha-system", "--trust-domain-labels", "example.org=prod",
 	}, envOf(nil), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.listen != ":8443" || c.cluster != "prod-a" || c.labels.Short("example.org") != "prod" || c.logLevel != "info" {
+	if c.listen != ":8443" || c.healthListen != ":8081" || c.cluster != "prod-a" || c.labels.Short("example.org") != "prod" || c.logLevel != "info" {
 		t.Errorf("config %+v", c)
+	}
+	if c.namespace != "cracha-system" || !c.agentID.IsZero() {
+		t.Errorf("agent identity not left to be derived: %+v", c)
 	}
 	if !c.cache || c.cacheMinRemaining != 20*time.Minute || c.cacheRefreshAt != 0.7 || c.cacheMaxEntries != 10000 || c.cacheStaleCheckMax != 10*time.Minute {
 		t.Errorf("cache defaults %+v", c)
@@ -39,7 +42,7 @@ func TestParseConfigCacheFlags(t *testing.T) {
 		"CRACHA_CACHE_MAX_ENTRIES":     "500",
 		"CRACHA_CACHE_STALE_CHECK_MAX": "5m",
 	})
-	base := []string{"--cluster", "c", "--assignments", "a", "--grants-fixture", "g", "--insecure-plaintext"}
+	base := []string{"--cluster", "c", "--assignments", "a", "--grants-fixture", "g", "--namespace", "n"}
 	c, err := parseConfig(base, env, io.Discard)
 	if err != nil {
 		t.Fatal(err)
@@ -95,7 +98,7 @@ func TestParseConfigEnvFallback(t *testing.T) {
 		"CRACHA_CLUSTER":             "prod-b",
 		"CRACHA_ASSIGNMENTS":         "a.yaml",
 		"CRACHA_GRANTS_FIXTURE":      "g.yaml",
-		"CRACHA_INSECURE_PLAINTEXT":  "true",
+		"CRACHA_NAMESPACE":           "cracha-system",
 		"CRACHA_LISTEN":              ":8080",
 		"CRACHA_TRUST_DOMAIN_LABELS": "example.org=prod",
 		"CRACHA_LOG_LEVEL":           "debug",
@@ -104,7 +107,7 @@ func TestParseConfigEnvFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.cluster != "prod-b" || !c.insecurePlaintext || c.logLevel != "debug" {
+	if c.cluster != "prod-b" || c.namespace != "cracha-system" || c.logLevel != "debug" {
 		t.Errorf("config %+v", c)
 	}
 	if c.listen != ":9090" {
@@ -114,34 +117,34 @@ func TestParseConfigEnvFallback(t *testing.T) {
 
 func TestEnvDefaults(t *testing.T) {
 	env := envDefaults(envOf(map[string]string{
-		"CRACHA_LISTEN":             ":8080",
-		"CRACHA_INSECURE_PLAINTEXT": "maybe",
-		"CRACHA_TLS_CERT":           "",
+		"CRACHA_LISTEN":          ":8080",
+		"CRACHA_CACHE":           "maybe",
+		"CRACHA_AGENT_SPIFFE_ID": "",
 	}))
 	if got := env.str("listen", ":8443"); got != ":8080" {
 		t.Errorf("listen %q", got)
 	}
-	if got := env.str("tls-cert", "default.pem"); got != "" {
+	if got := env.str("agent-spiffe-id", "default"); got != "" {
 		t.Errorf("an empty variable is a value, got %q", got)
 	}
-	if got := env.str("tls-key", "k.pem"); got != "k.pem" {
+	if got := env.str("namespace", "k.pem"); got != "k.pem" {
 		t.Errorf("unset variable gave %q, want the default", got)
 	}
 	// A bool set to something that is not a bool is false, not the default.
-	if env.boolean("insecure-plaintext", true) {
+	if env.boolean("cache", true) {
 		t.Error("non-bool value read as true")
 	}
-	if !env.boolean("tls-key", true) {
+	if !env.boolean("namespace", true) {
 		t.Error("unset bool did not take the default")
 	}
-	if !env.boolean("tls-cert", true) {
+	if !env.boolean("agent-spiffe-id", true) {
 		t.Error("empty bool did not take the default")
 	}
 }
 
 func TestParseConfigBundle(t *testing.T) {
 	c, err := parseConfig([]string{
-		"--cluster", "prod-a", "--assignments", "a.yaml", "--insecure-plaintext",
+		"--cluster", "prod-a", "--assignments", "a.yaml", "--namespace", "n",
 		"--bundle-source", "s3://grants/cracha/prod", "--bundle-kms-key", "arn:aws:kms:eu-west-1:111122223333:key/abc",
 	}, envOf(nil), io.Discard)
 	if err != nil {
@@ -153,7 +156,7 @@ func TestParseConfigBundle(t *testing.T) {
 	env := envOf(map[string]string{
 		"CRACHA_CLUSTER":              "prod-b",
 		"CRACHA_ASSIGNMENTS":          "a.yaml",
-		"CRACHA_INSECURE_PLAINTEXT":   "true",
+		"CRACHA_NAMESPACE":            "cracha-system",
 		"CRACHA_BUNDLE_SOURCE":        "local:/etc/cracha/bundle",
 		"CRACHA_BUNDLE_VERIFY_KEY":    "/etc/cracha/bundle-key/public.pem",
 		"CRACHA_BUNDLE_POLL_INTERVAL": "5m",
@@ -168,7 +171,7 @@ func TestParseConfigBundle(t *testing.T) {
 }
 
 func TestParseConfigBundleRejects(t *testing.T) {
-	base := []string{"--cluster", "c", "--assignments", "a", "--insecure-plaintext"}
+	base := []string{"--cluster", "c", "--assignments", "a", "--namespace", "n"}
 	with := func(args ...string) []string { return append(append([]string{}, base...), args...) }
 	tests := map[string]struct {
 		args []string
@@ -197,7 +200,7 @@ func TestParseConfigBundleRejects(t *testing.T) {
 
 func TestParseConfigAuthz(t *testing.T) {
 	c, err := parseConfig([]string{
-		"--cluster", "prod-a", "--grants-fixture", "g.yaml", "--insecure-plaintext",
+		"--cluster", "prod-a", "--grants-fixture", "g.yaml", "--namespace", "n",
 		"--authz-backend", "spicedb", "--spicedb-endpoint", "spicedb:50051", "--spicedb-token-file", "/etc/cracha/spicedb/token",
 		"--spicedb-ca", "/etc/cracha/spicedb/ca.pem", "--spicedb-timeout", "2s",
 	}, envOf(nil), io.Discard)
@@ -211,7 +214,7 @@ func TestParseConfigAuthz(t *testing.T) {
 	env := envOf(map[string]string{
 		"CRACHA_CLUSTER":            "prod-b",
 		"CRACHA_GRANTS_FIXTURE":     "g.yaml",
-		"CRACHA_INSECURE_PLAINTEXT": "true",
+		"CRACHA_NAMESPACE":          "cracha-system",
 		"CRACHA_AUTHZ_BACKEND":      "spicedb",
 		"CRACHA_SPICEDB_ENDPOINT":   "spicedb.spicedb.svc:50051",
 		"CRACHA_SPICEDB_TOKEN_FILE": "/run/secrets/spicedb",
@@ -225,7 +228,7 @@ func TestParseConfigAuthz(t *testing.T) {
 		!c.spicedbInsecure || c.spicedbTimeout != 5*time.Second {
 		t.Errorf("env did not set the spicedb flags: %+v", c)
 	}
-	c, err = parseConfig([]string{"--cluster", "c", "--grants-fixture", "g", "--insecure-plaintext", "--assignments", "a"}, envOf(nil), io.Discard)
+	c, err = parseConfig([]string{"--cluster", "c", "--grants-fixture", "g", "--namespace", "n", "--assignments", "a"}, envOf(nil), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +238,7 @@ func TestParseConfigAuthz(t *testing.T) {
 }
 
 func TestParseConfigAuthzRejects(t *testing.T) {
-	base := []string{"--cluster", "c", "--grants-fixture", "g", "--insecure-plaintext"}
+	base := []string{"--cluster", "c", "--grants-fixture", "g", "--namespace", "n"}
 	with := func(args ...string) []string { return append(append([]string{}, base...), args...) }
 	spicedb := []string{"--authz-backend", "spicedb", "--spicedb-endpoint", "e", "--spicedb-token-file", "t"}
 	tests := map[string]struct {
@@ -264,6 +267,28 @@ func TestParseConfigAuthzRejects(t *testing.T) {
 	}
 }
 
+func TestParseConfigAgentID(t *testing.T) {
+	c, err := parseConfig([]string{
+		"--cluster", "c", "--assignments", "a", "--grants-fixture", "g",
+		"--agent-spiffe-id", "spiffe://example.org/ns/infra/sa/node-agent",
+	}, envOf(nil), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.agentID.String() != "spiffe://example.org/ns/infra/sa/node-agent" {
+		t.Errorf("agent ID %q", c.agentID)
+	}
+	// The environment gives both, as the chart does for the namespace.
+	env := envOf(map[string]string{"CRACHA_NAMESPACE": "cracha-system", "CRACHA_HEALTH_LISTEN": ":9081"})
+	c, err = parseConfig([]string{"--cluster", "c", "--assignments", "a", "--grants-fixture", "g"}, env, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.namespace != "cracha-system" || c.healthListen != ":9081" || !c.agentID.IsZero() {
+		t.Errorf("config %+v", c)
+	}
+}
+
 func TestParseConfigVersion(t *testing.T) {
 	if _, err := parseConfig([]string{"--version"}, envOf(nil), io.Discard); !errors.Is(err, errVersion) {
 		t.Fatalf("got %v", err)
@@ -271,13 +296,16 @@ func TestParseConfigVersion(t *testing.T) {
 }
 
 func TestParseConfigRejects(t *testing.T) {
-	base := []string{"--cluster", "c", "--assignments", "a", "--grants-fixture", "g", "--tls-cert", "c.pem", "--tls-key", "k.pem"}
+	base := []string{"--cluster", "c", "--assignments", "a", "--grants-fixture", "g", "--namespace", "n"}
 	tests := map[string][]string{
-		"no cluster":          {"--assignments", "a", "--grants-fixture", "g", "--insecure-plaintext"},
-		"no assignments":      {"--cluster", "c", "--grants-fixture", "g", "--insecure-plaintext"},
-		"no tls":              {"--cluster", "c", "--assignments", "a", "--grants-fixture", "g"},
-		"half tls":            {"--cluster", "c", "--assignments", "a", "--grants-fixture", "g", "--tls-cert", "c.pem"},
-		"plaintext with tls":  append(append([]string{}, base...), "--insecure-plaintext"),
+		"no cluster":          {"--assignments", "a", "--grants-fixture", "g", "--namespace", "n"},
+		"no assignments":      {"--cluster", "c", "--grants-fixture", "g", "--namespace", "n"},
+		"no namespace, no id": {"--cluster", "c", "--assignments", "a", "--grants-fixture", "g"},
+		"bad agent id":        {"--cluster", "c", "--assignments", "a", "--grants-fixture", "g", "--agent-spiffe-id", "cracha-agent"},
+		"agent id is a td":    {"--cluster", "c", "--assignments", "a", "--grants-fixture", "g", "--agent-spiffe-id", "spiffe://example.org"},
+		"no listen":           append(append([]string{}, base...), "--listen", ""),
+		"no health listen":    append(append([]string{}, base...), "--health-listen", ""),
+		"shared listen":       append(append([]string{}, base...), "--listen", ":8443", "--health-listen", ":8443"),
 		"bad labels":          append(append([]string{}, base...), "--trust-domain-labels", "example.org"),
 		"reserved label":      append(append([]string{}, base...), "--trust-domain-labels", "example.org=h"),
 		"bad log level":       append(append([]string{}, base...), "--log-level", "loud"),

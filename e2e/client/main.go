@@ -1,24 +1,27 @@
 // Command client is the workload of the end-to-end suite: an AWS SDK user
 // with no configuration of its own. It loads the SDK's default configuration,
 // so the only reason it finds credentials is the environment the webhook
-// injected (AWS_CONTAINER_CREDENTIALS_FULL_URI and
-// AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE) and the token the CSI plugin wrote.
+// injected (AWS_CONTAINER_CREDENTIALS_FULL_URI, the loopback listener the
+// node agent bound in this pod's network namespace) and nothing else: no
+// token, no CA, no volume (docs/design.md, section 7.7).
 //
-// It prints one JSON report line to stdout with the credentials it got, the
-// broker's raw HTTP answer (status, Cracha-* headers, body) and the claims of
-// the token file, then keeps watching the token file and prints a line each
-// time the CSI plugin replaces it, which is how the suite observes rotation.
-// With E2E_FETCH_INTERVAL set to a duration it also asks the broker for
-// credentials again at that interval, the way the SDK would once a session
-// ran out, and prints a line per answer, which is how the suite observes
-// a revocation take effect. It exits only on a signal.
+// Its first action is the credential fetch, and the SDK's provider is told
+// not to retry: the listener must be there at first use (design 7.2,
+// "Ordering"), and the report says how many requests the first credentials
+// took. It prints one JSON report line to stdout with the credentials it
+// got, the broker's raw HTTP answer as the agent relayed it (status,
+// Cracha-* headers, body) and the request count, then one line with the
+// answer to GET /v1/grants, the inspection endpoint of design 6.5, through
+// the same listener. With E2E_FETCH_INTERVAL set to a duration it then asks
+// for credentials again at that interval, the way the SDK would once a
+// session ran out, and prints a line per answer or failure, which is how
+// the suite observes a revocation take effect and an agent restart go by.
+// It exits only on a signal.
 package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,8 +32,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/endpointcreds"
+)
+
+// credentialsPath and grantsPath are the broker's two endpoints (design
+// 6.5), which the agent relays and nothing else (design 7.1).
+const (
+	credentialsPath = "/v1/credentials"
+	grantsPath      = "/v1/grants"
 )
 
 // Report is the first line printed.
@@ -42,8 +53,9 @@ type Report struct {
 	Error string `json:"error,omitempty"`
 	// Exchange is the last HTTP exchange with the credentials URI.
 	Exchange *Exchange `json:"exchange,omitempty"`
-	// Token is the token file as it was at the first fetch.
-	Token *Token `json:"token,omitempty"`
+	// Attempts is how many HTTP requests the SDK's provider made for the
+	// first credentials: one, when the listener was there at first use.
+	Attempts int `json:"attempts"`
 }
 
 // Credentials is the SDK's view, secrets included: this is a test fixture
@@ -57,7 +69,7 @@ type Credentials struct {
 	Expires         time.Time `json:"expires"`
 }
 
-// Exchange is one HTTP response from the broker.
+// Exchange is one HTTP response from the listener.
 type Exchange struct {
 	URL     string              `json:"url"`
 	Status  int                 `json:"status"`
@@ -65,38 +77,30 @@ type Exchange struct {
 	Body    string              `json:"body"`
 }
 
-// Fetch is one answer of the broker to a fetch of its own, printed per
-// E2E_FETCH_INTERVAL: the exchange, or the error that prevented one.
+// Fetch is one answer to a request of the client's own: the grants line
+// (kind "grants", once, after the report) and the credential fetches of
+// E2E_FETCH_INTERVAL (kind "fetch"): the exchange, or the error that
+// prevented one.
 type Fetch struct {
-	Kind     string    `json:"kind"` // "fetch"
+	Kind     string    `json:"kind"`
 	At       time.Time `json:"at"`
 	Exchange *Exchange `json:"exchange,omitempty"`
 	Error    string    `json:"error,omitempty"`
 }
 
-// Token is the token file's claims, read without verification: the broker
-// verifies, this only reports.
-type Token struct {
-	Kind    string    `json:"kind"` // "token" on the rotation lines
-	Path    string    `json:"path"`
-	Subject string    `json:"sub"`
-	Aud     []string  `json:"aud"`
-	Iat     int64     `json:"iat"`
-	Exp     int64     `json:"exp"`
-	ReadAt  time.Time `json:"readAt"`
-	Error   string    `json:"error,omitempty"`
-	Changed bool      `json:"changed"`
-}
-
 // recording is the HTTP client the SDK's container-credentials provider uses;
-// it keeps the last response.
+// it keeps the last response and counts the requests.
 type recording struct {
-	inner http.Client
-	mu    sync.Mutex
-	last  *Exchange
+	inner    http.Client
+	mu       sync.Mutex
+	last     *Exchange
+	attempts int
 }
 
 func (r *recording) Do(req *http.Request) (*http.Response, error) {
+	r.mu.Lock()
+	r.attempts++
+	r.mu.Unlock()
 	resp, err := r.inner.Do(req)
 	if err != nil {
 		return nil, err
@@ -113,10 +117,10 @@ func (r *recording) Do(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-func (r *recording) exchange() *Exchange {
+func (r *recording) exchange() (*Exchange, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.last
+	return r.last, r.attempts
 }
 
 func main() {
@@ -124,24 +128,19 @@ func main() {
 	defer stop()
 
 	out := json.NewEncoder(os.Stdout)
-	tokenPath := os.Getenv("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE")
+	uri := os.Getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI")
 	report := Report{Kind: "report"}
-	report.Token = readToken(tokenPath)
 
 	rec := &recording{inner: http.Client{Timeout: 30 * time.Second}}
 	retrieve(ctx, rec, &report)
-	report.Exchange = rec.exchange()
+	report.Exchange, report.Attempts = rec.exchange()
 	if err := out.Encode(report); err != nil {
 		fmt.Fprintf(os.Stderr, "client: %v\n", err)
 		os.Exit(1)
 	}
+	_ = out.Encode(fetch(ctx, rec, "grants", strings.TrimSuffix(uri, credentialsPath)+grantsPath))
 
-	// Watch the token file: a line per change, so the rotation is visible in
-	// the pod's log without an exec. And, when asked, fetch credentials again
-	// at an interval: a line per answer.
-	last := report.Token
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
+	// When asked, fetch credentials again at an interval: a line per answer.
 	fetches, stopFetching := fetchTicker()
 	defer stopFetching()
 	for {
@@ -149,28 +148,21 @@ func main() {
 		case <-ctx.Done():
 			return
 		case <-fetches:
-			_ = out.Encode(fetch(ctx, rec, tokenPath, os.Getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI")))
-			continue
-		case <-ticker.C:
+			_ = out.Encode(fetch(ctx, rec, "fetch", uri))
 		}
-		cur := readToken(tokenPath)
-		if last != nil && cur.Error == last.Error && cur.Iat == last.Iat && cur.Exp == last.Exp && cur.Subject == last.Subject {
-			continue
-		}
-		cur.Changed = last != nil
-		last = cur
-		_ = out.Encode(cur)
 	}
 }
 
 // retrieve has the SDK obtain credentials and records the outcome in the
-// report. Nothing but the environment chooses the provider; the option only
-// swaps the HTTP client of the container-credentials provider for one that
-// keeps the broker's answer, so the suite can assert on it.
+// report. Nothing but the environment chooses the provider; the options only
+// swap the HTTP client of the container-credentials provider for one that
+// keeps the answer, so the suite can assert on it, and turn the provider's
+// retries off, so the first use of the listener is its first request.
 func retrieve(ctx context.Context, rec *recording, report *Report) {
 	cfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithEndpointCredentialOptions(func(o *endpointcreds.Options) {
 			o.HTTPClient = rec
+			o.Retryer = aws.NopRetryer{}
 		}))
 	if err != nil {
 		report.Error = "load config: " + err.Error()
@@ -207,69 +199,22 @@ func fetchTicker() (<-chan time.Time, func()) {
 	return t.C, t.Stop
 }
 
-// fetch asks the broker for credentials the way the SDK's provider does:
-// the token file's contents as the Authorization header, nothing else.
-func fetch(ctx context.Context, rec *recording, tokenPath, uri string) Fetch {
-	f := Fetch{Kind: "fetch", At: time.Now().UTC()}
-	raw, err := os.ReadFile(tokenPath)
-	if err != nil {
-		f.Error = "token: " + err.Error()
-		return f
-	}
+// fetch asks the listener the way the SDK's provider does: a plain GET of
+// the URI, nothing else, since nothing in the pod carries identity (design
+// 7.1).
+func fetch(ctx context.Context, rec *recording, kind, uri string) Fetch {
+	f := Fetch{Kind: kind, At: time.Now().UTC()}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
 	if err != nil {
 		f.Error = err.Error()
 		return f
 	}
-	req.Header.Set("Authorization", strings.TrimSpace(string(raw)))
 	resp, err := rec.Do(req)
 	if err != nil {
 		f.Error = err.Error()
 		return f
 	}
 	_ = resp.Body.Close()
-	f.Exchange = rec.exchange()
+	f.Exchange, _ = rec.exchange()
 	return f
-}
-
-// readToken reads the token file's claims without verifying anything.
-func readToken(path string) *Token {
-	t := &Token{Kind: "token", Path: path, ReadAt: time.Now().UTC()}
-	if path == "" {
-		t.Error = "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE is not set"
-		return t
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Error = err.Error()
-		return t
-	}
-	parts := strings.Split(strings.TrimSpace(string(raw)), ".")
-	if len(parts) != 3 {
-		t.Error = "not a JWS compact serialization"
-		return t
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		t.Error = "claims: " + err.Error()
-		return t
-	}
-	var claims struct {
-		Sub string          `json:"sub"`
-		Aud json.RawMessage `json:"aud"`
-		Iat int64           `json:"iat"`
-		Exp int64           `json:"exp"`
-	}
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		t.Error = "claims: " + err.Error()
-		return t
-	}
-	t.Subject, t.Iat, t.Exp = claims.Sub, claims.Iat, claims.Exp
-	var one string
-	if err := json.Unmarshal(claims.Aud, &one); err == nil {
-		t.Aud = []string{one}
-	} else if err := json.Unmarshal(claims.Aud, &t.Aud); err != nil {
-		t.Error = "aud: " + errors.New("neither a string nor a list").Error()
-	}
-	return t
 }

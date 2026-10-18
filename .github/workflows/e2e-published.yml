@@ -27,13 +27,19 @@ on:
         type: choice
         options: [static, spicedb]
         default: static
+      enrol:
+        description: "The agent's enrolment mode (E2E_ENROL of e2e/run.sh)"
+        required: true
+        type: choice
+        options: [init, cni]
+        default: init
 
 permissions:
   contents: read
 
 jobs:
   e2e:
-    name: e2e (kind, published chart, ${{ inputs.authz }})
+    name: e2e (kind, published chart, ${{ inputs.authz }}, ${{ inputs.enrol }})
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -49,13 +55,26 @@ jobs:
           repository-cache: true
           cache-save: ${{ github.ref == 'refs/heads/main' }}
 
-      # e2e/run.sh uses a cluster of this name if one exists.
+      # The node image is the one e2e/run.sh creates a cluster from, read
+      # from the same file (e2e/kind-node-image, which says how to bump it),
+      # so the Kubernetes the chart is tested on is the one the suite is
+      # developed against.
+      - name: the kind node image
+        id: kind
+        run: echo "node_image=$(grep -v '^#' e2e/kind-node-image)" >> "${GITHUB_OUTPUT}"
+
+      # e2e/run.sh uses a cluster of this name if one exists. kind is pinned
+      # to the release whose default node image e2e/kind-node-image is, as
+      # in ci.yml; bump the two together.
       - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
+          version: v0.31.0
+          node_image: ${{ steps.kind.outputs.node_image }}
           cluster_name: cracha-e2e
 
       - name: e2e/run.sh against the published chart
         env:
           E2E_CHART: ${{ inputs.chart_version }}
           E2E_AUTHZ: ${{ inputs.authz }}
+          E2E_ENROL: ${{ inputs.enrol }}
         run: e2e/run.sh --config=ci

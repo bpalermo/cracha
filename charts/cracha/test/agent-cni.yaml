@@ -1,0 +1,10 @@
+# The cni enrolment mode (design 7.2): the agent's Unix socket is rendered
+# for the plugin, the cni-install init container puts the plugin on the
+# node from these two directories, and the init-mode endpoint and its
+# TokenReview are not rendered. The directories are not the defaults, so
+# that agent_test.go sees the values reach the init container.
+agent:
+  enrol: cni
+  cni:
+    binDir: /usr/libexec/cni
+    confDir: /etc/kubernetes/cni/net.d

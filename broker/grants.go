@@ -10,9 +10,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/bpalermo/cracha/broker/internal/api"
 	"github.com/bpalermo/cracha/broker/internal/bundle"
 	"github.com/bpalermo/cracha/broker/internal/grants"
+	"github.com/bpalermo/cracha/broker/internal/health"
 	"github.com/bpalermo/cracha/common/grant"
 )
 
@@ -21,7 +21,7 @@ import (
 // loaded.
 type grantSource struct {
 	grants.Source
-	ready api.Readiness
+	ready health.Readiness
 }
 
 // newGrantSource opens the grant source the configuration names: the

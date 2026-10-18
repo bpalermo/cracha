@@ -2,6 +2,9 @@
 {{- if not (has .Values.webhook.conflictingEnv (list "reject" "strip")) }}
 {{- fail (printf "webhook.conflictingEnv must be reject or strip, not %q" .Values.webhook.conflictingEnv) }}
 {{- end }}
+{{- if not (has .Values.agent.enrol (list "init" "cni")) }}
+{{- fail (printf "agent.enrol must be init or cni, not %q" .Values.agent.enrol) }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -12,6 +15,15 @@ metadata:
     app.kubernetes.io/component: webhook
 spec:
   replicas: {{ .Values.webhook.replicas }}
+  # A rollout loses no admission (design 7.5): the new pod is Ready, and
+  # has been for minReadySeconds (time for the apiserver to see its
+  # endpoint), before the old one is told to stop and drains.
+  minReadySeconds: {{ int .Values.webhook.minReadySeconds }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       {{- include "cracha.selectorLabels" $selector | nindent 6 }}
@@ -29,6 +41,10 @@ spec:
       priorityClassName: {{ . }}
       {{- end }}
       serviceAccountName: {{ include "cracha.name" . }}-webhook
+      # The drain, the shutdown's wait for the admissions in flight and a
+      # margin for the process to exit: the binary does the draining, no
+      # preStop hook is involved.
+      terminationGracePeriodSeconds: {{ add (include "cracha.seconds" .Values.webhook.drain | int) (include "cracha.seconds" .Values.webhook.shutdownTimeout | int) 5 }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -47,17 +63,31 @@ spec:
           imagePullPolicy: {{ .Values.webhook.image.pullPolicy }}
           args:
             - --listen=:{{ .Values.webhook.port }}
-            {{- include "cracha.tlsArgs" $selector | nindent 12 }}
-            - --broker-url={{ include "cracha.brokerUrl" . }}
+            - --workload-api-socket=unix:///spiffe-workload-api/{{ .Values.webhook.workloadAPI.socket }}
+            - --webhook-config-name={{ include "cracha.name" . }}-webhook
+            - --service-dns-name={{ include "cracha.serviceHost" $selector }}
+            - --agent-port={{ int .Values.agent.port }}
+            - --enrol={{ .Values.agent.enrol }}
+            {{- if eq .Values.agent.enrol "init" }}
+            - --agent-image={{ include "cracha.image" (dict "root" . "image" .Values.agent.image) }}
+            - --enrol-port={{ int .Values.agent.enrolPort }}
+            - --enrol-timeout={{ .Values.agent.enrolTimeout }}
+            - --enrol-cpu={{ required "agent.enrolResources.cpu is required with agent.enrol init" .Values.agent.enrolResources.cpu }}
+            - --enrol-memory={{ required "agent.enrolResources.memory is required with agent.enrol init" .Values.agent.enrolResources.memory }}
+            {{- end }}
             - --default-region={{ required "webhook.defaultRegion is required: AWS_REGION for the pods that do not set their own" .Values.webhook.defaultRegion }}
             - --conflicting-env={{ .Values.webhook.conflictingEnv }}
             - --sa-cache-ttl={{ .Values.webhook.saCacheTTL }}
+            - --drain={{ .Values.webhook.drain }}
+            - --shutdown-timeout={{ .Values.webhook.shutdownTimeout }}
             - --log-level={{ include "cracha.logLevel" .Values.webhook.logLevel }}
           ports:
             - name: https
               containerPort: {{ .Values.webhook.port }}
-          # Ready once the apiserver answers: without it no ServiceAccount
-          # can be looked up and every opted-in pod would be denied.
+          # Ready once the apiserver answers (without it no ServiceAccount
+          # can be looked up and every opted-in pod would be denied), the
+          # SVID is there and the trust bundle has been published to the
+          # webhook configuration.
           readinessProbe:
             httpGet:
               path: /readyz
@@ -77,7 +107,9 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
-            {{- include "cracha.tlsVolumeMount" $selector | nindent 12 }}
+            - name: spire-workload-api
+              mountPath: /spiffe-workload-api
+              readOnly: true
       securityContext:
         seccompProfile:
           type: RuntimeDefault
@@ -89,4 +121,7 @@ spec:
             matchLabels:
               {{- include "cracha.selectorLabels" $selector | nindent 14 }}
       volumes:
-        {{- include "cracha.tlsVolume" $selector | nindent 8 }}
+        # The serving certificate is the webhook's X.509-SVID and the
+        # caBundle its trust bundle, both from the Workload API (design 7.5).
+        - name: spire-workload-api
+          {{- include "cracha.workloadAPIVolumeSource" (dict "component" "webhook" "volume" .Values.webhook.workloadAPI.volume) | nindent 10 }}

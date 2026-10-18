@@ -100,6 +100,9 @@ type brokerLine struct {
 	Entries int       `json:"entries"`
 	Subject string    `json:"subject"`
 	Grant   string    `json:"grant"`
+	Client  string    `json:"client"`
+	Path    string    `json:"path"`
+	Status  int       `json:"status"`
 }
 
 // brokerLogs returns every JSON line of every broker pod's log, in order.

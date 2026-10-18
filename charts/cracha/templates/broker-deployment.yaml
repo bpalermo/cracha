@@ -7,6 +7,9 @@
 {{- $bundleDir := include "cracha.bundleDir" . -}}
 {{- $backend := include "cracha.authzBackend" . -}}
 {{- $spicedb := .Values.broker.authz.spicedb -}}
+{{- with .Values.broker.agentSpiffeID -}}
+{{- if not (hasPrefix "spiffe://" .) }}{{ fail (printf "broker.agentSpiffeID must be a SPIFFE ID, not %q" .) }}{{ end -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -56,8 +59,11 @@ spec:
           imagePullPolicy: {{ .Values.broker.image.pullPolicy }}
           args:
             - --listen=:{{ .Values.broker.port }}
-            {{- include "cracha.tlsArgs" $selector | nindent 12 }}
+            - --health-listen=:{{ .Values.broker.healthPort }}
             - --workload-api-socket=unix:///spiffe-workload-api/{{ .Values.broker.workloadAPI.socket }}
+            {{- with .Values.broker.agentSpiffeID }}
+            - --agent-spiffe-id={{ . }}
+            {{- end }}
             - --cluster={{ required "broker.cluster is required: the name of the cluster this broker serves" .Values.broker.cluster }}
             {{- if $labels }}
             - --trust-domain-labels={{ join "," $labels }}
@@ -96,10 +102,16 @@ spec:
             - --cache-refresh-at={{ .Values.broker.cache.refreshAt }}
             - --cache-max-entries={{ .Values.broker.cache.maxEntries }}
             - --cache-stale-check-max={{ .Values.broker.cache.staleCheckMax }}
-          {{- with .Values.broker.env }}
           env:
+            # The broker's namespace, from which it derives the agent's
+            # SPIFFE ID when broker.agentSpiffeID is empty (design 6.5).
+            - name: CRACHA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- with .Values.broker.env }}
             {{- toYaml . | nindent 12 }}
-          {{- end }}
+            {{- end }}
           {{- with .Values.broker.envFrom }}
           envFrom:
             {{- toYaml . | nindent 12 }}
@@ -107,19 +119,21 @@ spec:
           ports:
             - name: https
               containerPort: {{ .Values.broker.port }}
-          # Ready once the grant bundle has verified (/readyz); alive while
+            - name: health
+              containerPort: {{ .Values.broker.healthPort }}
+          # The probes are plaintext, on their own port: the kubelet has no
+          # SVID to present to the API port. Ready once the broker's SVID has
+          # arrived and the grant bundle has verified (/readyz); alive while
           # the process serves (/healthz).
           readinessProbe:
             httpGet:
               path: /readyz
-              port: https
-              scheme: HTTPS
+              port: health
             periodSeconds: 2
           livenessProbe:
             httpGet:
               path: /healthz
-              port: https
-              scheme: HTTPS
+              port: health
             periodSeconds: 10
           securityContext:
             {{- include "cracha.restrictedSecurityContext" . | nindent 12 }}
@@ -128,7 +142,6 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
-            {{- include "cracha.tlsVolumeMount" $selector | nindent 12 }}
             {{- if eq $backend "static" }}
             - name: assignments
               mountPath: /etc/cracha/assignments
@@ -179,7 +192,6 @@ spec:
             matchLabels:
               {{- include "cracha.selectorLabels" $selector | nindent 14 }}
       volumes:
-        {{- include "cracha.tlsVolume" $selector | nindent 8 }}
         {{- if eq $backend "static" }}
         - name: assignments
           configMap:
@@ -211,10 +223,11 @@ spec:
           configMap:
             name: {{ .Values.broker.grants.existingConfigMap | default (printf "%s-grants" (include "cracha.name" .)) }}
         {{- end }}
-        # The trust bundle the JWT-SVIDs are verified against comes from the
-        # broker's own Workload API connection (design 6.5).
+        # The broker's own X.509-SVID, which it serves mTLS with, and the
+        # trust bundles the JWT-SVIDs are verified against come from its
+        # Workload API connection (design 6.5).
         - name: spire-workload-api
-          {{- include "cracha.workloadAPIVolumeSource" . | nindent 10 }}
+          {{- include "cracha.workloadAPIVolumeSource" (dict "component" "broker" "volume" .Values.broker.workloadAPI.volume) | nindent 10 }}
 ---
 # The broker's service account exists for the platform identity (design 5):
 # an IAM role annotation, or an EKS Pod Identity association. It holds no

@@ -21,10 +21,15 @@ test --test_tag_filters=-e2e
 test:e2e --test_tag_filters=e2e
 test:e2e --nocache_test_results
 test:e2e --test_env=KUBECONFIG
-# The mode e2e/run.sh ran in (E2E_AUTHZ) and, in spicedb mode, how the tests
-# reach the SpiceDB it deployed: the port-forward's address and the file
-# with the preshared key.
+# The modes e2e/run.sh ran in (E2E_AUTHZ, E2E_ENROL) and, in spicedb mode,
+# how the tests reach the SpiceDB it deployed: the port-forward's address
+# and the file with the preshared key.
 test:e2e --test_env=E2E_AUTHZ
+test:e2e --test_env=E2E_ENROL
+# The helm run.sh installed the chart with and the package it installed,
+# for the test that switches the release's mode.
+test:e2e --test_env=E2E_HELM
+test:e2e --test_env=E2E_CHART_PACKAGE
 test:e2e --test_env=E2E_SPICEDB_ENDPOINT
 test:e2e --test_env=E2E_SPICEDB_TOKEN_FILE
 test:e2e --test_timeout=1500

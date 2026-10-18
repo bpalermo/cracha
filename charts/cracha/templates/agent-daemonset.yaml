@@ -1,0 +1,254 @@
+{{- $selector := dict "root" . "component" "agent" -}}
+{{- $enrol := include "cracha.agentEnrol" . -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "cracha.name" . }}-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+spec:
+  selector:
+    matchLabels:
+      {{- include "cracha.selectorLabels" $selector | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cracha.labels" . | nindent 8 }}
+        app.kubernetes.io/component: agent
+      annotations:
+        # The mode this template selects, which the cni-retire preStop hook
+        # of cni mode reads from the DaemonSet (design 7.2): a template that
+        # no longer says cni retires the plugin from the node.
+        cracha.dev/enrol: {{ $enrol | quote }}
+        {{- with .Values.agent.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- if eq $enrol "cni" }}
+      # Covers the cni-retire hook (20 s of retrying the apiserver at most,
+      # then the uninstall) and the agent's own shutdown after it.
+      terminationGracePeriodSeconds: 60
+      {{- end }}
+      {{- with .Values.agent.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      serviceAccountName: {{ include "cracha.name" . }}-agent
+      # The agent's pods live in the release namespace, which the webhook
+      # configuration's namespaceSelector leaves out: nothing wires them,
+      # and they do not depend on the webhook to start.
+      # Design 7.8: host network, because the init-mode enrolment endpoint
+      # listens on the node's address and the listeners the agent binds live
+      # in pods' namespaces, not its own. Not the host PID namespace: it
+      # enters a pod's namespace by the path the runtime reports.
+      hostNetwork: true
+      hostPID: false
+      # The broker's Service name must still resolve from the host network.
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if eq $enrol "cni" }}
+      initContainers:
+        # cni mode (design 7.2): before the agent serves, the plugin is put
+        # on the node. cracha-agent cni-install copies cracha-cni from this
+        # image into the node's CNI bin directory and chains it after the
+        # node's primary plugin in its conflist, naming the agent's socket;
+        # a second run on a node that has it changes nothing. These two
+        # host directories are the only ones the agent image ever writes:
+        # here, and in the agent container's cni-retire preStop hook below,
+        # which undoes this when the agent is not coming back in cni mode.
+        - name: cni-install
+          image: {{ include "cracha.image" (dict "root" . "image" .Values.agent.image) }}
+          imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+          args:
+            - cni-install
+            - --bin-dir={{ .Values.agent.cni.binDir }}
+            - --conf-dir={{ .Values.agent.cni.confDir }}
+            - --socket={{ .Values.agent.cni.socket }}
+            - --log-level={{ include "cracha.logLevel" .Values.agent.logLevel }}
+          securityContext:
+            # Root, to write where the node's root owns; no capability: a
+            # file copy and a conflist rewrite need none.
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: cni-bin-dir
+              mountPath: {{ .Values.agent.cni.binDir }}
+            - name: cni-conf-dir
+              mountPath: {{ .Values.agent.cni.confDir }}
+      {{- end }}
+      containers:
+        - name: agent
+          image: {{ include "cracha.image" (dict "root" . "image" .Values.agent.image) }}
+          imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+          args:
+            - --port={{ int .Values.agent.port }}
+            - --enrol={{ $enrol }}
+            {{- if eq $enrol "init" }}
+            - --enrol-listen=:{{ int .Values.agent.enrolPort }}
+            {{- else }}
+            - --cni-socket={{ .Values.agent.cni.socket }}
+            {{- end }}
+            - --cri-socket={{ .Values.agent.criSocket }}
+            - --issuer-broker-socket=/run/spire/broker/{{ .Values.agent.brokerAPI.socket }}
+            - --workload-api=unix:///spiffe-workload-api/{{ .Values.agent.workloadAPI.socket }}
+            - --broker-url={{ include "cracha.agentBrokerUrl" . }}
+            - --broker-spiffe-id={{ include "cracha.agentBrokerSpiffeID" . }}
+            - --broker-timeout={{ .Values.agent.brokerTimeout }}
+            - --fetch-deadline={{ .Values.agent.fetchDeadline }}
+            - --healthz=:{{ int .Values.agent.healthzPort }}
+            - --log-level={{ include "cracha.logLevel" .Values.agent.logLevel }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- if eq $enrol "cni" }}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- end }}
+          ports:
+            {{- if eq $enrol "init" }}
+            - name: enrol
+              containerPort: {{ int .Values.agent.enrolPort }}
+            {{- end }}
+            - name: healthz
+              containerPort: {{ int .Values.agent.healthzPort }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: healthz
+            periodSeconds: 5
+          {{- if eq $enrol "cni" }}
+          # Retirement (design 7.2): the plugin fails every sandbox of the
+          # node while nothing serves its socket, so when this pod goes for
+          # good the plugin goes with it. The hook reads the DaemonSet (the
+          # Role of agent-rbac.yaml) and runs the installer's uninstall when
+          # it is gone (the chart is being uninstalled) or its template no
+          # longer says cni (agent.enrol changed); a restart, a rollout with
+          # the mode unchanged or a drain leaves the plugin in place. A pod
+          # killed without the hook (a node crash) leaves it too:
+          # `cracha-agent cni-install --uninstall` once on the node, or the
+          # chart installed again in cni mode, puts that right.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /cracha-agent
+                  - cni-retire
+                  - --daemonset={{ include "cracha.name" . }}-agent
+                  - --bin-dir={{ .Values.agent.cni.binDir }}
+                  - --conf-dir={{ .Values.agent.cni.confDir }}
+                  - --log-level={{ include "cracha.logLevel" .Values.agent.logLevel }}
+          {{- end }}
+          securityContext:
+            # Root, because setns into a pod's network namespace needs
+            # CAP_SYS_ADMIN and the runtime grants a container's capabilities
+            # to uid 0 alone. Nothing more: one capability, no writable
+            # image.
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              add:
+                # setns into a network namespace (design 7.8). Not
+                # CAP_SYS_PTRACE: the namespace path comes from the runtime,
+                # never from /proc/<pid>.
+                - SYS_ADMIN
+          {{- with .Values.agent.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: cri-socket
+              mountPath: {{ .Values.agent.criSocket }}
+              readOnly: true
+            # The namespaces the runtime reports are paths under this
+            # directory, bind-mounted there as sandboxes come and go, so the
+            # mount must see the host's later mounts: HostToContainer, at
+            # the same path as on the host.
+            - name: netns-dir
+              mountPath: {{ .Values.agent.netnsDir }}
+              readOnly: true
+              mountPropagation: HostToContainer
+            - name: spire-workload-api
+              mountPath: /spiffe-workload-api
+              readOnly: true
+            - name: spire-broker-api
+              mountPath: /run/spire/broker
+              readOnly: true
+            {{- if eq $enrol "cni" }}
+            - name: cni-socket-dir
+              mountPath: {{ dir .Values.agent.cni.socket }}
+            # The node's CNI directories, writable, for the cni-retire
+            # preStop hook alone (design 7.8): the agent proper never opens
+            # them.
+            - name: cni-bin-dir
+              mountPath: {{ .Values.agent.cni.binDir }}
+            - name: cni-conf-dir
+              mountPath: {{ .Values.agent.cni.confDir }}
+            {{- end }}
+      volumes:
+        - name: cri-socket
+          hostPath:
+            path: {{ .Values.agent.criSocket }}
+            type: Socket
+        - name: netns-dir
+          hostPath:
+            path: {{ .Values.agent.netnsDir }}
+            type: DirectoryOrCreate
+        # The identity issuer's sockets: the Workload API for the agent's
+        # own identity, the Broker API for the pods' tokens.
+        - name: spire-workload-api
+          hostPath:
+            path: {{ .Values.agent.workloadAPI.hostPath }}
+            type: Directory
+        - name: spire-broker-api
+          hostPath:
+            path: {{ .Values.agent.brokerAPI.hostPath }}
+            type: Directory
+        {{- if eq $enrol "cni" }}
+        # The directory of the agent's own socket, which the plugin calls.
+        - name: cni-socket-dir
+          hostPath:
+            path: {{ dir .Values.agent.cni.socket }}
+            type: DirectoryOrCreate
+        # The node's CNI directories, for the installer and the retire
+        # hook. They exist on any node with a CNI; a node without one has
+        # nothing to chain into.
+        - name: cni-bin-dir
+          hostPath:
+            path: {{ .Values.agent.cni.binDir }}
+            type: Directory
+        - name: cni-conf-dir
+          hostPath:
+            path: {{ .Values.agent.cni.confDir }}
+            type: Directory
+        {{- end }}

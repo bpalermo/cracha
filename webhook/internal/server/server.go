@@ -7,9 +7,14 @@
 // [v1]. Any non-200 answer (too large, not JSON, not a review) is a webhook
 // failure to the apiserver, resolved by the configuration's failurePolicy.
 //
-// TLS is mandatory. The certificate and key are read when the server starts
-// and again whenever either file changes on disk, so a renewed certificate
-// (cert-manager or otherwise) is picked up without a restart.
+// TLS is mandatory and comes in as a *tls.Config: the binary builds it from
+// its X.509-SVID source (go-spiffe's tlsconfig.TLSServerConfig, design
+// 7.5), which serves the current SVID to every handshake and so follows the
+// Workload API's rotation. The server only insists on TLS 1.2 or later.
+//
+// Told to stop, the server drains before it shuts down (Serve): readiness
+// goes false at once, the requests of the next Drain are still answered,
+// each with Connection: close, and only then is the listener closed.
 package server
 
 import (
@@ -23,8 +28,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
-	"os"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -39,18 +43,31 @@ type Admitter interface {
 type Config struct {
 	// Listen is the TCP address, such as ":8443".
 	Listen string
-	// CertFile and KeyFile hold the PEM certificate chain and private key.
-	CertFile string
-	KeyFile  string
+	// TLS is the serving configuration. It is cloned, and its MinVersion
+	// raised to TLS 1.2 when lower.
+	TLS *tls.Config
 	// MaxRequestBytes bounds the size of a request body. Zero means
 	// DefaultMaxRequestBytes.
 	MaxRequestBytes int64
 	// Ready, when set, is consulted by /readyz: an error makes the server
-	// report not ready with the error's text.
+	// report not ready with the error's text. While the server drains,
+	// /readyz reports not ready without consulting it.
 	Ready func(ctx context.Context) error
-	// ShutdownTimeout bounds the drain on shutdown. Zero means
-	// DefaultShutdownTimeout.
+	// Drain is how long the server keeps serving after its context is done,
+	// reporting not ready and asking every client to close its connection
+	// after the response, before it shuts down: the time the endpoints
+	// controller and kube-proxy take to stop sending it new connections once
+	// the pod is not ready, so that no apiserver is left with a connection
+	// to a webhook that is gone. Zero means no drain.
+	Drain time.Duration
+	// ShutdownTimeout bounds how long shutdown waits for the requests in
+	// flight after the drain. Zero means DefaultShutdownTimeout.
 	ShutdownTimeout time.Duration
+	// IdleTimeout is how long a keep-alive connection may sit idle before
+	// the server closes it. It is kept under Drain, so that every idle
+	// connection the apiserver holds to a draining webhook is closed by the
+	// webhook, gracefully, before it stops. Zero means DefaultIdleTimeout.
+	IdleTimeout time.Duration
 	// Logger receives one record per admission. Nil means slog.Default().
 	Logger *slog.Logger
 }
@@ -61,6 +78,11 @@ const (
 	// on a pod, which an AdmissionReview carries once (twice on UPDATE).
 	DefaultMaxRequestBytes = 8 << 20
 	DefaultShutdownTimeout = 10 * time.Second
+	// DefaultIdleTimeout is under the binary's default drain of 5s: an
+	// apiserver's idle connection is closed, and reopened to another
+	// webhook, before the draining one stops. HTTP/2 connections get a
+	// GOAWAY first.
+	DefaultIdleTimeout = 3 * time.Second
 )
 
 const admissionReviewAPIVersion = "admission.k8s.io/v1"
@@ -70,12 +92,15 @@ type Server struct {
 	cfg      Config
 	admitter Admitter
 	log      *slog.Logger
-	certs    *certReloader
+	tls      *tls.Config
 	handler  http.Handler
+	// draining is set when the context Serve was given ends, and never
+	// cleared: /readyz then answers 503 and every response asks the
+	// client to close the connection.
+	draining atomic.Bool
 }
 
-// New validates the configuration, loads the certificate once so that a bad
-// one fails at start, and returns the server.
+// New validates the configuration and returns the server.
 func New(cfg Config, admitter Admitter) (*Server, error) {
 	if admitter == nil {
 		return nil, errors.New("admitter must be set")
@@ -83,8 +108,8 @@ func New(cfg Config, admitter Admitter) (*Server, error) {
 	if cfg.Listen == "" {
 		return nil, errors.New("listen address must be set")
 	}
-	if cfg.CertFile == "" || cfg.KeyFile == "" {
-		return nil, errors.New("TLS certificate and key must be set")
+	if cfg.TLS == nil {
+		return nil, errors.New("TLS configuration must be set")
 	}
 	if cfg.MaxRequestBytes <= 0 {
 		cfg.MaxRequestBytes = DefaultMaxRequestBytes
@@ -92,21 +117,40 @@ func New(cfg Config, admitter Admitter) (*Server, error) {
 	if cfg.ShutdownTimeout <= 0 {
 		cfg.ShutdownTimeout = DefaultShutdownTimeout
 	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = DefaultIdleTimeout
+	}
+	if cfg.Drain < 0 {
+		cfg.Drain = 0
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	certs, err := newCertReloader(cfg.CertFile, cfg.KeyFile, cfg.Logger)
-	if err != nil {
-		return nil, err
+	tlsConfig := cfg.TLS.Clone()
+	if tlsConfig.MinVersion < tls.VersionTLS12 {
+		tlsConfig.MinVersion = tls.VersionTLS12
 	}
-	s := &Server{cfg: cfg, admitter: admitter, log: cfg.Logger, certs: certs}
+	s := &Server{cfg: cfg, admitter: admitter, log: cfg.Logger, tls: tlsConfig}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mutate", s.handleMutate)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
-	s.handler = mux
+	s.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// While draining, every response asks the client to open its next
+		// connection elsewhere: a plain close on HTTP/1.1, a GOAWAY on
+		// HTTP/2 (which is what the apiserver speaks).
+		if s.draining.Load() {
+			w.Header().Set("Connection", "close")
+		}
+		mux.ServeHTTP(w, r)
+	})
 	return s, nil
 }
+
+// Draining reports whether the server has been told to stop: it is
+// reporting not ready and closing the connections of the requests it still
+// answers.
+func (s *Server) Draining() bool { return s.draining.Load() }
 
 // Handler is the server's routes, for tests.
 func (s *Server) Handler() http.Handler { return s.handler }
@@ -120,24 +164,37 @@ func (s *Server) Run(ctx context.Context) error {
 	return s.Serve(ctx, ln)
 }
 
-// Serve serves TLS on ln until ctx is done, then drains for at most
-// ShutdownTimeout. It returns nil after a clean shutdown.
+// Serve serves TLS on ln until ctx is done. It then drains: readiness goes
+// false at once, requests are answered as before for Drain, each with
+// Connection: close, and only then is the listener closed and the
+// requests still in flight waited for, up to ShutdownTimeout. It returns
+// nil after a clean shutdown.
+//
+// The order matters to a rollout (design 7.5): the pod is told to stop and
+// taken out of the Service's endpoints at the same time, and an apiserver
+// that has not seen the removal yet keeps sending to the pod. A webhook
+// that stopped at once would leave such an apiserver holding a connection
+// to nothing, which hangs until the apiserver's own timeout fails the pod
+// closed. The drain keeps answering while the removal propagates, and
+// closes every connection of its own accord before it goes.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	// The requests' context ends when the server has stopped, not when ctx
+	// does: an admission in flight at that moment, and the ones of the
+	// drain, are still looked up and answered.
+	requests, stopRequests := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopRequests()
 	srv := &http.Server{
-		Addr:    s.cfg.Listen,
-		Handler: s.handler,
-		TLSConfig: &tls.Config{
-			MinVersion:     tls.VersionTLS12,
-			GetCertificate: s.certs.getCertificate,
-		},
+		Addr:      s.cfg.Listen,
+		Handler:   s.handler,
+		TLSConfig: s.tls,
 		// The apiserver gives a webhook at most 30s; these bound a slow or
 		// stalled client without getting in the way of that.
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       2 * time.Minute,
+		IdleTimeout:       s.cfg.IdleTimeout,
 		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
-		BaseContext:       func(net.Listener) context.Context { return ctx },
+		BaseContext:       func(net.Listener) context.Context { return requests },
 	}
 
 	s.log.Info("serving", "listen", ln.Addr().String())
@@ -149,6 +206,14 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	case err := <-served:
 		return fmt.Errorf("serve: %w", err)
 	case <-ctx.Done():
+	}
+
+	s.draining.Store(true)
+	s.log.Info("draining: not ready, still serving", "drain", s.cfg.Drain)
+	select {
+	case err := <-served:
+		return fmt.Errorf("serve: %w", err)
+	case <-time.After(s.cfg.Drain):
 	}
 
 	s.log.Info("shutting down", "timeout", s.cfg.ShutdownTimeout)
@@ -176,6 +241,11 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if s.draining.Load() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintln(w, "not ready: draining")
+		return
+	}
 	if s.cfg.Ready != nil {
 		if err := s.cfg.Ready(r.Context()); err != nil {
 			s.log.Warn("not ready", "error", err)
@@ -278,67 +348,4 @@ func podName(req *admissionv1.AdmissionRequest) string {
 func methodNotAllowed(w http.ResponseWriter, allow string) {
 	w.Header().Set("Allow", allow)
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-}
-
-// certReloader serves the certificate from CertFile and KeyFile, reading
-// them again when either changes on disk. A failed reload keeps the last
-// good certificate and is logged, so a half-written renewal cannot take the
-// webhook down.
-type certReloader struct {
-	certFile, keyFile string
-	log               *slog.Logger
-
-	mu      sync.Mutex
-	cert    *tls.Certificate
-	certMod time.Time
-	keyMod  time.Time
-}
-
-func newCertReloader(certFile, keyFile string, log *slog.Logger) (*certReloader, error) {
-	r := &certReloader{certFile: certFile, keyFile: keyFile, log: log}
-	certMod, keyMod, err := r.modTimes()
-	if err != nil {
-		return nil, err
-	}
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("loading the TLS certificate: %w", err)
-	}
-	r.cert, r.certMod, r.keyMod = &cert, certMod, keyMod
-	return r, nil
-}
-
-func (r *certReloader) modTimes() (certMod, keyMod time.Time, err error) {
-	certInfo, err := os.Stat(r.certFile)
-	if err != nil {
-		return certMod, keyMod, fmt.Errorf("TLS certificate: %w", err)
-	}
-	keyInfo, err := os.Stat(r.keyFile)
-	if err != nil {
-		return certMod, keyMod, fmt.Errorf("TLS key: %w", err)
-	}
-	return certInfo.ModTime(), keyInfo.ModTime(), nil
-}
-
-func (r *certReloader) getCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	certMod, keyMod, err := r.modTimes()
-	if err != nil {
-		r.log.Warn("checking the TLS files, keeping the loaded certificate", "error", err)
-		return r.cert, nil
-	}
-	if certMod.Equal(r.certMod) && keyMod.Equal(r.keyMod) {
-		return r.cert, nil
-	}
-	cert, err := tls.LoadX509KeyPair(r.certFile, r.keyFile)
-	if err != nil {
-		r.log.Warn("reloading the TLS certificate, keeping the loaded one", "error", err)
-		// Not recorded as seen: the next handshake tries again, which is
-		// what a renewal that is still being written needs.
-		return r.cert, nil
-	}
-	r.log.Info("TLS certificate reloaded", "cert", r.certFile)
-	r.cert, r.certMod, r.keyMod = &cert, certMod, keyMod
-	return r.cert, nil
 }

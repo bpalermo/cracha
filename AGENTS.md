@@ -5,9 +5,10 @@ Guidance for agents working in this repository.
 ## What this is
 
 Crachá issues AWS credentials to Kubernetes workloads from their SPIFFE
-identity. Three binaries: the credential broker (`broker`), the CSI node plugin
-that writes a pod's JWT-SVID where the AWS SDK reads it (`csi`), and the
-mutating webhook that wires pods up (`webhook`). [docs/design.md](docs/design.md)
+identity. Three binaries: the credential broker (`broker`), the node agent
+that serves each pod's credentials over a loopback listener bound inside the
+pod's network namespace (`agent`), and the mutating webhook that wires pods
+up (`webhook`). [docs/design.md](docs/design.md)
 is the design; read it before changing behaviour, and update it in the same
 pull request when behaviour changes. Its invariants (section 11) must hold in
 every change.
@@ -27,6 +28,7 @@ bazel build --config=ci //...   # what CI builds: lockfile must be current, shel
 ```bash
 e2e/run.sh                      # the whole system in a kind cluster
 E2E_AUTHZ=spicedb e2e/run.sh    # with SpiceDB as the authorization backend
+E2E_ENROL=cni e2e/run.sh        # enrolling pods through the CNI plugin, not the init container
 E2E_FILTER=TestName e2e/run.sh  # only the tests whose name matches
 E2E_KEEP_CLUSTER=1 e2e/run.sh   # leave the cluster up to look around
 E2E_CHART=0.1.0 e2e/run.sh      # a published chart and its images, not the checkout's
@@ -35,45 +37,68 @@ E2E_CHART=0.1.0 e2e/run.sh      # a published chart and its images, not the chec
 Needs docker, kind and kubectl; helm comes from Bazel. The suite in `e2e/` is
 tagged `e2e` and excluded from `bazel test //...`; `e2e/run.sh` creates or
 reuses the kind cluster `cracha-e2e`, loads the images built from the
-checkout, deploys SPIRE (`e2e/spire.sh`), installs the chart built from the
-checkout with `e2e/values.yaml` (the suite's assignments, SPIRE socket paths
-and STS endpoint), `e2e/values-local.yaml` (the images just loaded) and a
-values file it writes for the grant bundle it compiled from `e2e/grants`,
-signed with a throwaway key and published into a ConfigMap,
+checkout (the broker, the agent, the webhook and the suite's own two,
+`e2e/client` and `e2e/stsstub`), deploys SPIRE (`e2e/spire.sh`: the server
+and agent of `e2e/spire.yaml`, with the agent's Broker API open to
+`cracha-agent` alone, and the entries of the three components and the test
+workloads, the webhook's with its Service name as a DNS SAN), installs the
+chart built from the checkout with `e2e/values.yaml` (the suite's
+assignments, the SPIRE socket paths, the kind node's CRI socket and netns
+directory, the STS endpoint), `e2e/values-local.yaml` (the images just
+loaded) and a values file it writes for the grant bundle it compiled from
+`e2e/grants`, signed with a throwaway key and published into a ConfigMap,
 deploys the STS stand-in (`e2e/manifests/stsstub.yaml`, `e2e/stsstub`) and
-runs the tests against the ambient kubeconfig. The chart's generated CA is
-what the test workloads trust: run.sh copies it from the `cracha-ca` Secret
-into a ConfigMap of the test namespace. `E2E_AUTHZ` picks the broker's
-authorization backend: `static` (the default) is the assignments document
-in `e2e/values.yaml`; `spicedb` also deploys SpiceDB from
+runs the tests against the ambient kubeconfig. Nothing is generated or
+handed to a workload: every certificate is an X.509-SVID from that SPIRE,
+the agent reaches the broker over SPIFFE mTLS, and the test workloads see
+only the loopback listener in their own network namespace, so there is no
+CA anywhere in the suite. `E2E_AUTHZ` picks the broker's authorization
+backend: `static` (the default) is the assignments document in
+`e2e/values.yaml`; `spicedb` also deploys SpiceDB from
 `e2e/manifests/spicedb.yaml` (memory datastore, plaintext gRPC, a preshared
 key the script makes), runs `cracha-reconciler` built from the checkout on
 the host through a `kubectl port-forward` to write the schema and the
 relationships of `e2e/grants`, and installs the chart with
-`e2e/values-spicedb.yaml` on top. The tests that need SpiceDB (revocation
-through Watch, suspension, the cache's mode) skip in static mode; the rest
-run in both, and one of them checks that the static document and the grant
-tree assign the same things. CI runs the script once per backend. The
-cluster is created from the node image in `e2e/kind-node-image`, by tag and
-digest; CI's `e2e` job gives `helm/kind-action` the same file and pins the
-kind release it is the default of. To move to another Kubernetes, write the
-image for that minor from the kind release notes into the file and the kind
-release into `ci.yml`; a kept cluster made from the old image is reused as
-is until it is deleted.
+`e2e/values-spicedb.yaml` on top. `E2E_ENROL` picks how the agent enrols a
+pod (design 7.2): `init` (the default, the chart's) has the webhook inject
+the `cracha-enrol` init container; `cni` installs the chart with
+`e2e/values-cni.yaml` on top, which switches the agent to the `cracha-cni`
+plugin. A kept cluster switches modes through the chart: the agent going
+retires the plugin from the node (its `preStop` hook, design 7.2), and the
+suite's cni leg checks that switch both ways with `helm upgrade`, through
+the helm and chart package run.sh hands it as `E2E_HELM` and
+`E2E_CHART_PACKAGE`. The tests that
+need SpiceDB (revocation through Watch, suspension,
+the cache's mode) skip in static mode, those that look at one enrolment
+mode's wiring skip in the other; the rest run everywhere, and one of them
+checks that the static document and the grant tree assign the same
+things. `e2e/client` is the workload: the AWS SDK with the injected
+environment and nothing else, its first action the credential fetch with
+the provider's retries off, reporting the answer, the request count and
+then `GET /v1/grants` as JSON lines the tests read from its log, and
+fetching again at `E2E_FETCH_INTERVAL` when asked. CI runs the script once
+per backend and enrolment mode. The cluster is created from the node image
+in `e2e/kind-node-image`, by tag and digest; CI's `e2e` job gives
+`helm/kind-action` the same file and pins the kind release it is the
+default of. To move to another Kubernetes, write the image for that minor
+from the kind release notes into the file and the kind release into
+`ci.yml` and `e2e-published.yml`; a kept cluster made from the old image is
+reused as is until it is deleted.
 `E2E_CHART=<version>` runs the suite against a published chart instead of
 the one built from the checkout: run.sh pulls
 `oci://$(bazel/registry.sh chart-ref cracha)` at that version with the
 pinned helm, installs it with the images it pins (the node pulls them from
-the registry; the checkout's broker, csi and webhook images are neither
+the registry; the checkout's broker, agent and webhook images are neither
 built nor loaded and `values-local.yaml` is not passed) and prints the
 chart's digest and its image pins first, so the log says what was tested.
 The suite, SPIRE, the bundle, the STS stand-in and the suite's own images
 still come from the checkout, so run it from the commit whose suite
 matches the chart. The `e2e-published` workflow
-(`.github/workflows/e2e-published.yml`, run by hand with the chart version
-and the backend) does the same in a kind cluster on a runner. Every change
-that adds user-visible behaviour extends the suite, and a change to how
-Crachá is deployed goes in the chart, not in a manifest.
+(`.github/workflows/e2e-published.yml`, run by hand with the chart version,
+the backend and the enrolment mode) does the same in a kind cluster on a
+runner. Every change that adds user-visible behaviour extends the suite,
+and a change to how Crachá is deployed goes in the chart, not in a
+manifest.
 
 Bazel is the only build. Never run the host `go` tool: not `go mod tidy`, not
 `go get`, not `go test`. Change a Go dependency through rules_go's SDK:
@@ -106,12 +131,14 @@ CI builds and tests only what a change impacts. The `diff` job hashes the
 build graph at the base and the head of the change with bazel-diff
 (`bazel/ci-impacted-targets.sh`) and hands `build` the impacted rules to
 build and the impacted tests to run; `build` is skipped when nothing is
-impacted, and the `e2e (kind)` job runs only when the impacted set reaches
-something the suite deploys or runs: anything under `//e2e/...`, the chart
-`//charts/cracha:cracha` or a component's `image_load`. The suite's
-manifests, values files, `spire.sh` and `run.sh` are `data` of
-`//e2e:e2e_test`, so editing one of them is an e2e-relevant change; a new
-fixture the suite deploys goes in that glob. A documentation-only change
+impacted, and the `e2e (kind, <authz>, <enrol>)` matrix, one leg per
+authorization backend and enrolment mode (`E2E_AUTHZ`, `E2E_ENROL`), runs
+only when the impacted set reaches something the suite deploys or runs:
+anything under `//e2e/...`, the chart `//charts/cracha:cracha` or a
+component's `image_load`. The suite's manifests, values files, `spire.sh`
+and `run.sh` are `data` of `//e2e:e2e_test`, so editing one of them is an
+e2e-relevant change; a new fixture the suite deploys goes in that glob. The
+`ci` aggregate takes the matrix as one result: every leg has to pass. A documentation-only change
 builds nothing and creates no kind cluster; the formatter and the Gazelle
 check run on every change regardless. A change to the files CI itself
 depends on and no target does (`.bazelrc`, `.bazelversion`, `MODULE.bazel`
@@ -131,13 +158,77 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 ## Layout
 
 - No `cmd/`. Each binary lives in a root-level directory with its `main.go`:
-  `broker/`, `csi/`, `webhook/`, `grantc/`, `reconciler/`.
+  `broker/`, `agent/`, `webhook/`, `grantc/`, `reconciler/`.
+- `agent/` is `cracha-agent` (design 7). `internal/listener` is the registry
+  of loopback listeners, one per enrolled pod, bound inside the pod's network
+  namespace by `internal/netns` (setns on a dedicated locked thread) and
+  multiplexed into one `http.Server`; the pod a request is answered for is
+  the listener it arrived on, nothing in the request. `internal/credentials`
+  is the endpoint (`GET /v1/credentials` and `/v1/grants`): the pod's
+  JWT-SVID through the issuer adapter (`internal/issuer`, SPIRE's Broker API
+  in `internal/issuer/spire`), cached in memory until a minute before expiry,
+  then the broker's answer relayed unchanged over SPIFFE mTLS
+  (`internal/broker`, the agent's own SVID from `internal/identity`, the
+  broker verified by SPIFFE ID). Enrolment (design 7.2) is `internal/enrol`:
+  the label check and bind both modes share, the init-mode endpoint
+  (`POST /v1/enrol`, TokenReview of the init container's bound token in
+  `internal/tokenreview`, the sandbox's namespace path through the CRI in
+  `internal/cri`) and the `cracha-agent enrol` client; cni mode's server side
+  is `internal/cni/server`, speaking `agent/cni/proto` (JSON over HTTP on a
+  Unix socket the agent creates 0600 in a 0700 directory). `internal/recovery`
+  rebinds the node's enrolled pods on start from a filtered pod informer and
+  closes the listeners of pods that go. `agent/enrolapi` is the contract the
+  webhook imports: the enrolment label, the endpoint, the init container's
+  environment.
+- `agent/cni` is `cracha-cni`, the chained CNI plugin of cni mode (design
+  7.2), built from the agent's tree: `main.go` over `internal/plugin`
+  (ADD tells the agent the pod and its netns path and prints the previous
+  plugin's result byte for byte, failing closed when the agent is down or
+  refuses; DEL is best effort; CHECK, GC and STATUS do nothing) and
+  `netconf`, the conflist entry both the plugin and the installer import.
+  It has no image of its own: `//agent:image` carries it at
+  `/opt/cracha/cni/cracha-cni`, and `cracha-agent cni-install`
+  (`agent/internal/cni/install`, the DaemonSet's init container in cni
+  mode) copies it into the node's CNI bin directory and chains it after
+  the primary plugin of the lexically first conflist of the CNI conf
+  directory, with write-fsync-rename and nothing rewritten when already
+  there (`--uninstall` undoes it). `cracha-agent cni-retire`
+  (`agent/internal/cni/retire`, the agent container's `preStop` hook in
+  cni mode) runs that uninstall when the agent is not coming back in cni
+  mode: its DaemonSet gone or being deleted, the DaemonSet's pod template
+  annotation `cracha.dev/enrol` no longer `cni`, or its token refused
+  (401) for the whole budget; on anything else it logs and leaves the
+  plugin. `go_image` takes the extra file through its `files` argument.
 - Code private to a binary goes under its `internal/`. The webhook's
-  `internal/mutate` is the admission decision, pure over two interfaces:
-  ServiceAccount lookups (`internal/sacache`, a Get remembered for a TTL)
-  and the per-namespace `AWS_REGION` override (`internal/nsregion`, the
-  `cracha.dev/region` Namespace annotation served from an informer; the
-  chart's ClusterRole lists and watches namespaces for it).
+  `internal/mutate` is the admission decision (design 7.5), pure over two
+  interfaces: ServiceAccount lookups (`internal/sacache`, a Get remembered
+  for a TTL) and the per-namespace `AWS_REGION` override
+  (`internal/nsregion`, the `cracha.dev/region` Namespace annotation served
+  from an informer; the chart's ClusterRole lists and watches namespaces
+  for it). It injects the loopback `AWS_CONTAINER_CREDENTIALS_FULL_URI`
+  (`--agent-port`), `AWS_REGION`, the label `cracha.dev/credentials` (the
+  idempotency key) and, with `--enrol=init`, the `cracha-enrol` init
+  container from `--agent-image` with its projected token (audience
+  `cracha-agent`, at `mutate.EnrolTokenPath`, also in
+  `CRACHA_ENROL_TOKEN_FILE`; `CRACHA_HOST_IP`, `CRACHA_ENROL_PORT`,
+  `CRACHA_AGENT_PORT`, `CRACHA_ENROL_TIMEOUT`; every name is
+  `agent/enrolapi`'s, the one definition of the contract) with the
+  resources of `--enrol-cpu` and `--enrol-memory` as its requests and
+  limits alike (defaults `mutate.DefaultEnrolCPU`, 100m, and 32Mi: under
+  about 100m runc's init and the enrol binary are CFS-throttled and a pod
+  sits in Init for tens of seconds, which the e2e's first-fetch test
+  bounds at 5 s); the golden
+  pods of each mode are
+  `internal/mutate/testdata/*.golden.json` (refresh with
+  `--test_env=UPDATE_GOLDEN=1`). `internal/server` serves HTTPS with the
+  `*tls.Config` it is given, which `main.go` builds from the webhook's
+  X.509-SVID (`--workload-api-socket`), and drains when told to stop
+  (readiness false, then `--drain` of answering with `Connection: close`,
+  then the shutdown; `main.go` keeps the informers and the Workload API
+  source alive until the server has returned); `internal/cabundle` keeps the
+  `caBundle` of the chart's `MutatingWebhookConfiguration`
+  (`--webhook-config-name`) at the trust bundle of the webhook's trust
+  domain, on start, on every Workload API update and on a resync.
 - Code shared between binaries goes under `common/`. `common/idenc` is the
   single identity-encoding library (design 4.3): nothing else formats a
   SourceIdentity or an authorization subject ID.
@@ -171,6 +262,17 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   is the in-memory SpiceDB its tests use). Like `grantc` it runs from CI or
   an operator's machine and has no container image; the e2e will run it
   from the host against a port-forwarded SpiceDB.
+- The broker's transport is `broker/internal/mtls` (design 6.5): the TLS
+  configuration over go-spiffe (`tlsconfig.MTLSServerConfig`, the agent's
+  ID the only one authorised, so any other client fails at the handshake),
+  the peer identity of a request, which `broker/internal/api` logs beside
+  the token's subject with every request, and the readiness check that
+  waits for the broker's SVID. `broker/spiffe.go` is the broker's one
+  Workload API connection, which the X.509 source (mTLS) and the JWT
+  source (token verification) share. The probes are `broker/internal/health`,
+  on their own plaintext listener (`--health-listen`); the API listener
+  serves nothing but `/v1/credentials` and `/v1/grants`. `mtls/mtlstest`
+  mints the X.509-SVIDs the tests use, as `authn/authntest` mints JWTs.
 - The broker gets its grants from one of two sources, exactly one of which
   is configured. In production it is the compiled bundle `grantc` publishes
   (`--bundle-source local:<dir>` or `s3://bucket/prefix`,
@@ -193,30 +295,59 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   may spell it out.
 - Images are built with the `go_image` macro in `bazel/image/defs.bzl`, from
   pure-Go binaries on a digest-pinned distroless base. Image repositories are
-  `broker`, `csi` and `webhook`.
+  `broker`, `agent` and `webhook`.
 - `VERSION` holds the release being worked towards. Binaries report the commit
   they were built from, stamped by `bazel/workspace_status.sh`.
 
 ## Chart
 
-- `charts/cracha` is the Helm chart: the CSIDriver, the CSI DaemonSet, the
-  broker and the webhook with their TLS. It is built, linted, templated and
+- `charts/cracha` is the Helm chart: the agent DaemonSet, the broker and
+  the webhook. It is built, linted, templated and
   installed with the helm that rules_helm pins (`@helm//:helm`, the version
   in `MODULE.bazel` and `.bazelrc`); never a helm from PATH.
   `bazel build //charts/cracha:cracha` packages it as
   `bazel-bin/charts/cracha/cracha.tgz`; `bazel test //charts/cracha/...`
-  runs the lint, template (defaults, every override, cert-manager) and pin
+  runs the lint, template (defaults, every override) and pin
   tests, and the Go assertions over the rendered objects (`render_test.go`
   decodes the `helm_template` renderings of `BUILD.bazel`; an assertion
   on what a template renders goes there, since `helm_template_test` only
   renders).
 - The chart's version and image pins are stamped at package time: the
   version from `STABLE_CHART_VERSION`, each image's repository and digest
-  from its `image_push` target (`{@//csi:image_push.digest}` in
+  from its `image_push` target (`{@//agent:image_push.digest}` in
   `values.yaml`). Do not write a version or a digest into `Chart.yaml.in` or
   `values.yaml` by hand; `//charts/cracha:pin_test` checks the result with
-  `bazel/chart-pin.sh`. The registrar sidecar is the one image pinned by
-  hand, by tag and digest.
+  `bazel/chart-pin.sh`.
+- The agent's values are `agent.*` with the design's names: `port`,
+  `enrol` (`init` or `cni`), `enrolPort`, `enrolTimeout`, `enrolResources`
+  (`cpu` and `memory` of the `cracha-enrol` init container, passed to the
+  webhook as `--enrol-cpu` and `--enrol-memory`), `fetchDeadline`,
+  `brokerUrl`, `brokerSpiffeID` (empty: the broker ServiceAccount's path in
+  the agent's own trust domain), `criSocket`, `netnsDir`, `cni.socket`,
+  `cni.binDir`, `cni.confDir`. The DaemonSet is in the host network with
+  `CAP_SYS_ADMIN` alone; its host mounts are the CRI socket, the runtime's
+  netns directory (read-only, `HostToContainer`) and the issuer's sockets,
+  and `agent_test.go` holds it to that. `agent.enrol: cni` renders the
+  socket's hostPath for the agent container and the `cni-install` init
+  container from the agent image, with `cni.binDir` and `cni.confDir`
+  mounted read-write (no capability, read-only root): on the
+  node it writes `<binDir>/cracha-cni` and rewrites the lexically first
+  conflist of `confDir` (kind: `10-kindnet.conflist`) with the entry
+  `{"type": "cracha-cni", "socket": <cni.socket>, "timeout": "5s"}`
+  appended to its `plugins`, and touches nothing else. The agent container
+  mounts the same two directories read-write in cni mode for one reason:
+  its `preStop` hook, `cracha-agent cni-retire`, which takes the plugin
+  off the node when the agent is not coming back in cni mode (the chart
+  uninstalled, or `agent.enrol` switched: it reads its own DaemonSet,
+  through the Role `get` on that one DaemonSet by name that both modes
+  render, and compares the pod template's annotation `cracha.dev/enrol`,
+  which the template always carries) and leaves it on a restart, a
+  rollout or a drain; `terminationGracePeriodSeconds` is 60 in cni mode
+  to cover the hook. A node that lost its agent pod without the hook (a
+  crash) keeps the plugin: `cracha-agent cni-install --uninstall` once on
+  the node, or the chart installed again in cni mode, fixes it.
+  `test/agent-cni.yaml` renders cni mode with non-default directories and
+  `agent_test.go` checks the installer, the hook, the mounts and the Role.
 - `broker.authz.backend` picks the authorization store: `static` (the
   default) renders the assignments ConfigMap and its mount; `spicedb` takes
   `broker.authz.spicedb` (endpoint, `tokenSecret` naming a Secret the
@@ -234,9 +365,43 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   source, and a helper renders the chosen one only
   (`cracha.workloadAPIVolumeSource`). `//charts/cracha:cracha_test` fails
   any rendered volume with two sources, in every rendering it has.
-- The default TLS mode generates a CA at render time, for development and
-  kind only: the broker's certificate must be trusted by the workload images
-  (design 6.5), so production uses `existing` or `cert-manager`.
+- The broker has no certificate from the chart: it serves SPIFFE mTLS with
+  its own X.509-SVID from the Workload API and admits one client, the node
+  agent, by SPIFFE ID (design 6.5). `broker.agentSpiffeID` names it; empty,
+  the default, leaves the broker to derive
+  `spiffe://<its own trust domain>/ns/<its namespace>/sa/cracha-agent`, the
+  namespace coming from `CRACHA_NAMESPACE`, which the Deployment sets from
+  the downward API. The kubelet's probes cannot present an SVID, so
+  `/healthz` and `/readyz` are served plaintext on `broker.healthPort`
+  (`--health-listen`), a port that serves nothing else and is not on the
+  Service.
+- The webhook has no certificate from the chart either, so the chart has no
+  TLS values at all: it serves its X.509-SVID from the Workload API
+  (`webhook.workloadAPI`, the volume with its `type` and socket shaped as
+  the broker's), and the `MutatingWebhookConfiguration`
+  is rendered without a `caBundle`, which the webhook patches in itself (its
+  ClusterRole has `get` and `patch` on that one object by `resourceNames`).
+  The configuration's `namespaceSelector` excludes the release namespace
+  and `webhook.excludedNamespaces` (a list that replaces the default of
+  SPIRE's namespaces and `kube-system`). The webhook reads the agent's
+  values `agent.image`, `agent.port`, `agent.enrol` (`init` injects the
+  `cracha-enrol` init container, `cni` nothing but env and label),
+  `agent.enrolPort`, `agent.enrolTimeout` and `agent.enrolResources`;
+  `render_test.go` asserts the
+  configuration and the Deployment's arguments in both modes.
+- The webhook's rollout loses no admission (design 7.5): `webhook.drain`
+  (`--drain`, default `5s`) is how long a pod told to stop keeps
+  answering, not ready, before it shuts down, and `webhook.shutdownTimeout`
+  (`--shutdown-timeout`, `10s`) how long the shutdown then waits for the
+  admissions in flight; the Deployment's `terminationGracePeriodSeconds`
+  is the two plus 5 s of margin (`cracha.seconds` of `_helpers.tpl` turns
+  the durations, whole seconds only, into the number), its strategy is
+  `RollingUpdate` with `maxUnavailable: 0` and `maxSurge: 1`, and
+  `webhook.minReadySeconds` (5) keeps the new pod Ready that long before
+  the old one is told to stop. The binary drains; there is no `preStop`
+  hook. The e2e's `TestWebhookRolloutLosesNoPod` restarts the Deployment
+  and requires every create of the next 15 s to be admitted at the first
+  attempt.
 - The chart is published to `chart_registry_url("cracha")` of
   `bazel/registry.bzl` by the publish workflow (below).
 
@@ -245,7 +410,7 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 - Every published coordinate comes from `bazel/registry.bzl`: the registry
   host, the organization, the three image repositories and the chart's.
   Bazel loads it; shell and the workflows read it through `bazel/registry.sh`
-  (`bazel/registry.sh` prints `KEY=VALUE` lines, `bazel/registry.sh ref csi`
+  (`bazel/registry.sh` prints `KEY=VALUE` lines, `bazel/registry.sh ref agent`
   one reference). `bazel/check-registry-config.sh`, run by the `lint` job of
   `ci.yml`, fails a change that spells the registry out anywhere else; the
   README is the one file allowed to, because people copy install commands
@@ -286,9 +451,9 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   the signature is a referrer as `SIGNATURE_LAYOUT` promises) or the chart:
 
   ```bash
-  bazel run //bazel/cosign:verify_image -- "$(bazel/registry.sh ref csi)@sha256:<digest>"
+  bazel run //bazel/cosign:verify_image -- "$(bazel/registry.sh ref agent)@sha256:<digest>"
   bazel run //bazel/cosign:verify_image -- --single "$(bazel/registry.sh chart-ref cracha)@sha256:<digest>"
-  bazel run //bazel/cosign -- verify "$(bazel/registry.sh ref csi)@sha256:<digest>" \
+  bazel run //bazel/cosign -- verify "$(bazel/registry.sh ref agent)@sha256:<digest>" \
     --certificate-identity-regexp '^https://github.com/bpalermo/cracha/.github/workflows/publish.yml@refs/(heads/main|tags/v.*)$' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```

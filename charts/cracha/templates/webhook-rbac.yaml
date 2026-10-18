@@ -8,9 +8,10 @@ metadata:
     app.kubernetes.io/component: webhook
 ---
 # The webhook looks a pod's ServiceAccount up for the opt-in annotation
-# (design 7.4), in any namespace, and watches the Namespaces for the
-# per-namespace region override (the cracha.dev/region annotation). That is
-# all it may do with the API.
+# (design 7.5), in any namespace; watches the Namespaces for the
+# per-namespace region override (the cracha.dev/region annotation); and
+# keeps the caBundle of its own webhook configuration, and no other, at its
+# trust bundle. That is all it may do with the API.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -25,6 +26,10 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations"]
+    resourceNames: [{{ include "cracha.name" . }}-webhook]
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

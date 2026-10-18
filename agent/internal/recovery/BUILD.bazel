@@ -1,0 +1,37 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "recovery",
+    srcs = ["recovery.go"],
+    importpath = "github.com/bpalermo/cracha/agent/internal/recovery",
+    visibility = ["//agent:__subpackages__"],
+    deps = [
+        "//agent/enrolapi",
+        "//agent/internal/cri",
+        "//agent/internal/enrol",
+        "//agent/internal/listener",
+        "@io_k8s_api//core/v1:core",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_apimachinery//pkg/fields",
+        "@io_k8s_apimachinery//pkg/labels",
+        "@io_k8s_apimachinery//pkg/selection",
+        "@io_k8s_client_go//informers",
+        "@io_k8s_client_go//kubernetes",
+        "@io_k8s_client_go//tools/cache",
+    ],
+)
+
+go_test(
+    name = "recovery_test",
+    srcs = ["recovery_test.go"],
+    embed = [":recovery"],
+    deps = [
+        "//agent/enrolapi",
+        "//agent/internal/cri",
+        "//agent/internal/listener",
+        "@io_k8s_api//core/v1:core",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_apimachinery//pkg/types",
+        "@io_k8s_client_go//kubernetes/fake",
+    ],
+)

@@ -2,13 +2,13 @@
 //
 //	GET /v1/credentials   Authorization: <JWT-SVID>  → container-credentials JSON
 //	GET /v1/grants        same authorization         → shape, grants, composed policy
-//	GET /healthz          liveness: the process serves
-//	GET /readyz           readiness: every registered check passes (the
-//	                      grant bundle has loaded, say)
 //
 // The identity in the token selects everything. Nothing else in the request
 // is trusted: no proxy-asserted identity header is read, and nothing
-// workload-supplied reaches the store or STS.
+// workload-supplied reaches the store or STS. The transport is the SPIFFE
+// mTLS of broker/internal/mtls, which admits only the node agent; every
+// request is logged with the client SVID the TLS layer verified beside the
+// token's subject. The probes are served elsewhere (broker/internal/health).
 package api
 
 import (
@@ -18,11 +18,11 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/bpalermo/cracha/broker/internal/grants"
 	"github.com/bpalermo/cracha/broker/internal/issuer"
+	"github.com/bpalermo/cracha/broker/internal/mtls"
 	"github.com/bpalermo/cracha/common/idenc"
 )
 
@@ -48,21 +48,12 @@ const (
 	ReasonUnavailable     = "unavailable"
 )
 
-// Readiness is a dependency /readyz consults: an error means the broker
-// must not take traffic yet, and says why.
-type Readiness interface {
-	Ready() error
-}
-
 // Handler serves the API.
 type Handler struct {
 	auth   Authenticator
 	issuer issuer.Issuer
 	log    *slog.Logger
 	mux    *http.ServeMux
-
-	mu    sync.RWMutex
-	ready []Readiness
 }
 
 // New returns the API handler. Methods other than GET on the API paths get
@@ -74,34 +65,7 @@ func New(auth Authenticator, iss issuer.Issuer, log *slog.Logger) *Handler {
 	h := &Handler{auth: auth, issuer: iss, log: log, mux: http.NewServeMux()}
 	h.mux.HandleFunc("/v1/credentials", getOnly(h.credentials))
 	h.mux.HandleFunc("/v1/grants", getOnly(h.grants))
-	h.mux.HandleFunc("/healthz", getOnly(func(w http.ResponseWriter, _ *http.Request) {
-		writeText(w, http.StatusOK, "ok\n")
-	}))
-	h.mux.HandleFunc("/readyz", getOnly(h.readyz))
 	return h
-}
-
-// AddReadiness registers a check /readyz consults. Until every registered
-// check passes the handler reports not ready; with none registered it is
-// ready as soon as it serves.
-func (h *Handler) AddReadiness(r Readiness) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.ready = append(h.ready, r)
-}
-
-func (h *Handler) readyz(w http.ResponseWriter, r *http.Request) {
-	h.mu.RLock()
-	checks := h.ready
-	h.mu.RUnlock()
-	for _, c := range checks {
-		if err := c.Ready(); err != nil {
-			h.log.LogAttrs(r.Context(), slog.LevelWarn, "not ready", slog.String("error", err.Error()))
-			writeText(w, http.StatusServiceUnavailable, "not ready: "+err.Error()+"\n")
-			return
-		}
-	}
-	writeText(w, http.StatusOK, "ok\n")
 }
 
 // getOnly answers 405 to every method but GET. (A ServeMux "GET" pattern
@@ -117,9 +81,45 @@ func getOnly(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// ServeHTTP implements http.Handler.
+// ServeHTTP implements http.Handler. Every request is logged once answered,
+// with the client SVID the TLS layer verified (design 6.5) beside the
+// subject of the token it carried, when one verified.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.mux.ServeHTTP(w, r)
+	start := time.Now()
+	entry := &logEntry{}
+	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	h.mux.ServeHTTP(rec, r.WithContext(context.WithValue(r.Context(), logEntryKey{}, entry)))
+	h.log.LogAttrs(r.Context(), slog.LevelInfo, "request",
+		slog.String("method", r.Method), slog.String("path", r.URL.Path), slog.Int("status", rec.status),
+		slog.String("client", clientID(r)), slog.String("subject", entry.subject),
+		slog.Duration("duration", time.Since(start)))
+}
+
+// logEntry is what the handlers add to the request's log line: the
+// subject of the token, once it verified.
+type logEntry struct{ subject string }
+
+type logEntryKey struct{}
+
+// statusRecorder remembers the status a handler wrote, for the log.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(status int) {
+	s.status = status
+	s.ResponseWriter.WriteHeader(status)
+}
+
+// clientID is the SPIFFE ID of the client certificate the TLS layer
+// verified, or "" when the request carried none.
+func clientID(r *http.Request) string {
+	id, ok := mtls.PeerID(r)
+	if !ok {
+		return ""
+	}
+	return id.String()
 }
 
 // credentialsResponse is the container-credentials format every AWS SDK
@@ -220,9 +220,13 @@ func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request) (idenc.Id
 	id, err := h.auth.Verify(r.Context(), token)
 	if err != nil {
 		h.log.LogAttrs(r.Context(), slog.LevelWarn, "unauthenticated",
-			slog.String("remote", r.RemoteAddr), slog.String("path", r.URL.Path), slog.String("error", err.Error()))
+			slog.String("remote", r.RemoteAddr), slog.String("client", clientID(r)),
+			slog.String("path", r.URL.Path), slog.String("error", err.Error()))
 		writeReason(w, http.StatusUnauthorized, ReasonUnauthenticated)
 		return idenc.Identity{}, false
+	}
+	if entry, ok := r.Context().Value(logEntryKey{}).(*logEntry); ok {
+		entry.subject = id.String()
 	}
 	return id, true
 }
@@ -244,13 +248,6 @@ func setDecisionHeaders(w http.ResponseWriter, res issuer.Resolution) {
 	h.Set(HeaderGrants, strings.Join(res.Composed.Grants, ", "))
 	h.Set(HeaderBundleVersion, res.BundleVersion)
 	h.Set(HeaderConsistencyToken, string(res.Decision.Token))
-}
-
-func writeText(w http.ResponseWriter, status int, body string) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(status)
-	_, _ = w.Write([]byte(body))
 }
 
 func writeReason(w http.ResponseWriter, status int, reason string) {

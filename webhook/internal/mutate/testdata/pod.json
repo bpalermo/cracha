@@ -1,0 +1,65 @@
+{
+  "apiVersion": "v1",
+  "kind": "Pod",
+  "metadata": {
+    "namespace": "apps",
+    "generateName": "web-",
+    "labels": {
+      "app": "web"
+    },
+    "annotations": {
+      "team": "payments"
+    }
+  },
+  "spec": {
+    "serviceAccountName": "enabled",
+    "securityContext": {
+      "runAsUser": 1000,
+      "fsGroup": 1000
+    },
+    "initContainers": [
+      {
+        "name": "migrate",
+        "image": "example/migrate",
+        "env": [
+          {
+            "name": "DATABASE_URL",
+            "value": "postgres://ledger"
+          }
+        ]
+      }
+    ],
+    "containers": [
+      {
+        "name": "app",
+        "image": "example/app",
+        "env": [
+          {
+            "name": "FOO",
+            "value": "bar"
+          },
+          {
+            "name": "AWS_REGION",
+            "value": "us-east-1"
+          }
+        ],
+        "volumeMounts": [
+          {
+            "name": "data",
+            "mountPath": "/data"
+          }
+        ]
+      },
+      {
+        "name": "sidecar",
+        "image": "example/sidecar"
+      }
+    ],
+    "volumes": [
+      {
+        "name": "data",
+        "emptyDir": {}
+      }
+    ]
+  }
+}

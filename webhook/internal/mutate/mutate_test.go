@@ -1,17 +1,23 @@
 package mutate
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -20,9 +26,29 @@ import (
 )
 
 const (
-	brokerURL = "https://broker.cracha.svc/v1/credentials"
-	region    = "eu-west-1"
+	agentPort    = 8780
+	enrolPort    = 8781
+	enrolTimeout = 30 * time.Second
+	agentImage   = "registry.example.com/cracha/agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	region       = "eu-west-1"
 )
+
+var credentialsURI = "http://127.0.0.1:8780/v1/credentials"
+
+// config is the configuration under test in the given mode.
+func config(mode EnrolMode, policy ConflictPolicy) Config {
+	return Config{
+		AgentPort:      agentPort,
+		DefaultRegion:  region,
+		ConflictingEnv: policy,
+		Enrol:          mode,
+		AgentImage:     agentImage,
+		EnrolPort:      enrolPort,
+		EnrolTimeout:   enrolTimeout,
+		EnrolCPU:       resource.MustParse(DefaultEnrolCPU),
+		EnrolMemory:    resource.MustParse(DefaultEnrolMemory),
+	}
+}
 
 // clientLookup adapts a clientset to ServiceAccounts, without a cache, so
 // the tests exercise the real client path.
@@ -74,37 +100,34 @@ func secretEnv(name string) corev1.EnvVar {
 	}}
 }
 
-func boolPtr(b bool) *bool { return &b }
-
 func injectedEnv() []corev1.EnvVar {
 	return []corev1.EnvVar{
-		env(EnvCredentialsURI, brokerURL),
-		env(EnvTokenFile, TokenPath),
+		env(EnvCredentialsURI, credentialsURI),
 		env(EnvRegion, region),
 	}
 }
 
 // injected is what a container looks like after injection: its own
-// environment first, then ours, and the mount appended.
+// environment first, then ours.
 func injected(c corev1.Container) corev1.Container {
 	c.Env = append(append([]corev1.EnvVar{}, c.Env...), injectedEnv()...)
-	c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: VolumeName, MountPath: MountPath, ReadOnly: true})
 	return c
 }
 
-// injectedPod is a pod after injection, from the containers as they should
-// end up.
-func injectedPod(sa string, p *corev1.Pod) *corev1.Pod {
+// enrolled is a pod after injection in the given mode, from the containers
+// as they should end up: the label, and in the init mode the token volume
+// and the enrolment container ahead of every other init container.
+func enrolled(mode EnrolMode, p *corev1.Pod) *corev1.Pod {
 	out := p.DeepCopy()
-	out.Spec.ServiceAccountName = sa
-	out.Spec.Volumes = append(out.Spec.Volumes, corev1.Volume{
-		Name:         VolumeName,
-		VolumeSource: corev1.VolumeSource{CSI: &corev1.CSIVolumeSource{Driver: Driver, ReadOnly: boolPtr(true)}},
-	})
-	if out.Annotations == nil {
-		out.Annotations = map[string]string{}
+	if out.Labels == nil {
+		out.Labels = map[string]string{}
 	}
-	out.Annotations[AnnotationInjected] = "true"
+	out.Labels[LabelCredentials] = "true"
+	if mode == EnrolInit {
+		out.Spec.Volumes = append(out.Spec.Volumes, enrolVolume())
+		pl := planner{cfg: config(EnrolInit, Reject)}
+		out.Spec.InitContainers = append([]corev1.Container{pl.enrolContainer()}, out.Spec.InitContainers...)
+	}
 	return out
 }
 
@@ -202,7 +225,14 @@ func TestAdmit(t *testing.T) {
 		env("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", "/elsewhere/token"),
 	}
 
-	alreadyInjected := injectedPod("enabled", pod("enabled", injected(plainApp)))
+	withInit := func(p *corev1.Pod, init ...corev1.Container) *corev1.Pod {
+		p.Spec.InitContainers = init
+		return p
+	}
+	labelled := func(p *corev1.Pod) *corev1.Pod {
+		p.Labels = map[string]string{LabelCredentials: "true"}
+		return p
+	}
 
 	tests := []admitCase{
 		{
@@ -211,9 +241,15 @@ func TestAdmit(t *testing.T) {
 			want: want{unchanged: true},
 		},
 		{
-			name: "annotated service account gets volume, mount, env and annotation",
+			name: "init mode: env, label, token volume and the enrolment container",
 			pod:  pod("enabled", plainApp),
-			want: want{pod: injectedPod("enabled", pod("enabled", injected(plainApp)))},
+			want: want{pod: enrolled(EnrolInit, pod("enabled", injected(plainApp)))},
+		},
+		{
+			name: "cni mode: env and label only",
+			mode: EnrolCNI,
+			pod:  pod("enabled", plainApp),
+			want: want{pod: enrolled(EnrolCNI, pod("enabled", injected(plainApp)))},
 		},
 		{
 			name: "empty service account name means default",
@@ -223,27 +259,26 @@ func TestAdmit(t *testing.T) {
 					t.Fatal(err)
 				}
 			},
-			want: want{pod: injectedPod("", pod("", injected(plainApp)))},
+			want: want{pod: enrolled(EnrolInit, pod("", injected(plainApp)))},
 		},
 		{
-			name: "init containers are injected too",
-			pod: func() *corev1.Pod {
-				p := pod("enabled", plainApp)
-				p.Spec.InitContainers = []corev1.Container{plainInit}
-				return p
-			}(),
-			want: want{pod: func() *corev1.Pod {
-				p := pod("enabled", injected(plainApp))
-				p.Spec.InitContainers = []corev1.Container{injected(plainInit)}
-				return injectedPod("enabled", p)
-			}()},
+			name: "init mode: the pod's init containers get the env and come after the enrolment",
+			pod:  withInit(pod("enabled", plainApp), plainInit),
+			want: want{pod: enrolled(EnrolInit, withInit(pod("enabled", injected(plainApp)), injected(plainInit)))},
 		},
 		{
-			name: "existing volumes, mounts and annotations are kept",
+			name: "cni mode: the pod's init containers get the env",
+			mode: EnrolCNI,
+			pod:  withInit(pod("enabled", plainApp), plainInit),
+			want: want{pod: enrolled(EnrolCNI, withInit(pod("enabled", injected(plainApp)), injected(plainInit)))},
+		},
+		{
+			name: "existing volumes, labels and annotations are kept",
 			pod: func() *corev1.Pod {
 				c := plainApp
 				c.VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}
 				p := pod("enabled", c)
+				p.Labels = map[string]string{"app": "web"}
 				p.Annotations = map[string]string{"team": "payments"}
 				p.Spec.Volumes = []corev1.Volume{{Name: "data"}}
 				return p
@@ -252,35 +287,49 @@ func TestAdmit(t *testing.T) {
 				c := plainApp
 				c.VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}
 				p := pod("enabled", injected(c))
+				p.Labels = map[string]string{"app": "web"}
 				p.Annotations = map[string]string{"team": "payments"}
 				p.Spec.Volumes = []corev1.Volume{{Name: "data"}}
-				return injectedPod("enabled", p)
+				return enrolled(EnrolInit, p)
 			}()},
 		},
 		{
-			name: "already injected pod is unchanged",
-			pod:  alreadyInjected,
+			name: "a labelled pod is unchanged",
+			pod:  enrolled(EnrolInit, pod("enabled", injected(plainApp))),
 			want: want{unchanged: true},
 		},
 		{
-			name: "partially injected pod is completed",
+			name: "a labelled pod is unchanged even when it carries none of the rest",
+			pod:  labelled(pod("enabled", plainApp)),
+			want: want{unchanged: true},
+		},
+		{
+			name: "a labelled pod is unchanged even with conflicts",
+			pod:  labelled(pod("enabled", container("app", env("AWS_ACCESS_KEY_ID", "x")))),
+			want: want{unchanged: true},
+		},
+		{
+			name: "the label with another value is not the mark",
 			pod: func() *corev1.Pod {
-				// The env is there, the volume and mount are not.
-				c := plainApp
-				c.Env = append(c.Env, injectedEnv()...)
-				return pod("enabled", c)
+				p := pod("enabled", plainApp)
+				p.Labels = map[string]string{LabelCredentials: "false"}
+				return p
 			}(),
-			want: want{pod: injectedPod("enabled", pod("enabled", injected(plainApp)))},
+			want: want{pod: func() *corev1.Pod {
+				p := enrolled(EnrolInit, pod("enabled", injected(plainApp)))
+				return p
+			}()},
+		},
+		{
+			name: "env already there is completed with the rest",
+			pod:  pod("enabled", container("app", env("FOO", "bar"), env(EnvCredentialsURI, credentialsURI), env(EnvRegion, region))),
+			want: want{pod: enrolled(EnrolInit, pod("enabled", injected(plainApp)))},
 		},
 		{
 			name: "the pod's own AWS_REGION wins",
 			pod:  pod("enabled", container("app", env(EnvRegion, "us-east-1"))),
-			want: want{pod: func() *corev1.Pod {
-				c := container("app", env(EnvRegion, "us-east-1"),
-					env(EnvCredentialsURI, brokerURL), env(EnvTokenFile, TokenPath))
-				c.VolumeMounts = []corev1.VolumeMount{{Name: VolumeName, MountPath: MountPath, ReadOnly: true}}
-				return injectedPod("enabled", pod("enabled", c))
-			}()},
+			want: want{pod: enrolled(EnrolInit, pod("enabled",
+				container("app", env(EnvRegion, "us-east-1"), env(EnvCredentialsURI, credentialsURI))))},
 		},
 		{
 			name:    "the region hook overrides the default",
@@ -289,14 +338,14 @@ func TestAdmit(t *testing.T) {
 			want: want{pod: func() *corev1.Pod {
 				c := injected(plainApp)
 				c.Env[len(c.Env)-1].Value = "sa-east-1"
-				return injectedPod("enabled", pod("enabled", c))
+				return enrolled(EnrolInit, pod("enabled", c))
 			}()},
 		},
 		{
 			name:    "the region hook declining keeps the default",
 			pod:     pod("enabled", plainApp),
 			regions: regionsFunc(func(context.Context, string) (string, error) { return "", nil }),
-			want:    want{pod: injectedPod("enabled", pod("enabled", injected(plainApp)))},
+			want:    want{pod: enrolled(EnrolInit, pod("enabled", injected(plainApp)))},
 		},
 		{
 			name:    "the region hook failing denies",
@@ -313,33 +362,73 @@ func TestAdmit(t *testing.T) {
 			want: want{denied: []string{`cracha: annotation cracha.dev/region of namespace apps is "nowhere", not an AWS region`}, code: 422},
 		},
 		{
+			name: "hostNetwork is refused",
+			pod: func() *corev1.Pod {
+				p := pod("enabled", plainApp)
+				p.Spec.HostNetwork = true
+				return p
+			}(),
+			want: want{denied: []string{"pod uses hostNetwork"}, code: 422},
+		},
+		{
+			name: "hostNetwork is refused in cni mode too",
+			mode: EnrolCNI,
+			pod: func() *corev1.Pod {
+				p := pod("enabled", plainApp)
+				p.Spec.HostNetwork = true
+				return p
+			}(),
+			want: want{denied: []string{"pod uses hostNetwork"}, code: 422},
+		},
+		{
+			name: "a foreign cracha-enrol init container is refused",
+			pod:  withInit(pod("enabled", plainApp), corev1.Container{Name: EnrolContainerName, Image: "example/impostor"}),
+			want: want{denied: []string{`init container "cracha-enrol" is reserved`}, code: 422},
+		},
+		{
+			name: "a foreign cracha-enrol init container is refused in cni mode too",
+			mode: EnrolCNI,
+			pod:  withInit(pod("enabled", plainApp), corev1.Container{Name: EnrolContainerName, Image: "example/impostor"}),
+			want: want{denied: []string{`init container "cracha-enrol" is reserved`}, code: 422},
+		},
+		{
+			name: "a foreign cracha-enrol volume is refused",
+			pod: func() *corev1.Pod {
+				p := pod("enabled", plainApp)
+				p.Spec.Volumes = []corev1.Volume{{Name: EnrolVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}}
+				return p
+			}(),
+			want: want{denied: []string{`volume "cracha-enrol" is reserved`}, code: 422},
+		},
+		{
+			name: "every problem is reported together",
+			pod: func() *corev1.Pod {
+				p := pod("enabled", container("app", env("AWS_ACCESS_KEY_ID", "x")))
+				p.Spec.HostNetwork = true
+				return p
+			}(),
+			want: want{denied: []string{"pod uses hostNetwork", "sets AWS_ACCESS_KEY_ID"}, code: 422},
+		},
+		{
 			name: "valueFrom conflicts are rejected",
 			pod:  pod("enabled", container("app", secretEnv("AWS_ACCESS_KEY_ID"), secretEnv("AWS_SECRET_ACCESS_KEY"))),
 			want: want{denied: []string{`container "app" sets AWS_ACCESS_KEY_ID`, `container "app" sets AWS_SECRET_ACCESS_KEY`}, code: 422},
 		},
 		{
 			name: "conflicts in an init container are rejected",
-			pod: func() *corev1.Pod {
-				p := pod("enabled", plainApp)
-				p.Spec.InitContainers = []corev1.Container{container("init", env("AWS_ROLE_ARN", "x"))}
-				return p
-			}(),
+			pod:  withInit(pod("enabled", plainApp), container("init", env("AWS_ROLE_ARN", "x"))),
 			want: want{denied: []string{`container "init" sets AWS_ROLE_ARN`}, code: 422},
 		},
 		{
 			name:   "strip removes the conflicts and records them",
 			policy: Strip,
-			pod: func() *corev1.Pod {
-				p := pod("enabled", container("app", env("FOO", "bar"), secretEnv("AWS_ACCESS_KEY_ID"), env("AWS_SESSION_TOKEN", "t"), env("KEEP", "me")))
-				p.Spec.InitContainers = []corev1.Container{container("init", env("AWS_ROLE_ARN", "x"))}
-				return p
-			}(),
+			pod: withInit(pod("enabled", container("app", env("FOO", "bar"), secretEnv("AWS_ACCESS_KEY_ID"), env("AWS_SESSION_TOKEN", "t"), env("KEEP", "me"))),
+				container("init", env("AWS_ROLE_ARN", "x"))),
 			want: want{
 				pod: func() *corev1.Pod {
-					p := pod("enabled", injected(container("app", env("FOO", "bar"), env("KEEP", "me"))))
-					p.Spec.InitContainers = []corev1.Container{injected(container("init"))}
-					p = injectedPod("enabled", p)
-					p.Annotations[AnnotationStrippedEnv] = `[{"container":"init","name":"AWS_ROLE_ARN"},{"container":"app","name":"AWS_ACCESS_KEY_ID"},{"container":"app","name":"AWS_SESSION_TOKEN"}]`
+					p := withInit(pod("enabled", injected(container("app", env("FOO", "bar"), env("KEEP", "me")))), injected(container("init")))
+					p = enrolled(EnrolInit, p)
+					p.Annotations = map[string]string{AnnotationStrippedEnv: `[{"container":"init","name":"AWS_ROLE_ARN"},{"container":"app","name":"AWS_ACCESS_KEY_ID"},{"container":"app","name":"AWS_SESSION_TOKEN"}]`}
 					return p
 				}(),
 				warnings: []string{`removed AWS_ROLE_ARN from container "init"`, `removed AWS_ACCESS_KEY_ID from container "app"`, `removed AWS_SESSION_TOKEN from container "app"`},
@@ -351,52 +440,29 @@ func TestAdmit(t *testing.T) {
 			pod:    pod("enabled", container("app", env(EnvCredentialsURI, "https://elsewhere/v1/credentials"))),
 			want: want{
 				pod: func() *corev1.Pod {
-					p := injectedPod("enabled", pod("enabled", injected(container("app"))))
-					p.Annotations[AnnotationStrippedEnv] = `[{"container":"app","name":"AWS_CONTAINER_CREDENTIALS_FULL_URI"}]`
+					p := enrolled(EnrolInit, pod("enabled", injected(container("app"))))
+					p.Annotations = map[string]string{AnnotationStrippedEnv: `[{"container":"app","name":"AWS_CONTAINER_CREDENTIALS_FULL_URI"}]`}
 					return p
 				}(),
 				warnings: []string{"removed AWS_CONTAINER_CREDENTIALS_FULL_URI"},
 			},
 		},
 		{
-			name: "a foreign mount at the path is rejected",
+			name:   "strip keeps existing annotations",
+			policy: Strip,
 			pod: func() *corev1.Pod {
-				c := plainApp
-				c.VolumeMounts = []corev1.VolumeMount{{Name: "secrets", MountPath: "/var/run/cracha/"}}
-				p := pod("enabled", c)
-				p.Spec.Volumes = []corev1.Volume{{Name: "secrets"}}
+				p := pod("enabled", container("app", env("AWS_SESSION_TOKEN", "t")))
+				p.Annotations = map[string]string{"team": "payments"}
 				return p
 			}(),
-			want: want{denied: []string{`container "app" mounts volume "secrets" at /var/run/cracha`}, code: 422},
-		},
-		{
-			name: "a mount inside the path is rejected",
-			pod: func() *corev1.Pod {
-				c := plainApp
-				c.VolumeMounts = []corev1.VolumeMount{{Name: "secrets", MountPath: "/var/run/cracha/token"}}
-				p := pod("enabled", c)
-				p.Spec.Volumes = []corev1.Volume{{Name: "secrets"}}
-				return p
-			}(),
-			want: want{denied: []string{`container "app" mounts volume "secrets" at /var/run/cracha/token`}, code: 422},
-		},
-		{
-			name: "a volume named cracha that is not ours is rejected",
-			pod: func() *corev1.Pod {
-				p := pod("enabled", plainApp)
-				p.Spec.Volumes = []corev1.Volume{{Name: VolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}}
-				return p
-			}(),
-			want: want{denied: []string{`volume "cracha" is not the csi.cracha.dev CSI volume`}, code: 422},
-		},
-		{
-			name: "a conflict is reported even in a pod with a bad mount",
-			pod: func() *corev1.Pod {
-				c := container("app", env("AWS_ACCESS_KEY_ID", "x"))
-				c.VolumeMounts = []corev1.VolumeMount{{Name: "secrets", MountPath: MountPath}}
-				return pod("enabled", c)
-			}(),
-			want: want{denied: []string{`mounts volume "secrets"`, "sets AWS_ACCESS_KEY_ID"}, code: 422},
+			want: want{
+				pod: func() *corev1.Pod {
+					p := enrolled(EnrolInit, pod("enabled", injected(container("app"))))
+					p.Annotations = map[string]string{"team": "payments", AnnotationStrippedEnv: `[{"container":"app","name":"AWS_SESSION_TOKEN"}]`}
+					return p
+				}(),
+				warnings: []string{"removed AWS_SESSION_TOKEN"},
+			},
 		},
 		{
 			name: "service account lookup error denies",
@@ -480,6 +546,7 @@ func TestAdmit(t *testing.T) {
 // admitCase is one TestAdmit case.
 type admitCase struct {
 	name   string
+	mode   EnrolMode
 	policy ConflictPolicy
 	pod    *corev1.Pod
 	// request can turn the request into something else; client can break
@@ -502,11 +569,7 @@ func (tc admitCase) mutator(t *testing.T) *Mutator {
 	if tc.regions != nil {
 		opts = append(opts, WithRegions(tc.regions))
 	}
-	m, err := New(Config{
-		BrokerURL:      "https://broker.cracha.svc",
-		DefaultRegion:  region,
-		ConflictingEnv: tc.policy,
-	}, clientLookup{client}, opts...)
+	m, err := New(config(tc.mode, tc.policy), clientLookup{client}, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -585,6 +648,174 @@ func (w want) checkWarnings(t *testing.T, warnings []string) {
 	}
 }
 
+// TestPatchShape pins the operations themselves: their order is what makes
+// the patch applicable (the enrolment container is inserted at index 0
+// after the init containers' env has been addressed by their indices), and
+// the paths are what an operator reads in the audit log.
+func TestPatchShape(t *testing.T) {
+	p := pod("enabled", container("app", env("FOO", "bar")), corev1.Container{Name: "bare", Image: "example/bare"})
+	p.Spec.InitContainers = []corev1.Container{{Name: "init", Image: "example/init"}}
+	p.Labels = map[string]string{"app": "web"}
+
+	for _, tc := range []struct {
+		mode EnrolMode
+		want []string
+	}{
+		{EnrolInit, []string{
+			"add /spec/initContainers/0/env",
+			"replace /spec/containers/0/env",
+			"add /spec/containers/1/env",
+			"add /spec/volumes",
+			"add /spec/initContainers/0",
+			"add /metadata/labels/cracha.dev~1credentials",
+		}},
+		{EnrolCNI, []string{
+			"add /spec/initContainers/0/env",
+			"replace /spec/containers/0/env",
+			"add /spec/containers/1/env",
+			"add /metadata/labels/cracha.dev~1credentials",
+		}},
+	} {
+		t.Run(tc.mode.String(), func(t *testing.T) {
+			pl := planner{cfg: config(tc.mode, Reject), region: region}
+			pl.plan(p)
+			if len(pl.problems) > 0 {
+				t.Fatalf("problems: %v", pl.problems)
+			}
+			var got []string
+			for _, op := range pl.ops {
+				got = append(got, op.Op+" "+op.Path)
+			}
+			if d := cmp.Diff(tc.want, got); d != "" {
+				t.Errorf("operations (-want +got):\n%s", d)
+			}
+		})
+	}
+
+	t.Run("bare pod", func(t *testing.T) {
+		bare := pod("enabled", corev1.Container{Name: "app", Image: "example/app"})
+		pl := planner{cfg: config(EnrolInit, Reject), region: region}
+		pl.plan(bare)
+		var got []string
+		for _, op := range pl.ops {
+			got = append(got, op.Op+" "+op.Path)
+		}
+		want := []string{"add /spec/containers/0/env", "add /spec/volumes", "add /spec/initContainers", "add /metadata/labels"}
+		if d := cmp.Diff(want, got); d != "" {
+			t.Errorf("operations (-want +got):\n%s", d)
+		}
+	})
+}
+
+// TestGolden admits one pod with a bit of everything (its own init
+// container, env, volume, labels and annotations) in each mode and compares
+// the result with testdata/<mode>.golden.json: the whole mutated pod, as
+// the apiserver stores it, reviewed as a file. To refresh the files, run
+// with --test_env=UPDATE_GOLDEN=1 and copy them out of the test's
+// undeclared outputs.
+func TestGolden(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "pod.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []EnrolMode{EnrolInit, EnrolCNI} {
+		t.Run(mode.String(), func(t *testing.T) {
+			var p corev1.Pod
+			if err := json.Unmarshal(raw, &p); err != nil {
+				t.Fatal(err)
+			}
+			m, err := New(config(mode, Reject), clientLookup{fakeClient()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp := m.Admit(context.Background(), createRequest(t, &p))
+			if !resp.Allowed {
+				t.Fatalf("denied: %v", resp.Result)
+			}
+			got, err := json.MarshalIndent(apply(t, &p, resp), "", "  ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, '\n')
+			name := mode.String() + ".golden.json"
+			if os.Getenv("UPDATE_GOLDEN") != "" {
+				out := filepath.Join(os.Getenv("TEST_UNDECLARED_OUTPUTS_DIR"), name)
+				if err := os.WriteFile(out, got, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				t.Fatalf("wrote %s; copy it to testdata/ and run again", out)
+			}
+			want, err := os.ReadFile(filepath.Join("testdata", name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(want, got) {
+				t.Errorf("mutated pod differs from testdata/%s (-want +got):\n%s", name, cmp.Diff(string(want), string(got)))
+			}
+		})
+	}
+}
+
+// TestEnrolContainer pins what the init container asks of the pod: nothing
+// a restricted namespace refuses, nothing but the token, and the resources
+// the configuration gives, as requests and limits alike.
+func TestEnrolContainer(t *testing.T) {
+	cfg := config(EnrolInit, Reject)
+	cfg.EnrolCPU, cfg.EnrolMemory = resource.MustParse("150m"), resource.MustParse("24Mi")
+	pl := planner{cfg: cfg}
+	c := pl.enrolContainer()
+	sc := c.SecurityContext
+	switch {
+	case sc == nil:
+		t.Fatal("no security context")
+	case sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot:
+		t.Error("runAsNonRoot is not true")
+	case sc.RunAsUser == nil || *sc.RunAsUser == 0:
+		t.Error("runAsUser is root or unset")
+	case sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation:
+		t.Error("allowPrivilegeEscalation is not false")
+	case sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem:
+		t.Error("readOnlyRootFilesystem is not true")
+	case sc.Capabilities == nil || len(sc.Capabilities.Add) > 0 || len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != "ALL":
+		t.Errorf("capabilities %+v, want drop ALL and nothing added", sc.Capabilities)
+	case sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault:
+		t.Error("seccomp profile is not RuntimeDefault")
+	case sc.Privileged != nil && *sc.Privileged:
+		t.Error("privileged")
+	}
+	if c.Image != agentImage || len(c.Args) != 1 || c.Args[0] != EnrolArg || len(c.Command) != 0 {
+		t.Errorf("runs %q %q from %q, want the image's entrypoint with %q", c.Command, c.Args, c.Image, EnrolArg)
+	}
+	if len(c.VolumeMounts) != 1 || c.VolumeMounts[0].Name != EnrolVolumeName || c.VolumeMounts[0].MountPath != EnrolTokenDir || !c.VolumeMounts[0].ReadOnly {
+		t.Errorf("mounts %+v, want the token volume read-only at %s", c.VolumeMounts, EnrolTokenDir)
+	}
+	got := map[string]corev1.EnvVar{}
+	for _, e := range c.Env {
+		got[e.Name] = e
+	}
+	if e := got[EnvHostIP]; e.ValueFrom == nil || e.ValueFrom.FieldRef == nil || e.ValueFrom.FieldRef.FieldPath != "status.hostIP" {
+		t.Errorf("%s = %+v, want status.hostIP from the downward API", EnvHostIP, e)
+	}
+	for name, want := range map[string]string{EnvEnrolPort: "8781", EnvAgentPort: strconv.Itoa(pl.cfg.AgentPort), EnvEnrolTimeout: "30s", EnvEnrolTokenFile: EnrolTokenPath} {
+		if got[name].Value != want {
+			t.Errorf("%s = %q, want %q", name, got[name].Value, want)
+		}
+	}
+	if !c.Resources.Limits.Cpu().Equal(cfg.EnrolCPU) || !c.Resources.Requests.Cpu().Equal(cfg.EnrolCPU) ||
+		!c.Resources.Limits.Memory().Equal(cfg.EnrolMemory) || !c.Resources.Requests.Memory().Equal(cfg.EnrolMemory) {
+		t.Errorf("resources %+v, want requests and limits of %s CPU and %s memory", c.Resources, cfg.EnrolCPU.String(), cfg.EnrolMemory.String())
+	}
+
+	v := enrolVolume()
+	tok := v.Projected.Sources[0].ServiceAccountToken
+	if v.Name != EnrolVolumeName || len(v.Projected.Sources) != 1 || tok == nil {
+		t.Fatalf("volume %+v, want one projected token", v)
+	}
+	if tok.Audience != EnrolTokenAudience || tok.ExpirationSeconds == nil || *tok.ExpirationSeconds != EnrolTokenExpirationSeconds || tok.Path != EnrolTokenFile {
+		t.Errorf("token %+v, want audience %s, %d seconds, at %s", tok, EnrolTokenAudience, EnrolTokenExpirationSeconds, EnrolTokenFile)
+	}
+}
+
 func TestIsPodCreate(t *testing.T) {
 	podCreate := func() *admissionv1.AdmissionRequest {
 		return &admissionv1.AdmissionRequest{
@@ -621,59 +852,47 @@ func (f regionsFunc) Region(ctx context.Context, namespace string) (string, erro
 	return f(ctx, namespace)
 }
 
-func TestBrokerURL(t *testing.T) {
-	tests := []struct {
-		in, want string
-	}{
-		{"https://broker.cracha.svc", "https://broker.cracha.svc/v1/credentials"},
-		{"https://broker.cracha.svc/", "https://broker.cracha.svc/v1/credentials"},
-		{"https://broker.cracha.svc:8443", "https://broker.cracha.svc:8443/v1/credentials"},
-		{"https://broker.cracha.svc/v1/credentials", "https://broker.cracha.svc/v1/credentials"},
-		{"https://broker.cracha.svc/v1/credentials/", "https://broker.cracha.svc/v1/credentials"},
-		{"https://broker.example.com/cracha", "https://broker.example.com/cracha/v1/credentials"},
-		{"http://broker.cracha.svc", ""},
-		{"broker.cracha.svc", ""},
-		{"https://", ""},
-		{"https://broker.cracha.svc?x=1", ""},
-		{"https://user@broker.cracha.svc", ""},
-		{"https://broker.cracha.svc#f", ""},
-		{"://bad", ""},
-	}
-	for _, tc := range tests {
-		got, err := BrokerURL(tc.in)
-		if tc.want == "" {
-			if err == nil {
-				t.Errorf("BrokerURL(%q) = %q, want an error", tc.in, got)
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("BrokerURL(%q): %v", tc.in, err)
-			continue
-		}
-		if got != tc.want {
-			t.Errorf("BrokerURL(%q) = %q, want %q", tc.in, got, tc.want)
-		}
+func TestCredentialsURI(t *testing.T) {
+	if got := (Config{AgentPort: 80}).CredentialsURI(); got != "http://127.0.0.1:80/v1/credentials" {
+		t.Errorf("CredentialsURI = %q", got)
 	}
 }
 
 func TestNewRejectsBadConfig(t *testing.T) {
 	sas := clientLookup{fakeClient()}
-	if _, err := New(Config{BrokerURL: "http://broker", DefaultRegion: region}, sas); err == nil {
-		t.Error("New accepted an http broker URL")
+	good := config(EnrolInit, Reject)
+	for name, change := range map[string]func(*Config){
+		"no agent port":          func(c *Config) { c.AgentPort = 0 },
+		"agent port too large":   func(c *Config) { c.AgentPort = 65536 },
+		"no default region":      func(c *Config) { c.DefaultRegion = "" },
+		"init without image":     func(c *Config) { c.AgentImage = "" },
+		"init without port":      func(c *Config) { c.EnrolPort = 0 },
+		"init without timeout":   func(c *Config) { c.EnrolTimeout = 0 },
+		"init negative timeout":  func(c *Config) { c.EnrolTimeout = -time.Second },
+		"init without cpu":       func(c *Config) { c.EnrolCPU = resource.Quantity{} },
+		"init negative cpu":      func(c *Config) { c.EnrolCPU = resource.MustParse("-100m") },
+		"init without memory":    func(c *Config) { c.EnrolMemory = resource.Quantity{} },
+		"cni without agent port": func(c *Config) { c.Enrol = EnrolCNI; c.AgentPort = 0 },
+	} {
+		cfg := good
+		change(&cfg)
+		if _, err := New(cfg, sas); err == nil {
+			t.Errorf("%s: New accepted %+v", name, cfg)
+		}
 	}
-	if _, err := New(Config{BrokerURL: "https://broker"}, sas); err == nil {
-		t.Error("New accepted an empty default region")
-	}
-	if _, err := New(Config{BrokerURL: "https://broker", DefaultRegion: region}, nil); err == nil {
+	if _, err := New(good, nil); err == nil {
 		t.Error("New accepted a nil service account lookup")
 	}
-	m, err := New(Config{BrokerURL: "https://broker", DefaultRegion: region}, sas)
+	// The cni mode needs none of the enrolment settings.
+	if _, err := New(Config{AgentPort: 1, DefaultRegion: region, Enrol: EnrolCNI}, sas); err != nil {
+		t.Errorf("cni mode without the enrolment settings: %v", err)
+	}
+	m, err := New(good, sas)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := m.Config().BrokerURL; got != "https://broker/v1/credentials" {
-		t.Errorf("Config().BrokerURL = %q", got)
+	if got := m.Config(); got != good {
+		t.Errorf("Config() = %+v, want %+v", got, good)
 	}
 }
 
@@ -703,6 +922,36 @@ func TestConflictPolicyFlag(t *testing.T) {
 	}
 	if err := p.Set("drop"); err == nil {
 		t.Error("Set(drop) succeeded")
+	}
+}
+
+func TestQuantityValue(t *testing.T) {
+	var q resource.Quantity
+	v := QuantityValue{Q: &q}
+	if err := v.Set("250m"); err != nil || v.String() != "250m" || !q.Equal(resource.MustParse("250m")) {
+		t.Errorf("Set(250m): %v, String() = %q, quantity %s", err, v.String(), q.String())
+	}
+	if err := v.Set("lots"); err == nil {
+		t.Error("Set accepted \"lots\"")
+	}
+	if (QuantityValue{}).String() != "" {
+		t.Error("the zero value does not print empty")
+	}
+}
+
+func TestEnrolModeFlag(t *testing.T) {
+	var m EnrolMode
+	if m.String() != "init" {
+		t.Errorf("zero mode is %q, want init", m.String())
+	}
+	if err := m.Set("cni"); err != nil || m != EnrolCNI {
+		t.Errorf("Set(cni): %v, %v", m, err)
+	}
+	if err := m.Set("init"); err != nil || m != EnrolInit {
+		t.Errorf("Set(init): %v, %v", m, err)
+	}
+	if err := m.Set("sidecar"); err == nil {
+		t.Error("Set(sidecar) succeeded")
 	}
 }
 

@@ -32,7 +32,7 @@ concurrency:
 
 # WHERE everything goes is one setting, bazel/registry.bzl. Bazel loads it;
 # each job reads it through bazel/registry.sh into its environment
-# (BROKER_IMAGE, CSI_IMAGE, WEBHOOK_IMAGE, CHART_REPOSITORY,
+# (BROKER_IMAGE, AGENT_IMAGE, WEBHOOK_IMAGE, CHART_REPOSITORY,
 # IMAGE_REGISTRY_HOST, ...), and bazel/check-registry-config.sh fails CI on a
 # registry spelled out here.
 #
@@ -61,7 +61,7 @@ jobs:
       id-token: write
     outputs:
       broker: ${{ steps.digest.outputs.broker }}
-      csi: ${{ steps.digest.outputs.csi }}
+      agent: ${{ steps.digest.outputs.agent }}
       webhook: ${{ steps.digest.outputs.webhook }}
       chart: ${{ steps.chart.outputs.ref }}
       chart_version: ${{ steps.check.outputs.chart_version }}
@@ -127,7 +127,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
-          for pkg in broker csi webhook; do
+          for pkg in broker agent webhook; do
             echo "common:ci --//${pkg}:image_tag=${GITHUB_REF_NAME}" >> user.bazelrc
           done
           cat user.bazelrc
@@ -168,7 +168,7 @@ jobs:
         run: |
           bazel build --config=ci --output_groups=+digest \
             //broker:image_push //broker:image_index \
-            //csi:image_push //csi:image_index \
+            //agent:image_push //agent:image_index \
             //webhook:image_push //webhook:image_index \
             //charts/cracha:cracha //charts/cracha:cracha.push_registry \
             //bazel/cosign //bazel/cosign:verify_image
@@ -233,7 +233,7 @@ jobs:
             echo "chart ${got_version} will pin ${image}@${built}"
           }
           pinned //broker:image_index "${BROKER_IMAGE}"
-          pinned //csi:image_index "${CSI_IMAGE}"
+          pinned //agent:image_index "${AGENT_IMAGE}"
           pinned //webhook:image_index "${WEBHOOK_IMAGE}"
 
       # One login covers everything below: image_push (rules_img) and cosign
@@ -248,7 +248,7 @@ jobs:
       - name: Push the multi-arch images
         run: |
           set -euo pipefail
-          for target in //broker:image_push //csi:image_push //webhook:image_push; do
+          for target in //broker:image_push //agent:image_push //webhook:image_push; do
             bazel run --config=ci "${target}"
           done
 
@@ -283,7 +283,7 @@ jobs:
             echo "pushed ${image}@${digest}"
           }
           record broker //broker:image_index "${BROKER_IMAGE}"
-          record csi //csi:image_index "${CSI_IMAGE}"
+          record agent //agent:image_index "${AGENT_IMAGE}"
           record webhook //webhook:image_index "${WEBHOOK_IMAGE}"
 
       # --recursive signs the index and every child manifest. Without it, anyone
@@ -300,7 +300,7 @@ jobs:
           COSIGN_YES: "true"
           IMAGE_REFS: |
             ${{ steps.digest.outputs.broker }}
-            ${{ steps.digest.outputs.csi }}
+            ${{ steps.digest.outputs.agent }}
             ${{ steps.digest.outputs.webhook }}
           REGISTRY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           REGISTRY_PASSWORD: ${{ secrets.QUAY_TOKEN }}
@@ -359,7 +359,7 @@ jobs:
         run: |
           bazel run --config=ci //bazel/cosign:verify_image -- \
             "${{ steps.digest.outputs.broker }}" \
-            "${{ steps.digest.outputs.csi }}" \
+            "${{ steps.digest.outputs.agent }}" \
             "${{ steps.digest.outputs.webhook }}"
 
       # The chart carries the digest of every image it deploys, pinned at
@@ -472,11 +472,11 @@ jobs:
           CHART_VERSION: ${{ needs.publish.outputs.chart_version }}
           CHART_REF: ${{ needs.publish.outputs.chart }}
           BROKER_REF: ${{ needs.publish.outputs.broker }}
-          CSI_REF: ${{ needs.publish.outputs.csi }}
+          AGENT_REF: ${{ needs.publish.outputs.agent }}
           WEBHOOK_REF: ${{ needs.publish.outputs.webhook }}
         run: |
           set -euo pipefail
-          for v in CHART_VERSION CHART_REF BROKER_REF CSI_REF WEBHOOK_REF; do
+          for v in CHART_VERSION CHART_REF BROKER_REF AGENT_REF WEBHOOK_REF; do
             if [ -z "${!v}" ]; then
               echo "::error::publish reported no ${v}" >&2
               exit 1
@@ -519,7 +519,7 @@ jobs:
             echo "chart ${got_version} pins ${ref}"
           }
           pinned "${BROKER_REF}"
-          pinned "${CSI_REF}"
+          pinned "${AGENT_REF}"
           pinned "${WEBHOOK_REF}"
 
       # No REGISTRY_* credentials: the repositories are public, and this is
@@ -527,12 +527,12 @@ jobs:
       - name: Verify the published signatures without credentials
         env:
           BROKER_REF: ${{ needs.publish.outputs.broker }}
-          CSI_REF: ${{ needs.publish.outputs.csi }}
+          AGENT_REF: ${{ needs.publish.outputs.agent }}
           WEBHOOK_REF: ${{ needs.publish.outputs.webhook }}
           CHART_REF: ${{ needs.publish.outputs.chart }}
         run: |
           set -euo pipefail
-          bazel run --config=ci //bazel/cosign:verify_image -- "${BROKER_REF}" "${CSI_REF}" "${WEBHOOK_REF}"
+          bazel run --config=ci //bazel/cosign:verify_image -- "${BROKER_REF}" "${AGENT_REF}" "${WEBHOOK_REF}"
           bazel run --config=ci //bazel/cosign:verify_image -- --single "${CHART_REF}"
 
   # The GitHub Release of a tag: how to install it, what was published, by
@@ -560,7 +560,7 @@ jobs:
           CHART_VERSION: ${{ needs.publish.outputs.chart_version }}
           CHART_REF: ${{ needs.publish.outputs.chart }}
           BROKER_REF: ${{ needs.publish.outputs.broker }}
-          CSI_REF: ${{ needs.publish.outputs.csi }}
+          AGENT_REF: ${{ needs.publish.outputs.agent }}
           WEBHOOK_REF: ${{ needs.publish.outputs.webhook }}
         run: |
           set -euo pipefail
@@ -600,7 +600,7 @@ jobs:
           |---|---|
           | Chart ${CHART_VERSION} | \`${CHART_REF}\` |
           | broker | \`${BROKER_REF}\` |
-          | csi | \`${CSI_REF}\` |
+          | agent | \`${AGENT_REF}\` |
           | webhook | \`${WEBHOOK_REF}\` |
 
           The images are also tagged \`${tag}\`.
@@ -611,7 +611,7 @@ jobs:
           release's workflow run:
 
           \`\`\`bash
-          cosign verify ${CSI_REF} \\
+          cosign verify ${AGENT_REF} \\
             --certificate-identity '${identity}' \\
             --certificate-oidc-issuer https://token.actions.githubusercontent.com
           \`\`\`

@@ -1,0 +1,15 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "install",
+    srcs = ["install.go"],
+    importpath = "github.com/bpalermo/cracha/agent/internal/cni/install",
+    visibility = ["//agent:__subpackages__"],
+    deps = ["//agent/cni/netconf"],
+)
+
+go_test(
+    name = "install_test",
+    srcs = ["install_test.go"],
+    embed = [":install"],
+)

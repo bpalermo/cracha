@@ -1,7 +1,9 @@
 # How e2e/run.sh installs the chart in the kind cluster. The images are the
 # chart's own: e2e/values-local.yaml replaces them with the ones built from
-# this checkout. The TLS mode stays the chart's default, generated: run.sh
-# hands the authority the chart makes to the test workloads.
+# this checkout. Every certificate is an X.509-SVID from the SPIRE of
+# e2e/spire.yaml: the broker's, the agent's and the webhook's (whose entry
+# carries its Service name, e2e/spire.sh), so there is no CA anywhere and
+# the test workloads trust nothing.
 broker:
   # One node, one replica.
   replicas: 1
@@ -57,13 +59,21 @@ broker:
       value: http://cracha-stsstub.cracha-system.svc:8080
     - name: AWS_EC2_METADATA_DISABLED
       value: "true"
-csi:
+agent:
+  # The enrolment mode is the chart's default, init; E2E_ENROL=cni has
+  # run.sh add e2e/values-cni.yaml on top.
+  # The SPIRE agent's sockets (e2e/spire.yaml), shared on the node.
   workloadAPI:
     hostPath: /run/spire/agent-sockets
     socket: spire-agent.sock
   brokerAPI:
     hostPath: /run/spire/broker-sockets
     socket: broker.sock
+  # The kind node's containerd: its CRI socket, and the directory its CNI
+  # bind-mounts the sandboxes' network namespaces into (cni-<id> files under
+  # /var/run/netns, /var/run being /run on the node image).
+  criSocket: /run/containerd/containerd.sock
+  netnsDir: /var/run/netns
   logLevel: debug
 webhook:
   replicas: 1

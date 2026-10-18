@@ -89,7 +89,7 @@ jobs:
         run: |
           bazel query --config=ci --noshow_progress 'set(
             //broker:image_push //broker:image_index
-            //csi:image_push //csi:image_index
+            //agent:image_push //agent:image_index
             //webhook:image_push //webhook:image_index
             //charts/cracha:cracha //charts/cracha:cracha.push_registry
             //bazel/cosign:cosign //bazel/cosign:verify_image)'
@@ -245,18 +245,20 @@ jobs:
 
   # End to end in a kind cluster: the images are built from this commit, loaded
   # into the node and exercised as pods against a SPIRE agent and an STS
-  # stand-in (e2e/run.sh). A CSI plugin, an admission webhook and the SDK's
+  # stand-in (e2e/run.sh). A node agent, an admission webhook and the SDK's
   # credential path can only be validated against a real kubelet and
   # apiserver, so this is where the system as deployed is tested; everything
   # else is unit tests. After `build`, so a change that does not compile never
   # gets as far as creating a cluster, and only when `diff` found something
   # the suite deploys or runs impacted: a documentation-only change pays for
-  # no cluster. Once per authorization backend (E2E_AUTHZ of e2e/run.sh):
+  # no cluster. Once per authorization backend (E2E_AUTHZ of e2e/run.sh:
   # static, the assignments document, and spicedb, which also deploys SpiceDB
-  # and reconciles the grant tree into it; each leg is its own cluster, and
-  # one failing does not stop the other.
+  # and reconciles the grant tree into it) and per enrolment mode (E2E_ENROL:
+  # init, the webhook's init container, and cni, the chained CNI plugin on
+  # the node); each leg is its own cluster, and one failing does not stop the
+  # others.
   e2e:
-    name: e2e (kind, ${{ matrix.authz }})
+    name: e2e (kind, ${{ matrix.authz }}, ${{ matrix.enrol }})
     needs: [build, diff]
     if: needs.diff.outputs.has_e2e == 'true'
     runs-on: ubuntu-latest
@@ -264,6 +266,7 @@ jobs:
       fail-fast: false
       matrix:
         authz: [static, spicedb]
+        enrol: [init, cni]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -297,6 +300,7 @@ jobs:
       - name: e2e/run.sh
         env:
           E2E_AUTHZ: ${{ matrix.authz }}
+          E2E_ENROL: ${{ matrix.enrol }}
         run: e2e/run.sh --config=ci
 
   # The single check a ruleset should require. A required status check is
@@ -313,8 +317,9 @@ jobs:
   # here. Everything else has to be `success`. `e2e` is a matrix, and
   # needs.e2e.result is the whole of it: `success` only when every leg
   # succeeded, `failure` when any failed (fail-fast is off, so the others
-  # still ran), `skipped` when the gate skipped them all; so both backends
-  # are required when the gate is on and both are skipped when it is off.
+  # still ran), `skipped` when the gate skipped them all; so every backend
+  # and enrolment mode is required when the gate is on and all are skipped
+  # when it is off.
   ci:
     name: ci
     needs: [lint, diff, build, e2e]

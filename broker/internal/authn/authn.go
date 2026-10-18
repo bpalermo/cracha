@@ -3,10 +3,11 @@
 // subject's trust domain, audience exactly "cracha-broker", expiry, and a
 // subject that matches the SPIFFE ID scheme of section 4.
 //
-// The bundles come from a [jwtbundle.Source]. In production that is the
-// broker's own Workload API connection ([NewWorkloadAPISource]), which also
-// carries federated bundles; tests use a static [jwtbundle.Bundle]. The
-// broker touches nothing issuer-specific (section 4.1).
+// The bundles come from a [jwtbundle.Source]. In production that is the JWT
+// source over the broker's own Workload API connection (the one its X.509
+// source for mTLS shares, broker/spiffe.go), which also carries federated
+// bundles; tests use a static [jwtbundle.Bundle]. The broker touches
+// nothing issuer-specific (section 4.1).
 package authn
 
 import (
@@ -17,7 +18,6 @@ import (
 	"github.com/bpalermo/cracha/common/idenc"
 	"github.com/spiffe/go-spiffe/v2/bundle/jwtbundle"
 	"github.com/spiffe/go-spiffe/v2/svid/jwtsvid"
-	"github.com/spiffe/go-spiffe/v2/workloadapi"
 )
 
 // Audience is the only audience a JWT-SVID for the broker may carry.
@@ -35,14 +35,6 @@ type Verifier struct {
 // New returns a Verifier over the given bundle source.
 func New(bundles jwtbundle.Source) *Verifier {
 	return &Verifier{bundles: bundles}
-}
-
-// NewWorkloadAPISource connects to the SPIFFE Workload API at the given
-// address (for example unix:///run/spire/sockets/agent.sock) and returns a
-// bundle source that follows its updates. It blocks until the first bundle
-// arrives or the context ends. The caller closes it.
-func NewWorkloadAPISource(ctx context.Context, addr string) (*workloadapi.JWTSource, error) {
-	return workloadapi.NewJWTSource(ctx, workloadapi.WithClientOptions(workloadapi.WithAddr(addr)))
 }
 
 // Verify validates a serialized JWT-SVID and returns the workload identity

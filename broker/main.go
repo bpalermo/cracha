@@ -3,18 +3,20 @@
 // policy from the workload's grants and assumes a shape role on the
 // workload's behalf (docs/design.md, section 6).
 //
-// Grants come from the signed, polled bundle grantc publishes
-// (--bundle-source, broker/internal/bundle) or, for development, from a
-// resolved-grants fixture file (--grants-fixture); the authorization backend
-// is the static assignments file or SpiceDB (--authz-backend, authz.go), and
-// the credential cache (design 6.7) wraps the issuer unless --cache=false.
-// Revocation comes later. Configuration is by flags, each with a CRACHA_*
-// environment fallback (see config.go).
+// It serves SPIFFE mTLS with its own X.509-SVID from the Workload API and
+// accepts one client, the node agent (--agent-spiffe-id, section 6.5); the
+// kubelet's probes are answered on a plaintext listener of their own
+// (--health-listen). Grants come from the signed, polled bundle grantc
+// publishes (--bundle-source, broker/internal/bundle) or, for development,
+// from a resolved-grants fixture file (--grants-fixture); the
+// authorization backend is the static assignments file or SpiceDB
+// (--authz-backend, authz.go), and the credential cache (design 6.7) wraps
+// the issuer unless --cache=false. Revocation comes later. Configuration
+// is by flags, each with a CRACHA_* environment fallback (see config.go).
 package main
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -29,9 +31,12 @@ import (
 	"github.com/bpalermo/cracha/broker/internal/authn"
 	"github.com/bpalermo/cracha/broker/internal/authz"
 	"github.com/bpalermo/cracha/broker/internal/cache"
+	"github.com/bpalermo/cracha/broker/internal/health"
 	"github.com/bpalermo/cracha/broker/internal/issuer"
+	"github.com/bpalermo/cracha/broker/internal/mtls"
 	"github.com/bpalermo/cracha/broker/internal/sts"
 	"github.com/bpalermo/cracha/common/version"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 )
 
 func main() {
@@ -61,7 +66,15 @@ func run(ctx context.Context, cfg config) error {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(log)
 	log.Info("starting", "version", version.Version, "cluster", cfg.cluster, "listen", cfg.listen,
-		"trust_domain_labels", cfg.labels.String(), "plaintext", cfg.insecurePlaintext)
+		"health_listen", cfg.healthListen, "trust_domain_labels", cfg.labels.String())
+
+	// The probes first, so that liveness answers while the rest comes up;
+	// readiness waits for the broker's SVID and, below, the grant bundle.
+	probes := health.New(log)
+	svidReady := &mtls.SVIDReadiness{}
+	probes.AddReadiness(svidReady)
+	servers := newServers(cfg, probes)
+	servers.serve("health", servers.health.ListenAndServe)
 
 	store, err := newStore(cfg, log)
 	if err != nil {
@@ -82,13 +95,25 @@ func run(ctx context.Context, cfg config) error {
 	if err != nil {
 		return err
 	}
+	if src.ready != nil {
+		probes.AddReadiness(src.ready)
+	}
 
-	bundles, err := authn.NewWorkloadAPISource(ctx, cfg.workloadAPISocket)
+	wl, err := connectWorkloadAPI(ctx, cfg.workloadAPISocket)
 	if err != nil {
 		return fmt.Errorf("workload api %s: %w", cfg.workloadAPISocket, err)
 	}
-	defer bundles.Close()
-	log.Info("connected to the workload api", "socket", cfg.workloadAPISocket)
+	defer wl.Close()
+	svidReady.Set(wl.x509)
+	agent, err := agentID(cfg, wl)
+	if err != nil {
+		return err
+	}
+	own, err := wl.x509.GetX509SVID()
+	if err != nil {
+		return fmt.Errorf("own X.509-SVID: %w", err)
+	}
+	log.Info("connected to the workload api", "socket", cfg.workloadAPISocket, "spiffe_id", own.ID.String(), "agent_spiffe_id", agent.String())
 
 	direct := &issuer.Direct{
 		Store:   store.Store,
@@ -99,40 +124,77 @@ func run(ctx context.Context, cfg config) error {
 		Log:     log,
 	}
 	iss := newIssuer(ctx, cfg, direct, store.Store, log)
-	handler := api.New(authn.New(bundles), iss, log)
-	if src.ready != nil {
-		handler.AddReadiness(src.ready)
-	}
-	srv := &http.Server{
-		Addr:              cfg.listen,
-		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-		MaxHeaderBytes:    64 << 10,
-		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
-	}
+	servers.api.Handler = mtls.Require(agent, log, api.New(authn.New(wl.jwt), iss, log))
+	servers.api.TLSConfig = mtls.ServerConfig(wl.x509, wl.x509, agent)
+	servers.serve("api", func() error { return servers.api.ListenAndServeTLS("", "") })
+	return servers.wait(ctx, log)
+}
 
-	errc := make(chan error, 1)
+// agentID is the one client identity the broker accepts: --agent-spiffe-id,
+// or by default the agent's service account in the broker's namespace and
+// the trust domain of the broker's own SVID (design 6.5).
+func agentID(cfg config, wl *workloadAPI) (spiffeid.ID, error) {
+	if !cfg.agentID.IsZero() {
+		return cfg.agentID, nil
+	}
+	id, err := mtls.DefaultAgentID(wl.x509, cfg.namespace)
+	if err != nil {
+		return spiffeid.ID{}, fmt.Errorf("deriving the agent's SPIFFE ID: %w", err)
+	}
+	return id, nil
+}
+
+// servers is the broker's two listeners: the API over SPIFFE mTLS, and the
+// probes over plain HTTP. The first to fail ends the process.
+type servers struct {
+	api    *http.Server
+	health *http.Server
+	errc   chan error
+}
+
+func newServers(cfg config, probes http.Handler) *servers {
+	return &servers{
+		api: &http.Server{
+			Addr:              cfg.listen,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       2 * time.Minute,
+			MaxHeaderBytes:    64 << 10,
+		},
+		health: &http.Server{
+			Addr:              cfg.healthListen,
+			Handler:           probes,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       2 * time.Minute,
+			MaxHeaderBytes:    64 << 10,
+		},
+		errc: make(chan error, 2),
+	}
+}
+
+// serve runs one listener until it fails.
+func (s *servers) serve(name string, listen func() error) {
 	go func() {
-		if cfg.insecurePlaintext {
-			log.Warn("serving plaintext HTTP; JWT-SVIDs travel in the clear")
-			errc <- srv.ListenAndServe()
-			return
+		if err := listen(); !errors.Is(err, http.ErrServerClosed) {
+			s.errc <- fmt.Errorf("serve %s: %w", name, err)
 		}
-		errc <- srv.ListenAndServeTLS(cfg.tlsCert, cfg.tlsKey)
 	}()
+}
 
+// wait blocks until a listener fails or ctx ends, then shuts both down.
+func (s *servers) wait(ctx context.Context, log *slog.Logger) error {
 	select {
-	case err := <-errc:
-		return fmt.Errorf("serve: %w", err)
+	case err := <-s.errc:
+		return err
 	case <-ctx.Done():
 	}
 	log.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return srv.Shutdown(shutdownCtx)
+	return errors.Join(s.api.Shutdown(shutdownCtx), s.health.Shutdown(shutdownCtx))
 }
 
 // newIssuer wraps the direct issuer in the credential cache of design 6.7,

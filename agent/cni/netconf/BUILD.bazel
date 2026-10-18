@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "netconf",
+    srcs = ["netconf.go"],
+    importpath = "github.com/bpalermo/cracha/agent/cni/netconf",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "netconf_test",
+    srcs = ["netconf_test.go"],
+    embed = [":netconf"],
+)
