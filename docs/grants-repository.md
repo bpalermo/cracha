@@ -138,15 +138,48 @@ policy templates from `templates/`; the directories are a convention for
 people:
 
 ```
-grants/        kind: Grant, one per file
+accounts/      kind: Account, one per AWS account: its role, envelope and access table
+access/        kind: Access, a workload's or a service's relation to a resource
 templates/     session policy templates, <name>.json
 services/      kind: Service, a team's workloads and their shared grants
+grants/        kind: Grant, a grant written out (optional)
 assignments/   kind: Assignment, one workload's own grants or its suspension
-access/        kind: Access, a workload's or a service's relation to a resource
 ```
 
-A minimal tree, as an illustration only (the account and the names are
-examples; the real tree lives in the grants repository):
+The default model is one IAM role per account, the **account role**, shared
+by every application of the account (design 6.6): a broad identity policy,
+held in by a permission boundary and SCPs, and the session policy the
+broker composes for each workload does all the scoping. A team then writes
+relationships, not grants: "this workload reads that bucket" is an Access
+document, and what reading a bucket of the account means in IAM is one
+line of the account's access table.
+
+A minimal tree is one Account document, a template, and Access documents.
+As an illustration only (the account and the names are examples; the real
+tree lives in the grants repository):
+
+`accounts/apps.yaml`:
+
+```yaml
+kind: Account
+metadata:
+  name: apps                 # free; it names the implicit grants
+spec:
+  id: "111122223333"
+  role: arn:aws:iam::111122223333:role/cracha/apps    # the account role
+  envelope:                  # default envelope of the account's grants
+    - arn:aws:s3:::example-*
+  access:                    # what read and write mean, per resource kind
+    - kind: s3_bucket
+      permission: read
+      template: s3-read      # its one open parameter takes the buckets
+    - kind: s3_bucket
+      permission: write
+      template: s3-write
+      param: buckets         # needed when the template leaves more open
+      params: {prefix: incoming/}
+      duration: 1800         # optional, as on a Grant; so is sessionTags
+```
 
 `templates/s3-read.json`:
 
@@ -164,69 +197,6 @@ examples; the real tree lives in the grants repository):
 }
 ```
 
-`grants/reports-read.yaml`:
-
-```yaml
-kind: Grant
-metadata:
-  name: reports-read
-spec:
-  account: "111122223333"
-  baseRole: arn:aws:iam::111122223333:role/broker/shape-s3-read
-  sessionPolicy:
-    template: s3-read
-    params: {bucket: example-reports}
-  envelope:
-    - arn:aws:s3:::example-*
-```
-
-`services/reports-api.yaml`:
-
-```yaml
-kind: Service
-metadata:
-  name: reports-api
-spec:
-  team: reports
-  members:
-    - prod/reports/api
-  grants:
-    - name: reports-read
-```
-
-`assignments/reports-worker.yaml`:
-
-```yaml
-kind: Assignment
-metadata:
-  name: reports-worker
-spec:
-  subject: prod/reports/worker
-  grants: [reports-read]
-  expiresAt: "2027-06-30T00:00:00Z"
-```
-
-A grant may leave its resource to the tree instead of naming it (design
-6.2, Level 3): the parameter is a lookup, and `kind: Access` documents say
-which buckets which workloads may use. One grant per kind of access then
-serves every bucket, and giving a workload one more bucket is an Access
-document, not a new grant. `grants/bucket-read.yaml`:
-
-```yaml
-kind: Grant
-metadata:
-  name: bucket-read
-spec:
-  account: "111122223333"
-  baseRole: arn:aws:iam::111122223333:role/broker/shape-s3-read
-  sessionPolicy:
-    template: s3-read
-    params:
-      bucket: {lookup: {kind: s3_bucket, permission: read}}
-  envelope:                 # every bucket an Access gives must fall in it
-    - arn:aws:s3:::example-*
-```
-
 `access/reports-exports.yaml`:
 
 ```yaml
@@ -241,13 +211,81 @@ spec:
   clusters: [prod-sa-east-1]          # optional
 ```
 
-The broker renders `bucket-read` at issuance with every bucket the
-workload's Access documents give it, once per bucket for a `string`
-parameter like this one (a `list` parameter takes them all at once), and
-refuses the credential (`resource_outside_envelope`) when one is outside
-the envelope. `grantc lint` reports, per grant, how many buckets of the
-longest name its policy can hold, and per workload, the buckets it will be
-rendered with.
+`services/reports-api.yaml` (a service gives its members the `team` and
+`service` session tags, and lets one Access document cover them all):
+
+```yaml
+kind: Service
+metadata:
+  name: reports-api
+spec:
+  team: reports
+  members:
+    - prod/reports/api
+```
+
+Every entry of an access table is an **implicit grant**, compiled into the
+bundle under the name `account:<account name>:<kind>:<permission>`
+(`account:apps:s3_bucket:read` above) and shown under that name by
+`grantc lint`, in `Cracha-Grants`, in `/v1/grants`, in the `grant` session
+tag and in the broker's decision log. Nothing assigns it: the broker
+applies it to a workload the Access documents relate to a resource of the
+kind in the account, rendered with those resources (once per bucket for a
+`string` parameter like `bucket`, all at once for a `list` one), on the
+account role, inside the account's envelope, and refuses the credential
+(`resource_outside_envelope`) when one falls outside it. A workload with no
+grant and no relation gets nothing (`no_grant`). `grantc lint` reports,
+per implicit grant, how many resources of the longest name its policy can
+hold, and per workload, the resources it will be rendered with.
+
+A resource is in the account its Access document's `resource.account`
+names (the 12-digit id), or in the tree's only Account when it names none;
+with more than one Account document every Access document names it. One
+credential is one account: a workload whose relations span two accounts is
+refused (`accounts_mixed`), and the lint says so for the relations in Git.
+
+Grants can still be written out, beside the access tables, for what a
+relation does not express: a policy that names its resources itself,
+managed policies, a different duration. A grant of an account with an
+Account document may leave out `baseRole` and `envelope`, which are then
+the account's. `grants/reports-admin.yaml`:
+
+```yaml
+kind: Grant
+metadata:
+  name: reports-admin
+spec:
+  account: "111122223333"   # the account role and envelope apply
+  sessionPolicy:
+    template: s3-read
+    params: {bucket: example-reports-admin}
+```
+
+assigned to a service (`grants: [{name: reports-admin}]`) or to one
+workload (`assignments/reports-worker.yaml`):
+
+```yaml
+kind: Assignment
+metadata:
+  name: reports-worker
+spec:
+  subject: prod/reports/worker
+  grants: [reports-admin]
+  expiresAt: "2027-06-30T00:00:00Z"
+```
+
+`baseRole` is the override: a grant that names one is issued on that
+dedicated shape role instead of the account role, for the few workloads a
+shared role cannot serve (a role another account trusts by name, say). All
+of a workload's grants must still share one role, so a workload holding a
+dedicated-shape grant and related to resources of the account role's
+implicit grants is refused (`ambiguous`), and the lint says so.
+
+A written grant may also leave one parameter to a lookup, `bucket:
+{lookup: {kind: s3_bucket, permission: read}}`, rendered with the
+workload's resources like an implicit grant: a workload holding such a
+grant gets it, and not the account's implicit grant, for that kind and
+permission.
 
 Run the same lint locally with a release binary:
 `grantc lint .` (add `-access-analyzer -region sa-east-1` with AWS

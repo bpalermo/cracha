@@ -1,7 +1,7 @@
 # Crachá
 
 Crachá issues AWS credentials to Kubernetes workloads from their SPIFFE
-identity: a few IAM roles per account, one per permission shape, with
+identity: one IAM role per account, shared by its workloads, with
 per-workload session policies, attribution and revocation decided by a broker.
 A node agent serves the credentials to each pod over loopback, inside the
 pod's network namespace, so a workload trusts nothing, mounts nothing and
@@ -48,9 +48,10 @@ flowchart LR
    fetches the pod's JWT-SVID from SPIRE on its behalf and presents it to the
    broker over SPIFFE mTLS. The pod never sees an SVID.
 4. **The decision.** The broker verifies the SVID, looks the workload's
-   grants up in the authorization store, composes a session policy from the
-   signed grant bundle and checks it against the grant's envelope.
-5. **AWS.** The broker assumes one shared shape role with the workload's
+   grants and the resources it is related to up in the authorization store,
+   composes a session policy from the signed grant bundle and checks it
+   against the grant's envelope.
+5. **AWS.** The broker assumes the account's shared role with the workload's
    SourceIdentity, session tags and that session policy, caches the session
    and returns it. CloudTrail attributes every call to the workload.
 

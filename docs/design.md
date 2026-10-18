@@ -11,7 +11,7 @@ IAM role quotas (1,000 roles per account by default, max 5,000) make "one IAM ro
 ## 2. Goals / non-goals
 
 Goals
-- A few IAM roles per account, one per **permission shape** (e.g. `shape-s3-reader`, `shape-dynamo-rw`).
+- One IAM role per account by default, the **account role**, shared by every workload of the account; the session policy the broker composes scopes each workload, and IAM holds the role in with a permission boundary and SCPs (6.6). A dedicated role per **permission shape** (e.g. `shape-legacy-batch`) is the exception a grant asks for by name.
 - Workload identity = **SPIFFE ID**, obtained through the standard SPIFFE Workload API from a pluggable issuer. SPIRE is the reference issuer, not a dependency of the design. Uniform across all clusters regardless of platform or cloud provider.
 - Every credential is issued by a central broker, which sets per-workload ABAC session tags and, where needed, **session policies**. The issuer's keys never leave the cluster; AWS only ever sees the broker's role.
 - **Who may get what** lives in a **pluggable authorization store** behind a small, backend-neutral interface. SpiceDB is the reference backend, not a dependency of the design. **What a credential may look like** lives in a signed, Git-managed bundle.
@@ -33,7 +33,7 @@ One credential path for every workload:
 1. cracha-agent, one per node, binds a loopback listener (`127.0.0.1:<port>`) inside each enrolled pod's network namespace before the pod's app containers start, and serves the AWS container-credentials protocol on it over plain HTTP.
 2. The AWS SDK's container-credentials provider, which every first-party SDK has, calls that loopback endpoint. A listener bound inside a pod's network namespace is reachable from that pod alone, so the agent knows which pod every request comes from by the listener it arrived on.
 3. The agent fetches that pod's JWT-SVID (`aud=cracha-broker`) from the identity issuer on the pod's behalf, holds it in memory, and calls the broker with it over SPIFFE mTLS.
-4. The broker verifies the JWT-SVID against the trust bundle, checks the authorization store, renders and validates the session policy, and calls `sts:AssumeRole` on a shape role with `SourceIdentity`, session tags and the session policy.
+4. The broker verifies the JWT-SVID against the trust bundle, checks the authorization store, renders and validates the session policy, and calls `sts:AssumeRole` on the account role (or a grant's dedicated shape role) with `SourceIdentity`, session tags and the session policy.
 5. The agent relays the answer to the SDK, which caches the session and refreshes it through the same call.
 
 The pod holds no secret at all: no token file, no certificate to trust, no volume. The application code is unchanged. Between the SDK and the broker there is one hop, the agent on the same node, which is what makes a loopback endpoint possible.
@@ -55,7 +55,7 @@ flowchart TB
     authz["authz store<br/>(SpiceDB reference)"]
     bundle["grant bundle<br/>(signed, from Git)"]
     sts["STS"]
-    shapes["Shape roles in target accounts<br/>(permission boundary + SCP ceiling)"]
+    shapes["Account roles (or dedicated shape roles)<br/>in target accounts<br/>(permission boundary + SCP ceiling)"]
     agent -->|"mTLS (agent SVID) + JWT-SVID of the pod"| broker
     broker -->|Check| authz
     bundle -->|poll + verify| broker
@@ -124,33 +124,49 @@ The broker is the only principal that calls STS, so it is the only thing that ne
 - Preferred: the platform's native workload identity for the broker's pods (EKS Pod Identity, or an instance profile on the broker's dedicated nodes), bound to the `cracha-broker-<env>` role.
 - Clusters without a platform identity: an IAM OIDC provider for the issuer's trust domain, used by the broker alone with its own JWT-SVID (`aud=sts.amazonaws.com`) through the SDK's web-identity provider, with a trust policy pinned to the broker's SPIFFE ID. This is the one case where the issuer's JWKS must be published to AWS, and it covers a single identity.
 
-Shape-role trust policies name only the broker role (6.6), so workload identities are never visible to IAM.
+Account-role and shape-role trust policies name only the broker role (6.6), so workload identities are never visible to IAM.
 
 ## 6. Credential broker
 
 ### 6.1 Responsibilities split
 
-- **Grant bundle (Git, signed):** shapes (base roles and their ARN envelopes) and grants (policy templates with parameters). Answers *what*.
+- **Grant bundle (Git, signed):** accounts (the account role, its default envelope and its access table, which says what a permission on a resource kind means in IAM), dedicated shapes (base roles and their ARN envelopes) and grants (policy templates with parameters). Answers *what*.
 - **Authorization store (pluggable, SpiceDB reference):** assignments of grants to services/workloads, service membership, ownership, temporary access, and which resources a workload may reach (Level 3). Answers *who*, and for a lookup grant *which resources*.
 
 ### 6.2 Grant definition (bundle)
 
 ```yaml
+kind: Account
+metadata:
+  name: payments                   # free; it names the account's implicit grants
+spec:
+  id: "111122223333"
+  role: arn:aws:iam::111122223333:role/cracha/apps   # the account role
+  envelope:                        # default envelope of the account's grants
+    - arn:aws:dynamodb:*:111122223333:table/payments-*
+    - arn:aws:s3:::payments-*
+  access:                          # the access table: implicit grants (below)
+    - kind: s3_bucket
+      permission: read
+      template: s3-object-read
+---
 kind: Grant
 metadata:
   name: payments-ledger-rw
 spec:
   account: "111122223333"
-  baseRole: arn:aws:iam::111122223333:role/broker/shape-dynamo-rw
+  baseRole: arn:aws:iam::111122223333:role/broker/shape-dynamo-rw   # optional: the override
   sessionPolicy:
     template: dynamo-table-rw
     params: { tables: [ledger, ledger-outbox] }   # or a lookup (Level 3, below)
   managedPolicyArns: []            # escape hatch for large policies (max 10)
   sessionTags: { team: payments }
   duration: 3600                   # optional; default 1h, capped at 1h by role chaining
-  envelope:                        # runtime ARN allowlist for rendered policies
+  envelope:                        # runtime ARN allowlist for rendered policies; optional with an Account
     - arn:aws:dynamodb:*:111122223333:table/payments-*
 ```
+
+An **Account** document names one AWS account (`spec.id`, 12 digits; one document per account), its **account role** (`spec.role`, a role ARN in that account), optionally the default envelope of its grants (`spec.envelope`), and optionally its **access table** (`spec.access`). A Grant of an account with an Account document may leave out `baseRole`, and is then issued on the account role, and `envelope`, which is then the account's; a Grant without `baseRole` whose account has no Account document is refused by the lint. `baseRole` is the override: a grant that names one is issued on that dedicated shape role. The role a workload's credential is issued on, the account role or a dedicated one, is its **shape** below, and `Cracha-Shape` names it.
 
 Who holds a grant is recorded beside it, in the same tree, as a `kind: Service` (a team's workloads and the grants they share) and `kind: Assignment` (one workload's own grants, or its suspension) documents, and which resources a lookup grant reaches as `kind: Access` documents (below). They are not part of the bundle: the authorization store answers who holds what (6.1). For SpiceDB the `authz-reconciler` of 6.4 writes it there from these documents; for the static backend the compiler publishes them, beside the bundle, as the assignments document (below). They also let the composition lint (step 5) check what each workload will hold.
 
@@ -213,14 +229,20 @@ spec:
 - At issuance every Resource of the rendered policy must match the grant's envelope, or the request is refused with `resource_outside_envelope`. A lookup grant for which the store finds no resource is left out of the composition, so the workload keeps its other grants; when that leaves no grant, the refusal is `no_resources`. The decision log names the resources each lookup grant was rendered with, and the trace the relations that gave them.
 - Lints: the kind and permission are known, the parameter is declared by the template, an envelope is set; per grant, the policy for one probe resource is validated by Access Analyzer (CheckNoNewAccess cannot run on probes, which no envelope names) and its other resources, those the template writes itself, are checked against the envelope; the composition lint (step 5) renders each lookup grant with the resources the tree's Access documents relate the subject to in each cluster scope, and checks them against the grant's envelope and maximum, leaving the grant out when there are none, as the broker does.
 
-A workload has exactly one shape, and its session policy is composed by the broker at issuance time from every grant currently assigned to it in the authorization store. Permissions therefore change by assignment, with no redeploy and no per-workload configuration. All grants assigned to one workload must share its shape; a mix of shapes is ambiguous and denied. There are no profiles: one workload, one shape, one credential source.
+**Implicit grants.** For the common case a team writes no grant at all, only relationships: an entry of an account's access table, `{kind, permission, template, param?, params?, sessionTags?, duration?}`, says what holding `permission` on a resource of `kind` in the account means in IAM, and a workload related to such resources by Access documents gets that template rendered for them, as if it held a lookup grant. `param` is the template parameter the resources fill; it may be left out when the template leaves exactly one parameter without a value. The compiler turns every entry into an ordinary lookup grant of the bundle, marked `implicit`, named `account:<account name>:<kind>:<permission>` (e.g. `account:payments:s3_bucket:read`; the colon is in no name a Grant document may have, so an implicit grant can be neither written nor assigned), issued on the account role inside the account's envelope (required with an access table). Everything that applies to a lookup grant applies to it unchanged: the compiled maximum, the envelope check of every rendered resource, the size budget, the cache key, the decision log, `Cracha-Grants` and `/v1/grants`, which show the generated name.
+
+- Applying: at issuance the broker asks the store, for each kind and permission of the bundle's implicit grants, which resources the workload holds the permission on (`LookupResources`, once per pair), and composes each account's implicit grant with those of its resources in that account, beside the grants the workload holds. An implicit grant with no resource is left out silently (it is not held, so it is not reported as dropped); a workload that holds no grant and is related to no resource is `no_grant`. A workload that holds a lookup grant of a kind and permission gets that grant, and no implicit grant, for the pair: explicit lookup grants keep working beside access tables.
+- Which account: a resource is in the account its Access document names (`resource: {kind, name, account}`, the 12-digit id), or in the tree's only Account when it names none; with more than one Account document every Access document must name it, and two documents may not put one resource in two accounts (the store relates a resource by its name, so a name names one resource). The bundle carries the accounts (`accounts`: name, id, role, envelope) and, when there is more than one, the resources each holds; the published assignments do not carry the account. A resource the store relates the workload to that no account of a multi-account bundle places (a relation written outside Git) renders into no implicit grant, and the decision trace says so.
+- One credential is one account. The container-credentials protocol returns one credential, which is one `AssumeRole` in one account, so a workload whose grants, implicit ones included, are in more than one account is refused with `accounts_mixed`; the composition lint (step 5) reports the same for the relations and assignments known in Git.
+
+A workload has exactly one shape, and its session policy is composed by the broker at issuance time from every grant currently assigned to it in the authorization store and the implicit grants its relations bring in. Permissions therefore change by assignment or by relation, with no redeploy and no per-workload configuration. All of one workload's grants must share its shape, which grants on the account role do by construction; a mix of shapes (a dedicated-shape grant beside the account role's grants) is ambiguous and denied, and a mix of accounts is `accounts_mixed`. There are no profiles: one workload, one shape, one credential source.
 
 CI (`grant-compiler`) pipeline:
 1. Render templates.
 2. Access Analyzer `ValidatePolicy`.
 3. `CheckNoNewAccess` against the shape's envelope policy.
 4. Size budget lint (2,048-char inline session policy + packed tag budget).
-5. Composition lint, for assignments known in Git: the union of an assignee's grants, from its own Assignments and from the Service it is a member of, stays within one shape, the size budget and the envelope. The broker re-checks all three at issuance, since assignments can also come from the approval flow.
+5. Composition lint, for assignments known in Git: the union of an assignee's grants, from its own Assignments and from the Service it is a member of, the implicit grants its Access documents bring in, stays within one account, one shape, the size budget and the envelope. The broker re-checks all three at issuance, since assignments can also come from the approval flow.
 6. Compile → sign (KMS or cosign) → publish to S3.
 
 The grant tree is a repository of its own, not this one. Its CI runs the pipeline with a released `grantc`, verified against the signed checksums of its Crachá release, through the reusable workflow `.github/workflows/grants.yml`: lint and compile on a pull request; lint, compile, sign with a KMS key, verify and publish to S3 on a merge ([grants-repository.md](grants-repository.md)).
@@ -230,7 +252,7 @@ One compilation is one published version, of two artifacts:
 - `bundle.json`, the grants: what each grant is.
 - `assignments.json`, who holds them, for the static backend (6.3): every Service with its team, members and bounded grants, and every subject's Assignments merged into one workload, suspended when any of them suspends it and holding each grant once, with the union of the bounds its Assignments give it; and `access`, every Access document's relation, those that relate one holder to one resource by one relation merged the same way. The mapping is one pair of functions (`grant.ResolveAssignments`, `grant.ResolveAccess`), the same the reconciler writes SpiceDB from, so the two backends hold the same tree the same way; a union no single bound can express is refused by both.
 
-Both documents are decoded strictly, so a field a broker does not know is a rejected version, never an ignored one. The lookup fields are therefore absent when unused: a tree without lookup grants compiles to a bundle without `lookup`, and one without Access documents to assignments without `access`, byte for byte (and version for version) what they were before them, which a broker that predates them keeps reading. A tree that uses them is refused by such a broker, which keeps its last good version: it could not render a lookup grant, and must not hand out the grant's shape without its policy.
+Both documents are decoded strictly, so a field a broker does not know is a rejected version, never an ignored one. The lookup and account fields are therefore absent when unused: a tree without lookup grants compiles to a bundle without `lookup`, one without Account documents to a bundle without `accounts` or `implicit` (a grant that names its `baseRole` and `envelope` compiles as it always did), and one without Access documents to assignments without `access`, byte for byte (and version for version) what they were before them, which a broker that predates them keeps reading. A tree that uses them is refused by such a broker, which keeps its last good version: it could not render a lookup grant or apply an implicit one, and must not hand out the grant's shape without its policy. A grant that leaves out `baseRole` compiles with the account role written in, but needs an Account document, so its bundle carries `accounts` as well.
 
 Both carry the version and `generatedAt`, both are canonical JSON, each is signed with the same envelope and key (`<file>.sig`), and the version, when none is given, is the content hash of both, so a change of assignments alone is a new version. The layout:
 
@@ -326,7 +348,7 @@ Why it is shaped so:
 Integration levels:
 - **L1 (v1):** `Store.Check(subject, grant)` gates issuance (SpiceDB: `CheckPermission(grant#assume, workload)`).
 - **L2 (v1):** service/team returned in `Decision.Tags` become session tags for ABAC.
-- **L3:** a grant's lookup parameter is filled at issuance by `Store.LookupResources` with the resources the workload is related to (6.2); every rendered ARN is validated against the grant's envelope at runtime, and a violation rejects the request (`resource_outside_envelope`). The relations come from Git, as `kind: Access` documents, through the reconciler (SpiceDB) or the published assignments (static).
+- **L3:** a grant's lookup parameter is filled at issuance by `Store.LookupResources` with the resources the workload is related to (6.2); every rendered ARN is validated against the grant's envelope at runtime, and a violation rejects the request (`resource_outside_envelope`). The relations come from Git, as `kind: Access` documents, through the reconciler (SpiceDB) or the published assignments (static). An account's implicit grants (6.2) are filled the same way and are never relationships: nothing assigns them, so neither the schema nor the reconciler knows them, and the account a resource is in is the bundle's, not the store's.
 
 Relationship writers (write access to the authz store is security-critical, whatever the backend). What Crachá requires is that the writer is trusted and that no relationship is derived from anything the workload controls:
 
@@ -366,14 +388,14 @@ GET /v1/credentials
     Cracha-Consistency-Token: ...
     Cracha-Cache: hit | miss | refresh      (6.7: served from the cache, issued by STS now, or served from the cache while a refresh-ahead started; absent with the cache off)
 403 { "reason": "no_grant" | "ambiguous" | "subject_suspended" | "envelope_violation" | "policy_too_large"
-              | "resource_outside_envelope" | "no_resources" }
+              | "resource_outside_envelope" | "no_resources" | "accounts_mixed" }
 
 GET /v1/grants                (same authorization) → the caller's shape, grants and composed session policy, for inspection
 ```
 
-`/v1/grants` also shows, per lookup grant, the resources its policy was rendered with (`resources`). `resource_outside_envelope` is a resource the store related the workload to that renders outside a lookup grant's envelope; `no_resources` is a workload whose every grant is a lookup grant with no resource related (6.2).
+`/v1/grants` also shows, per lookup grant, implicit ones included, the resources its policy was rendered with (`resources`). `resource_outside_envelope` is a resource the store related the workload to that renders outside a lookup grant's envelope; `no_resources` is a workload whose every grant is a lookup grant with no resource related (6.2); `accounts_mixed` is a workload whose grants, implicit ones included, are in more than one account (6.2). A workload that holds no grant and whose relations bring in no implicit grant is `no_grant`.
 
-The request is exactly what the SDK's container-credentials provider sends, relayed by the agent (7.3) with the pod's token added, and nothing workload-specific is in it: the identity in the token selects everything. The broker is therefore a drop-in credential source for any SDK. `ambiguous` means the caller's grants span more than one shape.
+The request is exactly what the SDK's container-credentials provider sends, relayed by the agent (7.3) with the pod's token added, and nothing workload-specific is in it: the identity in the token selects everything. The broker is therefore a drop-in credential source for any SDK. `ambiguous` means the caller's grants span more than one shape (role) of one account.
 
 Authentication:
 - Transport: the broker serves TLS with its own X.509-SVID from the Workload API (go-spiffe `tlsconfig.MTLSServerConfig`) and requires a client SVID. It authorises exactly one client identity, the agent's (`spiffe://<td>/ns/<namespace>/sa/cracha-agent`; `--agent-spiffe-id`, which the chart derives from the release and `broker.agentSpiffeID` overrides). A connection from any other SVID is refused before a request is read, and the client identity is logged with every request beside the token's subject. No DNS SAN and no CA bundle are involved anywhere: the agent verifies the broker by SPIFFE ID too (7.3). Nothing in a pod can reach the broker, because nothing in a pod holds an SVID.
@@ -382,12 +404,12 @@ Authentication:
 
 ### 6.6 STS mechanics
 
-- Broker's role (`cracha-broker`, per environment) → `AssumeRole` on shape roles. This is role chaining, so the session max is 1 hour. Session duration is configurable per grant and defaults to 1 hour; targeted revocation (6.8) covers the window.
+- Broker's role (`cracha-broker`, per environment) → `AssumeRole` on the account role of the workload's account, or on a grant's dedicated shape role. This is role chaining, so the session max is 1 hour. Session duration is configurable per grant and defaults to 1 hour; targeted revocation (6.8) covers the window.
 - Each call sets:
   - `SourceIdentity` = `RoleSessionName` = idenc STS encoding (per workload, not per pod)
   - `Policy` / `PolicyArns` = rendered session policy
   - session tags: `spiffe-ns`, `spiffe-sa`, `cluster`, `grant`, `team`, `service` (non-transitive)
-- Shape role trust policy, two statements: STS evaluates `sts:TagSession` as its own action, without the `sts:SourceIdentity` key, so a single statement conditioned on both refuses every tagged session (seen on the first real-cluster run, while the IAM policy simulator allowed it).
+- Account-role (and shape-role) trust policy, two statements: STS evaluates `sts:TagSession` as its own action, without the `sts:SourceIdentity` key, so a single statement conditioned on both refuses every tagged session (seen on the first real-cluster run, while the IAM policy simulator allowed it).
 
 ```json
 [
@@ -410,12 +432,19 @@ Authentication:
 ]
 ```
 
-- Shape role ceiling: permission boundary with explicit denies on `iam:*`, `sts:AssumeRole*`, `organizations:*`, key administration; backed by SCPs.
-- Separate `cracha-broker` roles per environment/account tier. A dev broker can't assume prod shapes.
+- Role ceiling (account roles and shape roles alike): permission boundary with explicit denies on `iam:*`, `sts:AssumeRole*`, `organizations:*`, key administration; backed by SCPs.
+- Separate `cracha-broker` roles per environment/account tier. A dev broker can't assume prod roles.
+
+**The account role (the default model).** Every workload of an account shares one IAM role, which ends the role quota problem of section 1 outright: a fleet needs a role per account, not per workload or per shape.
+
+- Its identity policy is broad: the services and actions the account's workloads use, on the account's resources (`arn:aws:s3:::*`, `arn:aws:dynamodb:*:<account>:table/*`, ...). What contains it is everything around it: the permission boundary and SCPs above (which deny what no workload may ever do, whatever the policy says), and the session policy the broker passes on every `AssumeRole`, which the session's permissions are the intersection with. Every grant of the account carries a session policy or managed session policies (6.2 refuses one with neither), so no credential is ever issued with the role's whole identity policy.
+- The broker is then the only per-workload scoping layer, which is what the design already assumes and now relies on alone: a workload's access is exactly its session policy, rendered from the signed bundle and checked against the envelope before STS is called (section 11). The consequences: the bundle's signing key, the grant tree's CODEOWNERS (the access tables and envelopes above all, since one entry reaches every workload related to the kind) and the authorization store's writers are as sensitive as the role itself; the account envelope should be the narrowest ARN set the account's workloads use, since a relation written outside Git is held to it alone; a compromise of the broker reaches the account role's identity policy under the boundary, where a shape role would have capped it at the shape (9); and the inline session policy's 2,048 characters must hold a workload's whole scope, with managed session policies as the escape for the large ones.
+- ABAC, the variant for team-owned resources: the broker sets `team`, `service`, `spiffe-ns`, `spiffe-sa` and `cluster` on every session (above), from the store and Git, never from the workload, so the account role's identity policy can scope by them instead of, or as well as, the session policy: `"Condition": {"StringEquals": {"aws:ResourceTag/team": "${aws:PrincipalTag/team}"}}` lets a team's workloads reach the resources tagged as its own and nothing else, without an Access document per resource. It is a second layer, held in IAM, that does not depend on the bundle; it needs resources tagged reliably (by the provisioning pipeline, and an SCP denying tag changes to everyone else).
+- Dedicated shape roles are the exception, by a grant's `baseRole`: a role another account's resource policy trusts by name, a workload whose permissions must not depend on the session policy alone, or one that needs more than an inline session policy can say. A workload on a dedicated shape holds only grants of that shape (6.2); its trust and boundary are the account role's.
 
 ### 6.7 Caching
 
-- Broker cache key: `(shape, sorted grant set, bundleVersion, encoded workload, resource set)`, the resource set being the SHA-256 of the resources each lookup grant was rendered with, grant by grant, sorted (empty without lookup grants). A change in the grant set or the resource set is a new key, so an added or removed assignment, or a bucket related or unrelated, takes effect at the next fetch. In-memory only, singleflight on miss, refresh-ahead at ~70% of the usable lifetime (the TTL less the 20-minute floor: 28 minutes into a one-hour session), never return creds with <20 min left.
+- Broker cache key: `(shape, sorted grant set, bundleVersion, encoded workload, resource set)`, the grant set including the implicit grants applied (6.2) and the resource set being the SHA-256 of the resources each lookup grant, implicit or not, was rendered with, grant by grant, sorted (empty without lookup grants). A change in the grant set or the resource set is a new key, so an added or removed assignment, or a bucket related or unrelated, takes effect at the next fetch. In-memory only, singleflight on miss, refresh-ahead at ~70% of the usable lifetime (the TTL less the 20-minute floor: 28 minutes into a one-hour session), never return creds with <20 min left.
 - **Re-check the authz store on every issuance, including cache hits** (cheap at refresh frequency).
 - `Store.Watch` invalidates affected cache entries on assignment changes, resource relations included: SpiceDB's change of a workload's relation to a resource drops that subject's entries, one of a service's members drops every entry, and the static backend's swap drops every entry as it does for any change. Backends without Watch degrade to TTL-only invalidation, and the broker exposes which mode is active. The static backend's Watch is minimal: after each swap of its assignments, one change naming no subject, which drops every entry. That is enough because the cache already re-checks the store on every issuance, so a swap takes effect at the next fetch whatever the cache holds, and because the published version is the bundle version in the key, which every swap changes: the flush only drops at once the sessions of the previous version, which no request could reach any more, instead of leaving them to age out, and keeps them from being served in degraded mode.
 - Consistency: minimize latency by default; at-least-as-fresh when a caller (approver/revocation tool) supplies a consistency token.
@@ -424,7 +453,7 @@ Authentication:
 ### 6.8 Revocation
 
 1. Stop issuance: remove the relationship (or suspend the grant in the bundle) and flush the cache via Watch. The kind suite exercises this (`E2E_AUTHZ=spicedb e2e/run.sh`): the reconciler removes the assignment, the next fetch is refused within seconds and the broker's log shows the flush came from Watch.
-2. Kill live sessions: `revoke-tool` attaches an inline deny to the shape role, scoped to one workload, and removes it after 1h:
+2. Kill live sessions: `revoke-tool` attaches an inline deny to the role the workload's sessions are on (its account role, or its dedicated shape role), scoped to one workload, and removes it after 1h:
 
 ```json
 { "Effect": "Deny", "Action": "*", "Resource": "*",
@@ -630,9 +659,9 @@ A workload on an SDK that ignores the variables and needs more room sets it in t
 | cracha-agent | JWT-SVIDs and credentials of pods on that node (≈ node) | A privileged node component (host network, CRI socket, namespace entry, TokenReview) whose compromise is node compromise, as the CSI plugin's was. Hardening §7.8, RBAC-bounded fetch, fetch alerts |
 | Node-local path (`init` mode) | The enrolment token, and in both modes nothing else, crosses from the pod to the node in plain HTTP on the node's address; the credentials response crosses loopback inside the pod | The same trust boundary the on-disk token had: the node is trusted, and the token is bound to one pod, one audience and minutes of life |
 | Anything reaching the broker (bearer replay, flooding) | Denial of service; replay limited to the victim pod's grants within token TTL | The broker accepts only the agent's SVID, so a stolen JWT-SVID is useless without an agent's identity; strict JWT validation, per-identity rate limits at the broker and per-pod bounds at the agent, network policy |
-| Broker | Grants in its environment, capped by shape ceilings | Dedicated nodes, per-env roles, alert on shape-role assumption without `SourceIdentity` / by other principals |
-| Grant repo | Misuse within shape envelopes | CODEOWNERS, `CheckNoNewAccess`, signed bundles |
-| Authz store writes | Misassignment within shapes | Restricted writers, change-feed audit log, envelope check |
+| Broker | The account roles of its environment (each capped by its identity policy, permission boundary and SCPs; a dedicated shape by its own policy) | Dedicated nodes, per-env roles, alert on account-role or shape-role assumption without `SourceIdentity` / by other principals, ABAC on the account role's identity policy (6.6) |
+| Grant repo | Misuse within envelopes, an account's envelope and access table reaching every workload related to its resources | CODEOWNERS, `CheckNoNewAccess`, signed bundles |
+| Authz store writes | Misassignment and misrelation within envelopes | Restricted writers, change-feed audit log, envelope check |
 | Identity issuer (e.g. SPIRE server) | Mint any identity | Tier-0 controls, KMS/HSM keys |
 
 ## 10. Open questions
@@ -648,7 +677,9 @@ A workload on an SDK that ignores the variables and needs more room sets it in t
 These hold regardless of backend, issuer or platform. Any implementation must be able to demonstrate each one.
 
 - Never fail open: an unavailable authz store, issuer or bundle results in denial, or in serving already-issued credentials within bounded staleness, never in broader access.
-- Every rendered session policy is checked against the grant's envelope before STS is called, including every resource a lookup grant is rendered with at issuance: the store relates a workload to resources, it never widens a grant beyond its envelope.
+- Every rendered session policy is checked against the grant's envelope before STS is called, including every resource a lookup grant, implicit or not, is rendered with at issuance: the store relates a workload to resources, it never widens a grant beyond its envelope.
+- Every credential carries a session policy or managed session policies, so none is ever issued with an account role's whole identity policy.
+- One credential is one `AssumeRole` in one account: grants of two accounts are refused (`accounts_mixed`), never split or merged.
 - `SourceIdentity` is set on every assumed session and is reversible to a SPIFFE ID through the decision log.
 - Nothing writes AWS credentials or SVIDs to disk. The workload never holds an SVID: its JWT-SVID lives in the agent's memory and is presented to the broker, nowhere else.
 - Credentials are served to a workload over loopback only, from a listener bound inside that pod's network namespace and nowhere else. The pod a request is answered for is the pod the listener was bound in.
