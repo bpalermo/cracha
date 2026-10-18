@@ -222,6 +222,13 @@ func TestParseRejects(t *testing.T) {
 		"not a mapping":      "- a\n- b\n",
 		"empty member":       "services:\n  - name: a\n    members: ['']\n",
 		"service grant name": "services:\n  - name: a\n    grants: [{expiresAt: '2026-01-01T00:00:00Z'}]\n",
+		"access no holder":   "access:\n  - resource: {kind: s3_bucket, name: b}\n    relation: reader\n",
+		"access two holders": "access:\n  - subject: x\n    service: a\n    resource: {kind: s3_bucket, name: b}\n    relation: reader\n",
+		"access bad kind":    "access:\n  - subject: x\n    resource: {kind: sqs_queue, name: b}\n    relation: reader\n",
+		"access no name":     "access:\n  - subject: x\n    resource: {kind: s3_bucket}\n    relation: reader\n",
+		"access relation":    "access:\n  - subject: x\n    resource: {kind: s3_bucket, name: b}\n    relation: owner\n",
+		"access expiresAt":   "access:\n  - subject: x\n    resource: {kind: s3_bucket, name: b}\n    relation: reader\n    expiresAt: soon\n",
+		"access field":       "access:\n  - subject: x\n    resource: {kind: s3_bucket, name: b, arn: x}\n    relation: reader\n",
 	}
 	for name, in := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -363,5 +370,81 @@ func TestFromAssignments(t *testing.T) {
 	}
 	if got := FromAssignments(published); !reflect.DeepEqual(got, parsed) {
 		t.Errorf("FromAssignments =\n%+v\nwant the file's\n%+v", got, parsed)
+	}
+}
+
+func TestLookupResources(t *testing.T) {
+	const withAccess = file + `access:
+  - subject: prod/payments/ledger
+    resource: { kind: s3_bucket, name: data-raw }
+    relation: reader
+  - service: payments-api
+    resource: { kind: s3_bucket, name: data.curated }
+    relation: writer
+    clusters: [prod-a]
+  - subject: prod/payments/ledger
+    resource: { kind: s3_bucket, name: data-old }
+    relation: writer
+    expiresAt: "2026-06-01T00:00:00Z"
+  - subject: prod/payments/suspended
+    resource: { kind: s3_bucket, name: data-raw }
+    relation: reader
+  - subject: prod/nobody/else
+    resource: { kind: s3_bucket, name: data-raw }
+    relation: reader
+`
+	now := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	s, err := Parse([]byte(withAccess), WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	ledger := authz.Subject{ID: "prod/payments/ledger", Cluster: "prod-a"}
+	got, err := s.LookupResources(ctx, ledger, "s3_bucket", "read", authz.Consistency{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"data-raw", "data.curated"}; !reflect.DeepEqual(got.Names, want) || got.Token != s.Token() {
+		t.Errorf("read = %+v, want %v", got, want)
+	}
+	if !strings.Contains(strings.Join(got.Trace, "\n"), "s3_bucket data-old writer via workload: expired at 2026-06-01T00:00:00Z") {
+		t.Errorf("trace = %q, want the expired access named", got.Trace)
+	}
+	got, _ = s.LookupResources(ctx, ledger, "s3_bucket", "write", authz.Consistency{})
+	if want := []string{"data.curated"}; !reflect.DeepEqual(got.Names, want) {
+		t.Errorf("write = %v, want %v", got.Names, want)
+	}
+	got, _ = s.LookupResources(ctx, authz.Subject{ID: "prod/payments/worker", Cluster: "prod-b"}, "s3_bucket", "read", authz.Consistency{})
+	if len(got.Names) != 0 {
+		t.Errorf("worker in prod-b = %v, want nothing", got.Names)
+	}
+	// A subject with access and no assignments.
+	got, _ = s.LookupResources(ctx, authz.Subject{ID: "prod/nobody/else", Cluster: "prod-b"}, "s3_bucket", "read", authz.Consistency{})
+	if !reflect.DeepEqual(got.Names, []string{"data-raw"}) {
+		t.Errorf("nobody = %v, want data-raw", got.Names)
+	}
+	if _, err := s.LookupResources(ctx, authz.Subject{ID: "prod/payments/suspended"}, "s3_bucket", "read", authz.Consistency{}); !errors.Is(err, authz.ErrSubjectSuspended) {
+		t.Errorf("suspended: %v", err)
+	}
+	for _, q := range [][2]string{{"sqs_queue", "read"}, {"s3_bucket", "admin"}} {
+		if _, err := s.LookupResources(ctx, ledger, q[0], q[1], authz.Consistency{}); err == nil {
+			t.Errorf("%s#%s: no error", q[0], q[1])
+		}
+	}
+	if _, err := NewEmpty().LookupResources(ctx, ledger, "s3_bucket", "read", authz.Consistency{}); err == nil {
+		t.Error("an empty store answered")
+	}
+	if _, err := s.LookupResources(ctx, ledger, "s3_bucket", "read", authz.Consistency{AtLeastAsFresh: "other"}); err == nil {
+		t.Error("answered at a token it is not at")
+	}
+}
+
+func TestFromAssignmentsAccess(t *testing.T) {
+	f := FromAssignments(&grant.Assignments{Services: []grant.AssignedService{}, Workloads: []grant.AssignedWorkload{}, Access: []grant.AssignedAccess{
+		{Service: "s", Resource: grant.Resource{Kind: "s3_bucket", Name: "b"}, Relation: "writer", Clusters: []string{"c"}, ExpiresAt: "2030-01-01T00:00:00Z"},
+	}})
+	want := []Access{{Service: "s", Resource: Resource{Kind: "s3_bucket", Name: "b"}, Relation: "writer", Clusters: []string{"c"}, ExpiresAt: "2030-01-01T00:00:00Z"}}
+	if !reflect.DeepEqual(f.Access, want) {
+		t.Errorf("access = %+v, want %+v", f.Access, want)
 	}
 }

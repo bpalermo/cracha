@@ -244,7 +244,9 @@ func TestWatchMapping(t *testing.T) {
 		update("t4", parseRel("service:payments-api#owner@team:finance")),
 		update("t5", parseRel("workload:"+ledger+"#suspended@team:security")),
 		update("t6", parseRel("grant:break-glass#account@aws_account:111122223333")),
-		{ChangesThrough: &v1.ZedToken{Token: "t7"}, IsCheckpoint: true},
+		update("t7", parseRel("s3_bucket:data_2eraw#reader@workload:"+worker)),
+		update("t8", parseRel("s3_bucket:data-raw#writer@service:payments-api#member")),
+		{ChangesThrough: &v1.ZedToken{Token: "t9"}, IsCheckpoint: true},
 	}
 	ch, err := newStore(f).Watch(context.Background(), "t0")
 	if err != nil {
@@ -260,6 +262,8 @@ func TestWatchMapping(t *testing.T) {
 		{Token: "t3"},
 		{Token: "t4"},
 		{Token: "t5"},
+		{Subject: authz.Subject{ID: worker}, Token: "t7"},
+		{Token: "t8"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("changes %+v, want %+v", got, want)
@@ -267,7 +271,7 @@ func TestWatchMapping(t *testing.T) {
 	if f.lastWatch.GetOptionalStartCursor().GetToken() != "t0" {
 		t.Errorf("watch started at %v, want t0", f.lastWatch.GetOptionalStartCursor())
 	}
-	if want := []string{"grant", "service", "workload"}; !reflect.DeepEqual(f.lastWatch.GetOptionalObjectTypes(), want) {
+	if want := []string{"grant", "service", "workload", "s3_bucket", "dynamodb_table"}; !reflect.DeepEqual(f.lastWatch.GetOptionalObjectTypes(), want) {
 		t.Errorf("watched %v, want %v", f.lastWatch.GetOptionalObjectTypes(), want)
 	}
 }
@@ -403,4 +407,36 @@ func TestBearerToken(t *testing.T) {
 
 func writeFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0o600)
+}
+
+func TestLookupResources(t *testing.T) {
+	f := fixture()
+	f.write(parseRel("s3_bucket:data_2ecurated#reader@workload:"+ledger), parseRel("s3_bucket:data-raw#writer@workload:"+ledger))
+	s := newStore(f)
+	got, err := s.LookupResources(context.Background(), subject, "s3_bucket", "read", authz.Consistency{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"data-raw", "data.curated"}; !reflect.DeepEqual(got.Names, want) || got.Token != token {
+		t.Errorf("read = %+v, want %v at %s", got, want, token)
+	}
+	if f.lastContext["cluster"] != subject.Cluster || f.lastContext["now"] == "" {
+		t.Errorf("caveat context = %v, want now and the cluster", f.lastContext)
+	}
+	got, err = s.LookupResources(context.Background(), subject, "s3_bucket", "write", authz.Consistency{})
+	if err != nil || !reflect.DeepEqual(got.Names, []string{"data-raw"}) {
+		t.Errorf("write = %+v, %v, want data-raw", got, err)
+	}
+	if _, err := s.LookupResources(context.Background(), subject, "grant", "assume", authz.Consistency{}); err == nil {
+		t.Error("a lookup of grants as resources succeeded")
+	}
+	// An ID idenc did not make is an error, not a name.
+	f.write(parseRel("s3_bucket:data_2Dodd#reader@workload:" + ledger))
+	if _, err := s.LookupResources(context.Background(), subject, "s3_bucket", "read", authz.Consistency{}); err == nil {
+		t.Error("a non-canonical resource ID was accepted")
+	}
+	f.err = status.Error(codes.Unavailable, "spicedb is away")
+	if _, err := s.LookupResources(context.Background(), subject, "s3_bucket", "read", authz.Consistency{}); status.Code(err) != codes.Unavailable {
+		t.Errorf("LookupResources: %v, want the gRPC error", err)
+	}
 }

@@ -71,15 +71,34 @@ type Store interface {
 	Check(ctx context.Context, subject Subject, grant string, consistency Consistency) (CheckResult, error)
 }
 
-// ResourceLookup is the optional LookupResources of 6.3, for Level 3
-// template filling. A Store may implement it.
-type ResourceLookup interface {
-	LookupResources(ctx context.Context, subject Subject, kind, permission string, consistency Consistency) ([]string, Token, error)
+// Resources is the answer to LookupResources.
+type Resources struct {
+	// Names of the resources of the kind the subject holds the permission
+	// on right now, sorted, without duplicates: resource names (an S3
+	// bucket's name), never a backend's object IDs.
+	Names []string
+	// Token is the consistency token of this answer.
+	Token Token
+	// Trace explains the answer, one line per relation considered, for the
+	// decision log.
+	Trace []string
 }
 
-// Change is one assignment change seen by Watch.
+// ResourceLookup is LookupResources of 6.3, for Level 3 template filling:
+// which resources of a kind (an object type of design 6.4, such as
+// s3_bucket) the subject holds a permission (read or write) on, directly
+// or through its service, with the same time and cluster bounds, and the
+// same suspension, as its grants. Both backends implement it; a broker
+// whose store does not denies every grant that needs it.
+type ResourceLookup interface {
+	LookupResources(ctx context.Context, subject Subject, kind, permission string, consistency Consistency) (Resources, error)
+}
+
+// Change is one assignment change seen by Watch, a change of a resource
+// relation (Level 3) included.
 type Change struct {
-	// Subject whose grants changed, if the backend knows; empty means "any".
+	// Subject whose grants or resources changed, if the backend knows;
+	// empty means "any".
 	Subject Subject
 	// Grant that was assigned or removed, if the backend knows.
 	Grant string

@@ -24,6 +24,7 @@ func TestSchemaNames(t *testing.T) {
 		"definition " + TypeWorkload + " {",
 		"definition " + TypeAWSAccount + " {",
 		"definition " + TypeGrant + " {",
+		"definition " + TypeS3Bucket + " {",
 		"definition " + TypeDynamoDBTable + " {",
 		"relation " + RelationOwner + ": " + TypeTeam,
 		"relation " + RelationMember + ": " + TypeWorkload,
@@ -31,18 +32,30 @@ func TestSchemaNames(t *testing.T) {
 		"relation " + RelationAccount + ": " + TypeAWSAccount,
 		"relation " + RelationAssigneeService + ": " + TypeService + " | " + TypeService + " with " + CaveatWithinWindow + " | " + TypeService + " with " + CaveatInClusters + " | " + TypeService + " with " + CaveatBounded,
 		"relation " + RelationAssigneeWorkload + ": " + TypeWorkload + " | " + TypeWorkload + " with " + CaveatWithinWindow + " | " + TypeWorkload + " with " + CaveatInClusters + " | " + TypeWorkload + " with " + CaveatBounded,
-		"relation " + RelationWriter + ": " + TypeService,
-		"relation " + RelationReader + ": " + TypeService,
 		"permission " + PermissionIsSuspended + " = " + RelationSuspended,
 		"permission " + PermissionAssume + " = " + RelationAssigneeService + "->" + RelationMember + " + " + RelationAssigneeWorkload,
-		"permission " + PermissionWrite + " = " + RelationWriter + "->" + RelationMember,
-		"permission " + PermissionRead + "  = " + PermissionWrite + " + " + RelationReader + "->" + RelationMember,
 		"caveat " + CaveatWithinWindow + "(" + ContextExpiresAt + " timestamp, " + ContextNow + " timestamp)",
 		"caveat " + CaveatInClusters + "(" + ContextAllowed + " list<string>, " + ContextCluster + " string)",
 		"caveat " + CaveatBounded + "(" + ContextExpiresAt + " timestamp, " + ContextNow + " timestamp, " + ContextAllowed + " list<string>, " + ContextCluster + " string)",
 	} {
 		if !strings.Contains(Schema, want) {
 			t.Errorf("schema does not contain %q", want)
+		}
+	}
+	holders := strings.Join([]string{
+		TypeWorkload, TypeWorkload + " with " + CaveatWithinWindow, TypeWorkload + " with " + CaveatInClusters, TypeWorkload + " with " + CaveatBounded,
+		TypeService + "#" + RelationMember, TypeService + "#" + RelationMember + " with " + CaveatWithinWindow,
+		TypeService + "#" + RelationMember + " with " + CaveatInClusters, TypeService + "#" + RelationMember + " with " + CaveatBounded,
+	}, " | ")
+	for _, typ := range ResourceTypes {
+		def := "definition " + typ + " {\n" +
+			"  relation " + RelationReader + ": " + holders + "\n" +
+			"  relation " + RelationWriter + ": " + holders + "\n" +
+			"  permission " + PermissionWrite + " = " + RelationWriter + "\n" +
+			"  permission " + PermissionRead + " = " + RelationReader + " + " + RelationWriter + "\n" +
+			"}"
+		if !strings.Contains(Schema, def) {
+			t.Errorf("schema does not contain\n%s", def)
 		}
 	}
 }
@@ -71,6 +84,12 @@ func TestObjectIDs(t *testing.T) {
 	}
 	if !objectIDRE.MatchString("td_2eother_2eorg/a_3ab/c_2fd_7ce") {
 		t.Error("an escaped subject is not a SpiceDB object ID")
+	}
+	for _, bucket := range []string{"data.curated", "a-b.c-d", "cracha-e2e-data"} {
+		id, err := idenc.Resource(bucket)
+		if err != nil || !objectIDRE.MatchString(id) {
+			t.Errorf("Resource(%q) = %q, %v: not a SpiceDB object ID", bucket, id, err)
+		}
 	}
 	for _, id := range []string{"payments-ledger-rw", "payments", "111122223333", TeamNone} {
 		if !objectIDRE.MatchString(id) {

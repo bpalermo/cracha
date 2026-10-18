@@ -26,8 +26,14 @@
 //	    grants:                       # assigned to this workload alone
 //	      - name: payments-outbox-r
 //	        expiresAt: "2026-12-31T00:00:00Z"
+//	access:                           # Level 3: resources by name
+//	  - subject: prod/payments/ledger # or service: payments-api, for its members
+//	    resource: { kind: s3_bucket, name: payments-exports }
+//	    relation: reader              # or writer
+//	    clusters: [prod-us-east-1]    # optional, as on a grant
+//	    expiresAt: "2026-12-31T00:00:00Z"
 //
-// Both assignment forms take both conditions. A workload is a member of at
+// Both assignment forms, and access, take both conditions. A workload is a member of at
 // most one service. Unknown fields are an error. Time-bounded and
 // cluster-bounded assignments are evaluated here, at every call, against the
 // subject's cluster and the clock.
@@ -41,6 +47,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -55,6 +62,24 @@ import (
 type File struct {
 	Services  []Service  `yaml:"services"`
 	Workloads []Workload `yaml:"workloads"`
+	Access    []Access   `yaml:"access"`
+}
+
+// Access relates a workload, or every member of a service, to a resource
+// (Level 3), optionally bounded by cluster and time.
+type Access struct {
+	Subject   string   `yaml:"subject"`
+	Service   string   `yaml:"service"`
+	Resource  Resource `yaml:"resource"`
+	Relation  string   `yaml:"relation"`
+	Clusters  []string `yaml:"clusters"`
+	ExpiresAt string   `yaml:"expiresAt"`
+}
+
+// Resource names a resource of a kind.
+type Resource struct {
+	Kind string `yaml:"kind"`
+	Name string `yaml:"name"`
 }
 
 // Service groups workloads that share grants and tags.
@@ -89,6 +114,13 @@ func FromAssignments(a *grant.Assignments) File {
 	for _, w := range a.Workloads {
 		f.Workloads = append(f.Workloads, Workload{Subject: w.Subject, Suspended: w.Suspended, Grants: fromBounded(w.Grants)})
 	}
+	for _, r := range a.Access {
+		f.Access = append(f.Access, Access{
+			Subject: r.Subject, Service: r.Service,
+			Resource: Resource{Kind: r.Resource.Kind, Name: r.Resource.Name},
+			Relation: r.Relation, Clusters: r.Clusters, ExpiresAt: r.ExpiresAt,
+		})
+	}
 	return f
 }
 
@@ -109,8 +141,8 @@ func WithClock(now func() time.Time) Option {
 	return func(s *Store) { s.now = now }
 }
 
-// Store is the static backend. It implements authz.Store and
-// authz.Watcher.
+// Store is the static backend. It implements authz.Store,
+// authz.ResourceLookup and authz.Watcher.
 type Store struct {
 	now     func() time.Time
 	current atomic.Pointer[Snapshot]
@@ -125,6 +157,15 @@ type Store struct {
 type Snapshot struct {
 	token     authz.Token
 	workloads map[string]*workload
+	access    []access
+}
+
+// access is one relation of a holder to a resource.
+type access struct {
+	subject, service string
+	kind, name       string
+	relation         string
+	bounds           bounds
 }
 
 type workload struct {
@@ -135,10 +176,28 @@ type workload struct {
 }
 
 type assignment struct {
-	grant     string
-	source    string // "service <name>" or "workload"
+	grant  string
+	source string // "service <name>" or "workload"
+	bounds bounds
+}
+
+// bounds are the cluster and time bounds of an assignment or an access.
+type bounds struct {
 	clusters  []string
 	expiresAt time.Time // zero: unbounded
+}
+
+// newBounds parses the bounds a document gives.
+func newBounds(clusters []string, expiresAt string) (bounds, error) {
+	b := bounds{clusters: append([]string(nil), clusters...)}
+	if expiresAt != "" {
+		t, err := time.Parse(time.RFC3339, expiresAt)
+		if err != nil {
+			return bounds{}, fmt.Errorf("expiresAt: %w", err)
+		}
+		b.expiresAt = t
+	}
+	return b, nil
 }
 
 // Load reads and parses an assignments file.
@@ -202,7 +261,35 @@ func Build(f File, token authz.Token) (*Snapshot, error) {
 	if err := snap.addWorkloads(f.Workloads); err != nil {
 		return nil, err
 	}
+	if err := snap.addAccess(f.Access); err != nil {
+		return nil, err
+	}
 	return snap, nil
+}
+
+// addAccess loads the access section: each entry relates exactly one
+// holder, a subject or a service, to a named resource by a relation of
+// its kind.
+func (snap *Snapshot) addAccess(entries []Access) error {
+	for i, a := range entries {
+		if (a.Subject == "") == (a.Service == "") {
+			return fmt.Errorf("access[%d]: exactly one of subject and service is required", i)
+		}
+		if _, ok := grant.LookupResourceKind(a.Resource.Kind); !ok || a.Resource.Name == "" {
+			return fmt.Errorf("access[%d]: resource %q:%q is not a resource of a known kind", i, a.Resource.Kind, a.Resource.Name)
+		}
+		if a.Relation != grant.RelationReader && a.Relation != grant.RelationWriter {
+			return fmt.Errorf("access[%d]: relation %q: want %s or %s", i, a.Relation, grant.RelationReader, grant.RelationWriter)
+		}
+		b, err := newBounds(a.Clusters, a.ExpiresAt)
+		if err != nil {
+			return fmt.Errorf("access[%d]: %w", i, err)
+		}
+		snap.access = append(snap.access, access{
+			subject: a.Subject, service: a.Service, kind: a.Resource.Kind, name: a.Resource.Name, relation: a.Relation, bounds: b,
+		})
+	}
+	return nil
 }
 
 // Token returns the snapshot's consistency token.
@@ -355,15 +442,11 @@ func convert(in []Assignment, source string) ([]assignment, error) {
 		if a.Name == "" {
 			return nil, fmt.Errorf("grants[%d]: name is required", i)
 		}
-		conv := assignment{grant: a.Name, source: source, clusters: append([]string(nil), a.Clusters...)}
-		if a.ExpiresAt != "" {
-			t, err := time.Parse(time.RFC3339, a.ExpiresAt)
-			if err != nil {
-				return nil, fmt.Errorf("grant %q: expiresAt: %w", a.Name, err)
-			}
-			conv.expiresAt = t
+		b, err := newBounds(a.Clusters, a.ExpiresAt)
+		if err != nil {
+			return nil, fmt.Errorf("grant %q: %w", a.Name, err)
 		}
-		out = append(out, conv)
+		out = append(out, assignment{grant: a.Name, source: source, bounds: b})
 	}
 	return out, nil
 }
@@ -449,20 +532,76 @@ func (s *Store) Check(ctx context.Context, subject authz.Subject, grant string, 
 }
 
 func (a assignment) evaluate(cluster string, now time.Time) (string, bool) {
-	prefix := "grant " + a.grant + " via " + a.source + ": "
-	if len(a.clusters) > 0 {
-		in := false
-		for _, c := range a.clusters {
-			if c == cluster {
-				in = true
-			}
-		}
-		if !in {
-			return prefix + "not for cluster " + cluster, false
-		}
+	return a.bounds.evaluate("grant "+a.grant+" via "+a.source+": ", cluster, now)
+}
+
+// evaluate says whether the bounds hold in cluster at now, with the trace
+// line that says why, after prefix.
+func (b bounds) evaluate(prefix, cluster string, now time.Time) (string, bool) {
+	if len(b.clusters) > 0 && !slices.Contains(b.clusters, cluster) {
+		return prefix + "not for cluster " + cluster, false
 	}
-	if !a.expiresAt.IsZero() && !now.Before(a.expiresAt) {
-		return prefix + "expired at " + a.expiresAt.UTC().Format(time.RFC3339), false
+	if !b.expiresAt.IsZero() && !now.Before(b.expiresAt) {
+		return prefix + "expired at " + b.expiresAt.UTC().Format(time.RFC3339), false
 	}
 	return prefix + "active", true
+}
+
+// LookupResources implements authz.ResourceLookup: the resources of the
+// kind the subject's own access and its service's give the permission on,
+// in the subject's cluster and at the store's clock, as its grants are
+// evaluated. A suspended subject holds none.
+func (s *Store) LookupResources(ctx context.Context, subject authz.Subject, kind, permission string, c authz.Consistency) (authz.Resources, error) {
+	if err := ctx.Err(); err != nil {
+		return authz.Resources{}, err
+	}
+	snap, err := s.snapshot(c)
+	if err != nil {
+		return authz.Resources{}, err
+	}
+	relations, ok := grant.RelationsOf(permission)
+	if _, known := grant.LookupResourceKind(kind); !ok || !known {
+		return authz.Resources{}, fmt.Errorf("static: lookup %s#%s: unknown kind or permission", kind, permission)
+	}
+	var service string
+	if w, ok := snap.workloads[subject.ID]; ok {
+		if w.suspended {
+			return authz.Resources{}, fmt.Errorf("%w: %s", authz.ErrSubjectSuspended, subject.ID)
+		}
+		service = w.service
+	}
+	r := authz.Resources{Token: snap.token}
+	now := s.now()
+	held := map[string]bool{}
+	for _, a := range snap.access {
+		via, ok := a.heldBy(subject.ID, service)
+		if !ok || a.kind != kind || !slices.Contains(relations, a.relation) {
+			continue
+		}
+		line, active := a.bounds.evaluate(kind+" "+a.name+" "+a.relation+" via "+via+": ", subject.Cluster, now)
+		r.Trace = append(r.Trace, line)
+		if active {
+			held[a.name] = true
+		}
+	}
+	for name := range held {
+		r.Names = append(r.Names, name)
+	}
+	sort.Strings(r.Names)
+	if len(r.Names) == 0 {
+		r.Trace = append(r.Trace, "subject "+subject.ID+" holds "+permission+" on no "+kind)
+	}
+	return r, nil
+}
+
+// heldBy says whether the access is the subject's, directly or through its
+// service, and which.
+func (a access) heldBy(subject, service string) (string, bool) {
+	switch {
+	case a.subject != "" && a.subject == subject:
+		return "workload", true
+	case a.service != "" && a.service == service:
+		return "service " + service, true
+	}
+	return "", false
 }

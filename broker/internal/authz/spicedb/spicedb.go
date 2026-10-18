@@ -16,10 +16,16 @@
 // at_least_as_fresh with the token as the zedtoken SpiceDB minted earlier.
 // Tokens are zedtokens verbatim.
 //
+// LookupResources (Level 3) is SpiceDB's LookupResources on the resource's
+// object type (s3_bucket) and permission (read, write), with the same
+// caveat context, after the same suspension check; the object IDs it
+// returns are decoded back to resource names with common/idenc.
+//
 // Watch maps SpiceDB's Watch stream to assignment changes: an assignment to
-// a workload names its subject and grant; everything else (an assignment to
-// a service, a membership, an ownership, a suspension) invalidates every
-// cached session. The stream is never reconnected here: the cache does that
+// a workload names its subject and grant, and a workload's relation to a
+// resource its subject; everything else (an assignment to a service, a
+// membership, an ownership, a suspension, a service's relation to a
+// resource) invalidates every cached session. The stream is never reconnected here: the cache does that
 // from the last token.
 package spicedb
 
@@ -30,12 +36,15 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sort"
 	"time"
 
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 	"github.com/bpalermo/cracha/broker/internal/authz"
+	"github.com/bpalermo/cracha/common/idenc"
 	schema "github.com/bpalermo/cracha/common/spicedb"
+	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -69,8 +78,8 @@ func WithLogger(log *slog.Logger) Option {
 	}
 }
 
-// Store is the SpiceDB backend. It implements authz.Store and
-// authz.Watcher.
+// Store is the SpiceDB backend. It implements authz.Store,
+// authz.ResourceLookup and authz.Watcher.
 type Store struct {
 	perms   v1.PermissionsServiceClient
 	watcher v1.WatchServiceClient
@@ -219,6 +228,80 @@ func (s *Store) lookupGrants(ctx context.Context, subject authz.Subject, consist
 	return nil
 }
 
+// LookupResources implements authz.ResourceLookup.
+func (s *Store) LookupResources(ctx context.Context, subject authz.Subject, kind, permission string, c authz.Consistency) (authz.Resources, error) {
+	if !slices.Contains(schema.ResourceTypes, kind) || (permission != schema.PermissionRead && permission != schema.PermissionWrite) {
+		return authz.Resources{}, fmt.Errorf("spicedb: lookup %s#%s: not a resource type and permission of the schema", kind, permission)
+	}
+	consistency, err := consistencyOf(c)
+	if err != nil {
+		return authz.Resources{}, err
+	}
+	var d authz.Decision
+	if err := s.checkSuspended(ctx, subject, consistency, &d); err != nil {
+		return authz.Resources{}, err
+	}
+	r := authz.Resources{Token: d.Token}
+	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+	stream, err := s.perms.LookupResources(ctx, &v1.LookupResourcesRequest{
+		Consistency:        consistency,
+		ResourceObjectType: kind,
+		Permission:         permission,
+		Subject:            workloadSubject(subject),
+		Context:            s.caveatContext(subject),
+	})
+	if err != nil {
+		return authz.Resources{}, fmt.Errorf("spicedb: lookup %s#%s of %s: %w", kind, permission, subject.ID, err)
+	}
+	held, err := readResources(stream, &r)
+	if err != nil {
+		return authz.Resources{}, fmt.Errorf("spicedb: lookup %s#%s of %s: %w", kind, permission, subject.ID, err)
+	}
+	r.Names = sortedKeys(held)
+	for _, name := range r.Names {
+		r.Trace = append(r.Trace, kind+" "+name+": "+permission)
+	}
+	if len(r.Names) == 0 {
+		r.Names = nil
+		r.Trace = append(r.Trace, "subject "+subject.ID+" holds "+permission+" on no "+kind)
+	}
+	return r, nil
+}
+
+// readResources reads a lookup's stream to its end: the resource names,
+// with the latest token in r.
+func readResources(stream grpc.ServerStreamingClient[v1.LookupResourcesResponse], r *authz.Resources) (map[string]bool, error) {
+	held := map[string]bool{}
+	for {
+		resp, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return held, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		name, err := resourceName(resp)
+		if err != nil {
+			return nil, err
+		}
+		held[name] = true
+		if t := tokenOf(resp.GetLookedUpAt()); t != "" {
+			r.Token = t
+		}
+	}
+}
+
+// resourceName is the resource name a lookup result stands for; a
+// conditional result (caveat context missing) or an ID common/idenc did
+// not make is an error.
+func resourceName(resp *v1.LookupResourcesResponse) (string, error) {
+	if resp.GetPermissionship() != v1.LookupPermissionship_LOOKUP_PERMISSIONSHIP_HAS_PERMISSION {
+		return "", fmt.Errorf("resource %s is %s (caveat context missing?)", resp.GetResourceObjectId(), resp.GetPermissionship())
+	}
+	return idenc.ParseResource(resp.GetResourceObjectId())
+}
+
 // tagsOf sets the service and team tags: the one service the subject is a
 // member of, and that service's owner. A subject in several services gets
 // neither tag.
@@ -298,7 +381,7 @@ func (s *Store) Watch(ctx context.Context, since authz.Token) (<-chan authz.Chan
 	if s.watcher == nil {
 		return nil, errors.New("spicedb: watch: no watch client")
 	}
-	req := &v1.WatchRequest{OptionalObjectTypes: []string{schema.TypeGrant, schema.TypeService, schema.TypeWorkload}}
+	req := &v1.WatchRequest{OptionalObjectTypes: append([]string{schema.TypeGrant, schema.TypeService, schema.TypeWorkload}, schema.ResourceTypes...)}
 	if since != "" {
 		req.OptionalStartCursor = &v1.ZedToken{Token: string(since)}
 	}
@@ -349,7 +432,12 @@ func changeOf(rel *v1.Relationship, token authz.Token) (authz.Change, bool) {
 			Grant:   resource.GetObjectId(),
 			Token:   token,
 		}, true
-	case resource.GetObjectType() == schema.TypeGrant && relation == schema.RelationAssigneeService,
+	case slices.Contains(schema.ResourceTypes, resource.GetObjectType()) && rel.GetSubject().GetObject().GetObjectType() == schema.TypeWorkload:
+		// A workload's relation to a resource: its sessions, whatever
+		// their grants, since any lookup grant of the kind may change.
+		return authz.Change{Subject: authz.Subject{ID: rel.GetSubject().GetObject().GetObjectId()}, Token: token}, true
+	case slices.Contains(schema.ResourceTypes, resource.GetObjectType()),
+		resource.GetObjectType() == schema.TypeGrant && relation == schema.RelationAssigneeService,
 		resource.GetObjectType() == schema.TypeService && (relation == schema.RelationMember || relation == schema.RelationOwner),
 		resource.GetObjectType() == schema.TypeWorkload && relation == schema.RelationSuspended:
 		return authz.Change{Token: token}, true
