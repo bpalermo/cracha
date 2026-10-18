@@ -12,6 +12,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// What the webhook injects for enrolment in init mode (docs/design.md,
+// section 7.2; agent/enrolapi is the contract): the init container, its
+// token volume and the variables it reads, with the chart's defaults.
+const (
+	enrolVolume        = "cracha-enrol"
+	enrolTokenDir      = "/var/run/secrets/cracha.dev/enrol"
+	enrolTokenFile     = enrolTokenDir + "/token"
+	enrolTokenAudience = "cracha-agent"
+	enrolPort          = "9798"
+	enrolTimeout       = "2m0s"
+)
+
 // sleeper is a pod that does nothing, for looking at what admission made of
 // it.
 func sleeper(name, serviceAccount string, env ...corev1.EnvVar) *corev1.Pod {
@@ -41,28 +53,137 @@ func envValue(c corev1.Container, name string) (string, bool) {
 	return "", false
 }
 
-func hasVolume(pod *corev1.Pod) (corev1.Volume, bool) {
+func findVolume(pod *corev1.Pod, name string) (corev1.Volume, bool) {
 	for _, v := range pod.Spec.Volumes {
-		if v.Name == volumeName {
+		if v.Name == name {
 			return v, true
 		}
 	}
 	return corev1.Volume{}, false
 }
 
-func hasMount(c corev1.Container) (corev1.VolumeMount, bool) {
+func findMount(c corev1.Container, volume string) (corev1.VolumeMount, bool) {
 	for _, m := range c.VolumeMounts {
-		if m.Name == volumeName {
+		if m.Name == volume {
 			return m, true
 		}
 	}
 	return corev1.VolumeMount{}, false
 }
 
-// The webhook (docs/design.md, section 7.4): a pod of an enabled
-// ServiceAccount gets the volume and the environment in every container, a
-// pod of any other ServiceAccount is left alone, and a pod that brings its
-// own AWS credentials is refused.
+// workloadContainers is every container of the pod that the pod itself
+// declared: all of them but the enrolment init container.
+func workloadContainers(pod *corev1.Pod) []corev1.Container {
+	var out []corev1.Container
+	for _, c := range append(pod.Spec.InitContainers, pod.Spec.Containers...) {
+		if c.Name != enrolContainer {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// checkWired asserts the wiring of design 7.5 that both enrolment modes
+// share: the label, and in every container the loopback endpoint and the
+// region, with no token file and nothing mounted for the app.
+func checkWired(t *testing.T, pod *corev1.Pod) {
+	t.Helper()
+	if pod.Labels[enrolLabel] != "true" {
+		t.Errorf("labels = %v, want %s=true", pod.Labels, enrolLabel)
+	}
+	for _, c := range workloadContainers(pod) {
+		for name, want := range map[string]string{
+			"AWS_CONTAINER_CREDENTIALS_FULL_URI": credentialsURI,
+			"AWS_REGION":                         region,
+		} {
+			if v, ok := envValue(c, name); !ok || v != want {
+				t.Errorf("container %q: %s = %q (set %t), want %q", c.Name, name, v, ok, want)
+			}
+		}
+		for _, e := range c.Env {
+			if strings.HasPrefix(e.Name, "AWS_CONTAINER_AUTHORIZATION") {
+				t.Errorf("container %q got %s=%q; the pod holds no token", c.Name, e.Name, e.Value)
+			}
+		}
+		if _, ok := findMount(c, enrolVolume); ok {
+			t.Errorf("container %q mounts the %q volume; only the enrolment init container may", c.Name, enrolVolume)
+		}
+	}
+}
+
+// checkEnrolInjected asserts the init mode's enrolment: the init container
+// first in the list, from the agent's image, with the environment the
+// agent's `enrol` reads, and its projected token mounted into it alone.
+func checkEnrolInjected(ctx context.Context, t *testing.T, pod *corev1.Pod) {
+	t.Helper()
+	if len(pod.Spec.InitContainers) == 0 || pod.Spec.InitContainers[0].Name != enrolContainer {
+		t.Fatalf("init containers = %+v, want %s first", pod.Spec.InitContainers, enrolContainer)
+	}
+	c := pod.Spec.InitContainers[0]
+	if want := agentImage(ctx, t); c.Image != want {
+		t.Errorf("%s image = %q, want the agent's, %q", enrolContainer, c.Image, want)
+	}
+	if len(c.Args) != 1 || c.Args[0] != "enrol" {
+		t.Errorf("%s args = %v, want [enrol]", enrolContainer, c.Args)
+	}
+	for name, want := range map[string]string{
+		"CRACHA_ENROL_PORT":       enrolPort,
+		"CRACHA_AGENT_PORT":       fmt.Sprint(agentPort),
+		"CRACHA_ENROL_TIMEOUT":    enrolTimeout,
+		"CRACHA_ENROL_TOKEN_FILE": enrolTokenFile,
+	} {
+		if v, ok := envValue(c, name); !ok || v != want {
+			t.Errorf("%s: %s = %q (set %t), want %q", enrolContainer, name, v, ok, want)
+		}
+	}
+	hostIP := false
+	for _, e := range c.Env {
+		if e.Name == "CRACHA_HOST_IP" && e.ValueFrom != nil && e.ValueFrom.FieldRef != nil && e.ValueFrom.FieldRef.FieldPath == "status.hostIP" {
+			hostIP = true
+		}
+	}
+	if !hostIP {
+		t.Errorf("%s env = %+v, want CRACHA_HOST_IP from status.hostIP", enrolContainer, c.Env)
+	}
+	if m, ok := findMount(c, enrolVolume); !ok || m.MountPath != enrolTokenDir || !m.ReadOnly {
+		t.Errorf("%s mounts %+v, want %q read-only at %s", enrolContainer, c.VolumeMounts, enrolVolume, enrolTokenDir)
+	}
+	if c.SecurityContext == nil || c.SecurityContext.RunAsNonRoot == nil || !*c.SecurityContext.RunAsNonRoot {
+		t.Errorf("%s security context = %+v, want non-root", enrolContainer, c.SecurityContext)
+	}
+	v, ok := findVolume(pod, enrolVolume)
+	if !ok {
+		t.Fatalf("no %q volume; volumes: %+v", enrolVolume, pod.Spec.Volumes)
+	}
+	if v.Projected == nil || len(v.Projected.Sources) != 1 || v.Projected.Sources[0].ServiceAccountToken == nil {
+		t.Fatalf("volume %q = %+v, want one projected ServiceAccount token", enrolVolume, v.VolumeSource)
+	}
+	tok := v.Projected.Sources[0].ServiceAccountToken
+	if tok.Audience != enrolTokenAudience || tok.ExpirationSeconds == nil || *tok.ExpirationSeconds != 600 || tok.Path != "token" {
+		t.Errorf("projected token = %+v, want audience %s, 600 s, path token", tok, enrolTokenAudience)
+	}
+}
+
+// checkNothingEnrolInjected asserts the cni mode's pod spec: nothing but
+// the variables and the label entered it.
+func checkNothingEnrolInjected(t *testing.T, pod *corev1.Pod) {
+	t.Helper()
+	for _, c := range pod.Spec.InitContainers {
+		if c.Name == enrolContainer {
+			t.Errorf("init container %q was injected in cni mode", enrolContainer)
+		}
+	}
+	if _, ok := findVolume(pod, enrolVolume); ok {
+		t.Errorf("volume %q was injected in cni mode", enrolVolume)
+	}
+}
+
+// The webhook (docs/design.md, section 7.5): a pod of an enabled
+// ServiceAccount gets the label, the loopback endpoint and the region in
+// every container and, in init mode, the enrolment init container; a pod
+// of any other ServiceAccount is left alone; a pod that brings its own AWS
+// credentials, runs in the host's network or carries the enrolment
+// container's name is refused.
 func TestWebhookWiresEnabledPods(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -75,48 +196,30 @@ func TestWebhookWiresEnabledPods(t *testing.T) {
 			Command: []string{"true"},
 		}}
 		got := mustCreatePod(ctx, t, pod)
-
-		if got.Annotations["cracha.dev/injected"] != "true" {
-			t.Errorf("annotations = %v, want cracha.dev/injected=true", got.Annotations)
+		checkWired(t, got)
+		if n := len(workloadContainers(got)); n != 2 {
+			t.Errorf("the pod's own containers = %d, want its init container and its container", n)
 		}
-		v, ok := hasVolume(got)
-		if !ok {
-			t.Fatalf("no %q volume; volumes: %+v", volumeName, got.Spec.Volumes)
-		}
-		if v.CSI == nil || v.CSI.Driver != driverName || v.CSI.ReadOnly == nil || !*v.CSI.ReadOnly {
-			t.Errorf("volume %q = %+v, want a read-only %s CSI volume", volumeName, v.VolumeSource, driverName)
-		}
-		for _, c := range append(got.Spec.InitContainers, got.Spec.Containers...) {
-			m, ok := hasMount(c)
-			if !ok {
-				t.Errorf("container %q has no %q mount", c.Name, volumeName)
-			} else if m.MountPath != mountPath || !m.ReadOnly {
-				t.Errorf("container %q mounts %q at %s read-only=%t, want %s read-only", c.Name, volumeName, m.MountPath, m.ReadOnly, mountPath)
-			}
-			for name, want := range map[string]string{
-				"AWS_CONTAINER_CREDENTIALS_FULL_URI":     credentialsURI,
-				"AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": tokenPath,
-				"AWS_REGION":                             region,
-			} {
-				if v, ok := envValue(c, name); !ok || v != want {
-					t.Errorf("container %q: %s = %q (set %t), want %q", c.Name, name, v, ok, want)
-				}
-			}
+		switch enrolMode() {
+		case enrolInit:
+			checkEnrolInjected(ctx, t, got)
+		case enrolCNI:
+			checkNothingEnrolInjected(t, got)
 		}
 	})
 
 	t.Run("not enabled", func(t *testing.T) {
 		got := mustCreatePod(ctx, t, sleeper("plain", "default"))
-		if _, ok := got.Annotations["cracha.dev/injected"]; ok {
-			t.Errorf("annotations = %v, want no cracha.dev/injected", got.Annotations)
+		if _, ok := got.Labels[enrolLabel]; ok {
+			t.Errorf("labels = %v, want no %s", got.Labels, enrolLabel)
 		}
-		if _, ok := hasVolume(got); ok {
-			t.Errorf("a %q volume was injected into a pod of the default ServiceAccount", volumeName)
+		if len(got.Spec.InitContainers) != 0 {
+			t.Errorf("init containers = %+v, want none", got.Spec.InitContainers)
+		}
+		if _, ok := findVolume(got, enrolVolume); ok {
+			t.Errorf("a %q volume was injected into a pod of the default ServiceAccount", enrolVolume)
 		}
 		for _, c := range got.Spec.Containers {
-			if _, ok := hasMount(c); ok {
-				t.Errorf("container %q got a %q mount", c.Name, volumeName)
-			}
 			if len(c.Env) != 0 {
 				t.Errorf("container %q got env %v", c.Name, c.Env)
 			}
@@ -134,16 +237,48 @@ func TestWebhookWiresEnabledPods(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("host network is refused", func(t *testing.T) {
+		pod := sleeper("hostnet", assignedSA)
+		pod.Spec.HostNetwork = true
+		_, err := createPod(ctx, pod)
+		if err == nil {
+			t.Fatal("a pod with hostNetwork was admitted; its listener would serve the whole node (design 7.1)")
+		}
+		for _, want := range []string{"pods.cracha.dev", "hostNetwork"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal %q does not mention %q", err, want)
+			}
+		}
+	})
+
+	t.Run("the enrolment container's name is reserved", func(t *testing.T) {
+		pod := sleeper("reserved", assignedSA)
+		pod.Spec.InitContainers = []corev1.Container{{
+			Name:    enrolContainer,
+			Image:   busybox,
+			Command: []string{"true"},
+		}}
+		_, err := createPod(ctx, pod)
+		if err == nil {
+			t.Fatalf("a pod carrying its own %q init container was admitted", enrolContainer)
+		}
+		for _, want := range []string{"pods.cracha.dev", enrolContainer, "reserved"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal %q does not mention %q", err, want)
+			}
+		}
+	})
 }
 
-// The per-namespace region override (docs/design.md, section 7.4): a pod of
+// The per-namespace region override (docs/design.md, section 7.5): a pod of
 // a namespace annotated cracha.dev/region gets that region, a pod of the e2e
 // namespace keeps the chart's webhook.defaultRegion, and an annotation that
 // is not a region refuses the namespace's pods. The namespace is the test's
 // own, wired like the e2e namespace (an enabled ServiceAccount of the same
 // name) and deleted after. Only admission is exercised: e2e/spire.sh
-// registers no identity for it, so its pods never start, and the injection
-// is read from the pod as the apiserver persisted it.
+// registers no identity for it, so its pods get no credentials, and the
+// injection is read from the pod as the apiserver persisted it.
 func TestWebhookNamespaceRegion(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
@@ -207,11 +342,11 @@ func TestWebhookNamespaceRegion(t *testing.T) {
 		if err != nil {
 			t.Fatalf("no pod of namespace %s got the annotated region: %v", regionNamespace, err)
 		}
-		if got.Annotations["cracha.dev/injected"] != "true" {
-			t.Errorf("annotations = %v, want cracha.dev/injected=true", got.Annotations)
+		if got.Labels[enrolLabel] != "true" {
+			t.Errorf("labels = %v, want %s=true; the override must not change the rest of the wiring", got.Labels, enrolLabel)
 		}
-		if _, ok := hasVolume(got); !ok {
-			t.Errorf("no %q volume; the override must not change the rest of the wiring", volumeName)
+		if v, _ := envValue(got.Spec.Containers[0], "AWS_CONTAINER_CREDENTIALS_FULL_URI"); v != credentialsURI {
+			t.Errorf("AWS_CONTAINER_CREDENTIALS_FULL_URI = %q, want %q", v, credentialsURI)
 		}
 	})
 
