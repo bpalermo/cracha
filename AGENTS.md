@@ -29,6 +29,7 @@ e2e/run.sh                      # the whole system in a kind cluster
 E2E_AUTHZ=spicedb e2e/run.sh    # with SpiceDB as the authorization backend
 E2E_FILTER=TestName e2e/run.sh  # only the tests whose name matches
 E2E_KEEP_CLUSTER=1 e2e/run.sh   # leave the cluster up to look around
+E2E_CHART=0.1.0 e2e/run.sh      # a published chart and its images, not the checkout's
 ```
 
 Needs docker, kind and kubectl; helm comes from Bazel. The suite in `e2e/` is
@@ -58,9 +59,21 @@ digest; CI's `e2e` job gives `helm/kind-action` the same file and pins the
 kind release it is the default of. To move to another Kubernetes, write the
 image for that minor from the kind release notes into the file and the kind
 release into `ci.yml`; a kept cluster made from the old image is reused as
-is until it is deleted. Every change that adds user-visible behaviour
-extends the suite, and a change to how Crachá is deployed goes in the
-chart, not in a manifest.
+is until it is deleted.
+`E2E_CHART=<version>` runs the suite against a published chart instead of
+the one built from the checkout: run.sh pulls
+`oci://$(bazel/registry.sh chart-ref cracha)` at that version with the
+pinned helm, installs it with the images it pins (the node pulls them from
+the registry; the checkout's broker, csi and webhook images are neither
+built nor loaded and `values-local.yaml` is not passed) and prints the
+chart's digest and its image pins first, so the log says what was tested.
+The suite, SPIRE, the bundle, the STS stand-in and the suite's own images
+still come from the checkout, so run it from the commit whose suite
+matches the chart. The `e2e-published` workflow
+(`.github/workflows/e2e-published.yml`, run by hand with the chart version
+and the backend) does the same in a kind cluster on a runner. Every change
+that adds user-visible behaviour extends the suite, and a change to how
+Crachá is deployed goes in the chart, not in a manifest.
 
 Bazel is the only build. Never run the host `go` tool: not `go mod tidy`, not
 `go get`, not `go test`. Change a Go dependency through rules_go's SDK:
@@ -272,7 +285,10 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   the images under the mutable tag `dev` and the immutable `dev-<commit>`.
 - A release is a tag `v<VERSION>` on a commit of `main`, pushed by a person.
   Cut a candidate first, `v<VERSION>-rc.<n>`, since the tag path of the
-  workflow runs only on a real tag. The tag publishes the images under
+  workflow runs only on a real tag, and check what it published before the
+  real tag: run the `e2e-published` workflow from the candidate's commit
+  with the candidate's chart version (`<VERSION>-rc.<n>`, what its `check`
+  job reports as `CHART_VERSION`), once per backend. The tag publishes the images under
   `v<VERSION>` (and `v<VERSION>-<commit>`), the chart as `<VERSION>`, signs
   them, and once `check` passes creates the GitHub Release with the pinned
   references and the `cosign verify` command in its notes. A tag that is not
