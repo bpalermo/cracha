@@ -39,6 +39,17 @@
 // ever produced by the escape itself, so the encoding is injective and the
 // original can be recovered by reversing it. The result must be at most 1024
 // characters; a longer one is an error rather than a truncation.
+//
+// # Resource encoding
+//
+// [Resource] returns the authorization-store object ID of a resource that a
+// workload is related to by name (design 6.4, Level 3): an S3 bucket, a
+// DynamoDB table. Resource names may carry characters the store's object ID
+// charset lacks (a bucket name may hold "."), so the name is escaped with
+// the subject encoding's component rule: every byte outside [A-Za-z0-9-]
+// becomes "_" and its two lower-case hex digits ("my.bucket" is
+// "my_2ebucket"). [ParseResource] reverses it. The kind of the resource is
+// the object type, not part of the ID.
 package idenc
 
 import (
@@ -296,4 +307,36 @@ func unhex(c byte) int {
 	default:
 		return -1
 	}
+}
+
+// Resource returns the authorization-store object ID of a resource name
+// (see the package doc). It fails on an empty name and when the result
+// would exceed [AuthzMaxLen].
+func Resource(name string) (string, error) {
+	if name == "" {
+		return "", errors.New("idenc: empty resource name")
+	}
+	s := escape(name)
+	if len(s) > AuthzMaxLen {
+		return "", fmt.Errorf("idenc: resource ID for %q is %d characters, over %d", name, len(s), AuthzMaxLen)
+	}
+	return s, nil
+}
+
+// ParseResource returns the resource name an object ID made by [Resource]
+// stands for. An ID that [Resource] would not have made (an escape of a
+// byte that needs none, an upper-case hex digit) is an error, so one name
+// has exactly one ID.
+func ParseResource(id string) (string, error) {
+	if id == "" {
+		return "", errors.New("idenc: empty resource ID")
+	}
+	name, err := UnescapeAuthzComponent(id)
+	if err != nil {
+		return "", err
+	}
+	if escape(name) != id {
+		return "", fmt.Errorf("idenc: resource ID %q is not in canonical form", id)
+	}
+	return name, nil
 }
