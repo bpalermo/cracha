@@ -43,7 +43,7 @@
         ],
         "env": [
           {
-            "name": "NODE_IP",
+            "name": "CRACHA_HOST_IP",
             "valueFrom": {
               "fieldRef": {
                 "fieldPath": "status.hostIP"
@@ -53,6 +53,10 @@
           {
             "name": "CRACHA_ENROL_PORT",
             "value": "8781"
+          },
+          {
+            "name": "CRACHA_AGENT_PORT",
+            "value": "8780"
           },
           {
             "name": "CRACHA_ENROL_TIMEOUT",

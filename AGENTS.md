@@ -165,8 +165,10 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   idempotency key) and, with `--enrol=init`, the `cracha-enrol` init
   container from `--agent-image` with its projected token (audience
   `cracha-agent`, at `mutate.EnrolTokenPath`, also in
-  `CRACHA_ENROL_TOKEN_FILE`; `NODE_IP`, `CRACHA_ENROL_PORT`,
-  `CRACHA_ENROL_TIMEOUT`); the golden pods of each mode are
+  `CRACHA_ENROL_TOKEN_FILE`; `CRACHA_HOST_IP`, `CRACHA_ENROL_PORT`,
+  `CRACHA_AGENT_PORT`, `CRACHA_ENROL_TIMEOUT`; every name is
+  `agent/enrolapi`'s, the one definition of the contract); the golden
+  pods of each mode are
   `internal/mutate/testdata/*.golden.json` (refresh with
   `--test_env=UPDATE_GOLDEN=1`). `internal/server` serves HTTPS with the
   `*tls.Config` it is given, which `main.go` builds from the webhook's

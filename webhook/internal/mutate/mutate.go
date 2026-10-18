@@ -16,6 +16,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/bpalermo/cracha/agent/enrolapi"
 )
 
 // Labels and annotations read and written by the webhook.
@@ -26,7 +28,8 @@ const (
 	// LabelCredentials on a pod, with the value "true", is the enrolment
 	// mark the agent checks before it binds a listener (design 7.2), and the
 	// webhook's idempotency key: a pod that carries it is left unchanged.
-	LabelCredentials = "cracha.dev/credentials"
+	// The agent owns the contract (agent/enrolapi).
+	LabelCredentials = enrolapi.Label
 	// AnnotationStrippedEnv records, as a JSON list of StrippedEnv, the
 	// variables the strip policy removed from a pod.
 	AnnotationStrippedEnv = "cracha.dev/stripped-env"
@@ -49,38 +52,41 @@ const (
 )
 
 // Enrolment in the init mode (design 7.2): the init container, its token
-// volume and the variables it reads.
+// volume and the variables it reads. Every name the agent reads comes from
+// agent/enrolapi, the one definition of the contract.
 const (
 	// EnrolContainerName is the init container the webhook injects first in
 	// the list; a pod that carries one of this name without the label is
 	// refused.
-	EnrolContainerName = "cracha-enrol"
+	EnrolContainerName = enrolapi.InitContainerName
 	// EnrolVolumeName is the projected token volume, mounted into that
 	// container only.
 	EnrolVolumeName = "cracha-enrol"
 	// EnrolTokenAudience is the audience of the projected token, which the
 	// agent's TokenReview checks.
-	EnrolTokenAudience = "cracha-agent"
+	EnrolTokenAudience = enrolapi.Audience
 	// EnrolTokenExpirationSeconds is the shortest lifetime the API allows
 	// for a projected token.
 	EnrolTokenExpirationSeconds = 600
-	// EnrolTokenDir is where the volume is mounted in the init container and
-	// EnrolTokenPath the token in it: the path the agent's `enrol` reads,
-	// also handed to it as CRACHA_ENROL_TOKEN_FILE.
-	EnrolTokenDir  = "/var/run/secrets/cracha.dev/enrol"
+	// EnrolTokenPath is the token's path, the one the agent's `enrol` reads
+	// by default and is also handed as CRACHA_ENROL_TOKEN_FILE;
+	// EnrolTokenDir is where the volume is mounted in the init container
+	// and EnrolTokenFile the token in it.
+	EnrolTokenPath = enrolapi.DefaultTokenFile
 	EnrolTokenFile = "token"
-	EnrolTokenPath = EnrolTokenDir + "/" + EnrolTokenFile
+	EnrolTokenDir  = "/var/run/secrets/cracha.dev/enrol"
 	// EnrolArg is the agent image's subcommand the init container runs; the
 	// image's entrypoint is the agent binary.
 	EnrolArg = "enrol"
 
 	// The init container's environment: the node's address from the
-	// downward API, the agent's enrolment port, how long to retry, and the
-	// token's path.
-	EnvNodeIP         = "NODE_IP"
-	EnvEnrolPort      = "CRACHA_ENROL_PORT"
-	EnvEnrolTimeout   = "CRACHA_ENROL_TIMEOUT"
-	EnvEnrolTokenFile = "CRACHA_ENROL_TOKEN_FILE"
+	// downward API, the agent's enrolment port, the loopback listener's port
+	// it confirms before exiting, how long to retry, and the token's path.
+	EnvHostIP         = enrolapi.EnvHostIP
+	EnvEnrolPort      = enrolapi.EnvEnrolPort
+	EnvAgentPort      = enrolapi.EnvPort
+	EnvEnrolTimeout   = enrolapi.EnvTimeout
+	EnvEnrolTokenFile = enrolapi.EnvTokenFile
 
 	// enrolUID is distroless's nonroot user, which the agent image runs as.
 	enrolUID int64 = 65532

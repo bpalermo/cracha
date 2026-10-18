@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -786,10 +787,10 @@ func TestEnrolContainer(t *testing.T) {
 	for _, e := range c.Env {
 		got[e.Name] = e
 	}
-	if e := got[EnvNodeIP]; e.ValueFrom == nil || e.ValueFrom.FieldRef == nil || e.ValueFrom.FieldRef.FieldPath != "status.hostIP" {
-		t.Errorf("%s = %+v, want status.hostIP from the downward API", EnvNodeIP, e)
+	if e := got[EnvHostIP]; e.ValueFrom == nil || e.ValueFrom.FieldRef == nil || e.ValueFrom.FieldRef.FieldPath != "status.hostIP" {
+		t.Errorf("%s = %+v, want status.hostIP from the downward API", EnvHostIP, e)
 	}
-	for name, want := range map[string]string{EnvEnrolPort: "8781", EnvEnrolTimeout: "30s", EnvEnrolTokenFile: EnrolTokenPath} {
+	for name, want := range map[string]string{EnvEnrolPort: "8781", EnvAgentPort: strconv.Itoa(pl.cfg.AgentPort), EnvEnrolTimeout: "30s", EnvEnrolTokenFile: EnrolTokenPath} {
 		if got[name].Value != want {
 			t.Errorf("%s = %q, want %q", name, got[name].Value, want)
 		}

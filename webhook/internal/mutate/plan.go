@@ -183,10 +183,11 @@ func (p *planner) enrolContainer() corev1.Container {
 		Image: p.cfg.AgentImage,
 		Args:  []string{EnrolArg},
 		Env: []corev1.EnvVar{
-			{Name: EnvNodeIP, ValueFrom: &corev1.EnvVarSource{
+			{Name: EnvHostIP, ValueFrom: &corev1.EnvVarSource{
 				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.hostIP"},
 			}},
 			{Name: EnvEnrolPort, Value: strconv.Itoa(p.cfg.EnrolPort)},
+			{Name: EnvAgentPort, Value: strconv.Itoa(p.cfg.AgentPort)},
 			{Name: EnvEnrolTimeout, Value: p.cfg.EnrolTimeout.String()},
 			{Name: EnvEnrolTokenFile, Value: EnrolTokenPath},
 		},

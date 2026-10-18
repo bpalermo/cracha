@@ -26,6 +26,9 @@ spec:
       priorityClassName: {{ . }}
       {{- end }}
       serviceAccountName: {{ include "cracha.name" . }}-agent
+      # The agent's pods live in the release namespace, which the webhook
+      # configuration's namespaceSelector leaves out: nothing wires them,
+      # and they do not depend on the webhook to start.
       # Design 7.8: host network, because the init-mode enrolment endpoint
       # listens on the node's address and the listeners the agent binds live
       # in pods' namespaces, not its own. Not the host PID namespace: it
