@@ -112,6 +112,7 @@ Several systems restrict characters, so one deterministic encoding, owned by a s
 |---|---|---|
 | STS `SourceIdentity`, `RoleSessionName` | `[\w+=,.@-]`, 2–64 chars | `w.<td-short>.<ns>.<sa>`; if >64 chars → `w.h.<sha256 base32 prefix>` |
 | Authz subject ID (SpiceDB object ID charset, the strictest backend considered) | `[a-zA-Z0-9/_\|\-=+]`, ≤1024 | `<td-short>/<ns>/<sa>` (no `.`/`:`; escape rule defined by the library) |
+| Authz resource ID (Level 3: an S3 bucket's or a DynamoDB table's object ID, same charset) | as the subject ID | the resource name with the subject encoding's component escape (`data.curated` → `data_2ecurated`); reversible, and an ID not in canonical form is refused when read back |
 | Session tags | standard tag charset | raw `ns`, `sa`, `cluster` values |
 
 The mapping (encoded → full SPIFFE ID) is logged at every issuance to keep audit reversible.
@@ -130,7 +131,7 @@ Shape-role trust policies name only the broker role (6.6), so workload identitie
 ### 6.1 Responsibilities split
 
 - **Grant bundle (Git, signed):** shapes (base roles and their ARN envelopes) and grants (policy templates with parameters). Answers *what*.
-- **Authorization store (pluggable, SpiceDB reference):** assignments of grants to services/workloads, service membership, ownership, temporary access. Answers *who*.
+- **Authorization store (pluggable, SpiceDB reference):** assignments of grants to services/workloads, service membership, ownership, temporary access, and which resources a workload may reach (Level 3). Answers *who*, and for a lookup grant *which resources*.
 
 ### 6.2 Grant definition (bundle)
 
@@ -143,7 +144,7 @@ spec:
   baseRole: arn:aws:iam::111122223333:role/broker/shape-dynamo-rw
   sessionPolicy:
     template: dynamo-table-rw
-    params: { tables: [ledger, ledger-outbox] }   # or resolved via the authz store (Level 3)
+    params: { tables: [ledger, ledger-outbox] }   # or a lookup (Level 3, below)
   managedPolicyArns: []            # escape hatch for large policies (max 10)
   sessionTags: { team: payments }
   duration: 3600                   # optional; default 1h, capped at 1h by role chaining
@@ -151,7 +152,7 @@ spec:
     - arn:aws:dynamodb:*:111122223333:table/payments-*
 ```
 
-Who holds a grant is recorded beside it, in the same tree, as a `kind: Service` (a team's workloads and the grants they share) and `kind: Assignment` (one workload's own grants, or its suspension) documents. They are not part of the bundle: the authorization store answers who holds what (6.1). For SpiceDB the `authz-reconciler` of 6.4 writes it there from these documents; for the static backend the compiler publishes them, beside the bundle, as the assignments document (below). They also let the composition lint (step 5) check what each workload will hold.
+Who holds a grant is recorded beside it, in the same tree, as a `kind: Service` (a team's workloads and the grants they share) and `kind: Assignment` (one workload's own grants, or its suspension) documents, and which resources a lookup grant reaches as `kind: Access` documents (below). They are not part of the bundle: the authorization store answers who holds what (6.1). For SpiceDB the `authz-reconciler` of 6.4 writes it there from these documents; for the static backend the compiler publishes them, beside the bundle, as the assignments document (below). They also let the composition lint (step 5) check what each workload will hold.
 
 ```yaml
 kind: Service
@@ -179,6 +180,39 @@ spec:
   suspended: false                 # true: the subject holds nothing until cleared
 ```
 
+A grant may leave one template parameter to the authorization store instead of naming its resources (Level 3 of 6.4): the parameter is a lookup, `{lookup: {kind: s3_bucket, permission: read}}`, and which buckets a workload may reach is a relationship, recorded in the tree as a `kind: Access` document. Grants then become generic per kind of access, and giving a workload one more bucket is an Access document, not a new grant.
+
+```yaml
+kind: Grant
+metadata:
+  name: bucket-read
+spec:
+  account: "111122223333"
+  baseRole: arn:aws:iam::111122223333:role/broker/shape-s3-read
+  sessionPolicy:
+    template: s3-object-read
+    params:
+      bucket: { lookup: { kind: s3_bucket, permission: read } }
+  envelope:                        # required: every bucket found must fall in it
+    - arn:aws:s3:::payments-*
+---
+kind: Access
+metadata:
+  name: payments-exports
+spec:
+  service: payments-api            # every member; or subject: prod/payments/ledger
+  resource: { kind: s3_bucket, name: payments-exports }
+  relation: reader                 # reader | writer
+  expiresAt: "2026-12-31T00:00:00Z"   # optional bounds, as on an Assignment
+  clusters: [prod-us-east-1]
+```
+
+- Kinds: `s3_bucket` and `dynamodb_table` (names checked by the kind's rules: S3's for buckets). Permissions: `read`, held through `reader` or `writer`, and `write`, through `writer` alone. A grant has at most one lookup parameter (a grant per kind of resource), and a template default is never a lookup.
+- Rendering: the broker asks the store which resources of the kind the workload holds the permission on (`LookupResources`, 6.3), sorts them and renders the template with them. A parameter the template declares as a `list` is the resources, rendered once; one declared as a `string` is rendered once per resource and the statements of the renderings are put together under one `Version`, so a template written for one bucket, as every template before lookups was, serves any number. A template rendered once per resource must not repeat a statement `Sid` (the lint refuses it).
+- Compiled maximum: the compiler renders the template for probe resources of the kind's longest name (63 characters for a bucket) and records in the bundle the most that fit the 2,048-character budget (`maxResources`); the broker refuses more with `policy_too_large`, and measures the real policy as for any grant. A template that does not fit one is refused.
+- At issuance every Resource of the rendered policy must match the grant's envelope, or the request is refused with `resource_outside_envelope`. A lookup grant for which the store finds no resource is left out of the composition, so the workload keeps its other grants; when that leaves no grant, the refusal is `no_resources`. The decision log names the resources each lookup grant was rendered with, and the trace the relations that gave them.
+- Lints: the kind and permission are known, the parameter is declared by the template, an envelope is set; per grant, the policy for one probe resource is validated by Access Analyzer (CheckNoNewAccess cannot run on probes, which no envelope names) and its other resources, those the template writes itself, are checked against the envelope; the composition lint (step 5) renders each lookup grant with the resources the tree's Access documents relate the subject to in each cluster scope, and checks them against the grant's envelope and maximum, leaving the grant out when there are none, as the broker does.
+
 A workload has exactly one shape, and its session policy is composed by the broker at issuance time from every grant currently assigned to it in the authorization store. Permissions therefore change by assignment, with no redeploy and no per-workload configuration. All grants assigned to one workload must share its shape; a mix of shapes is ambiguous and denied. There are no profiles: one workload, one shape, one credential source.
 
 CI (`grant-compiler`) pipeline:
@@ -194,7 +228,9 @@ The grant tree is a repository of its own, not this one. Its CI runs the pipelin
 One compilation is one published version, of two artifacts:
 
 - `bundle.json`, the grants: what each grant is.
-- `assignments.json`, who holds them, for the static backend (6.3): every Service with its team, members and bounded grants, and every subject's Assignments merged into one workload, suspended when any of them suspends it and holding each grant once, with the union of the bounds its Assignments give it. The mapping is one function (`grant.ResolveAssignments`), the same the reconciler writes SpiceDB from, so the two backends hold the same tree the same way; a union no single bound can express is refused by both.
+- `assignments.json`, who holds them, for the static backend (6.3): every Service with its team, members and bounded grants, and every subject's Assignments merged into one workload, suspended when any of them suspends it and holding each grant once, with the union of the bounds its Assignments give it; and `access`, every Access document's relation, those that relate one holder to one resource by one relation merged the same way. The mapping is one pair of functions (`grant.ResolveAssignments`, `grant.ResolveAccess`), the same the reconciler writes SpiceDB from, so the two backends hold the same tree the same way; a union no single bound can express is refused by both.
+
+Both documents are decoded strictly, so a field a broker does not know is a rejected version, never an ignored one. The lookup fields are therefore absent when unused: a tree without lookup grants compiles to a bundle without `lookup`, and one without Access documents to assignments without `access`, byte for byte (and version for version) what they were before them, which a broker that predates them keeps reading. A tree that uses them is refused by such a broker, which keeps its last good version: it could not render a lookup grant, and must not hand out the grant's shape without its policy.
 
 Both carry the version and `generatedAt`, both are canonical JSON, each is signed with the same envelope and key (`<file>.sig`), and the version, when none is given, is the content hash of both, so a change of assignments alone is a new version. The layout:
 
@@ -218,14 +254,14 @@ The broker depends only on this contract. Each backend is an adapter chosen by c
 |---|---|---|---|
 | Which grants does this workload hold? | ListGrants(subject, consistency) | grant list, ABAC tags such as service and team, a consistency token, a decision trace | yes |
 | Does this workload hold this grant? | Check(subject, grant, consistency) | allow/deny + consistency token; used to re-validate cached sessions grant by grant | yes |
-| Which resources of a kind may this workload use? | LookupResources(subject, kind, permission) | resource list, for Level 3 template filling | optional |
+| Which resources of a kind may this workload use? | LookupResources(subject, kind, permission, consistency) | resource names, a consistency token, a decision trace; for Level 3 template filling | yes for lookup grants: both backends implement it, and a broker whose store does not denies every lookup grant |
 | What changed since this token? | Watch(since) | stream of assignment changes, for cache invalidation | optional; without it the cache degrades to TTL-only invalidation |
 
 Rules:
 - Subject = the workload's authz encoding (4.3) plus the cluster the broker serves. The subject never carries anything the workload can set itself.
 - Consistency tokens are opaque outside the adapter. SpiceDB's zedToken is one implementation; a static backend may use a file hash. Callers may ask for minimize-latency or at-least-as-fresh(token).
 - Any failure to answer is a deny. Backends never fail open.
-- Time-bounded and cluster-bounded assignments are part of the model, not of one backend's caveat feature. A backend without native conditions evaluates them in its adapter.
+- Time-bounded and cluster-bounded assignments are part of the model, not of one backend's caveat feature. A backend without native conditions evaluates them in its adapter. So are resource relations (Level 3): a workload's own and its service's, with the same bounds, and nothing for a suspended workload. LookupResources answers with resource names (a bucket's name), never a backend's object IDs, and the parity test holds both backends to the same answers for direct and service relations, expired ones and those of another cluster.
 - Backends: `static` (assignments held in memory, for bootstrap, air-gapped or small fleets) and `spicedb` (reference). The static backend's assignments come from one of two sources (`--assignments-source`): `published`, the signed assignments document of the version the bundle source serves (6.2), swapped with its bundle, so that every cluster reading one publication holds the same assignments without a database; or `file`, a document of the install's own read once (development, single clusters). Its consistency token is the SHA-256 of the document it holds, so every swap is a new token, and its Watch reports every swap as a change of every subject (6.7). OpenFGA or a Cedar-based store would be further adapters, not design changes. The broker's `--authz-backend` chooses one: `static` is `broker/internal/authz/static`, `spicedb` is `broker/internal/authz/spicedb`, the adapter over 6.4.
 
 ### 6.4 Reference backend: SpiceDB
@@ -266,30 +302,37 @@ definition grant {
   permission assume = assignee_service->member + assignee_workload
 }
 
+definition s3_bucket {
+  relation reader: workload | workload with within_window | workload with in_clusters | workload with bounded | service#member | service#member with within_window | service#member with in_clusters | service#member with bounded
+  relation writer: workload | workload with within_window | workload with in_clusters | workload with bounded | service#member | service#member with within_window | service#member with in_clusters | service#member with bounded
+  permission write = writer
+  permission read = reader + writer
+}
+
 definition dynamodb_table {
-  relation account: aws_account
-  relation writer: service
-  relation reader: service
-  permission write = writer->member
-  permission read  = write + reader->member
+  relation reader: workload | workload with within_window | workload with in_clusters | workload with bounded | service#member | service#member with within_window | service#member with in_clusters | service#member with bounded
+  relation writer: workload | workload with within_window | workload with in_clusters | workload with bounded | service#member | service#member with within_window | service#member with in_clusters | service#member with bounded
+  permission write = writer
+  permission read = reader + writer
 }
 ```
 
 Why it is shaped so:
 - `workload#suspended` and `is_suspended` let SpiceDB express the suspension the contract reports as `ErrSubjectSuspended` (6.3): a workload with the permission holds nothing, whatever `grant#assume` would say. The relation's subject is the team of the workload's service, or `team:none` when it has no service, so the relationship has a subject and a suspension stays attributable.
 - A SpiceDB relationship carries at most one caveat, and a Git assignment may carry both bounds, so `bounded` takes both; `within_window` and `in_clusters` stay for a relationship bound in only one way. Every assignee relation admits all four forms. The broker sends `now` (RFC 3339) and `cluster` as the caveat context of every query; the relationship carries `expires_at` and/or `allowed`.
-- Object IDs: `workload:<authz encoding of 4.3>` (the encoding's charset is a subset of SpiceDB's), `grant:<name>`, `service:<name>`, `team:<name>`, `aws_account:<id>`. Names in Git are DNS labels for this reason.
+- Resources (Level 3) are related to a workload, or to a service's members (`service#member`), with the same caveats as a grant's assignees, so an Access document bounded in time or to clusters means what an Assignment bounded so means. The resource type's name is the kind of a lookup parameter, and its object ID the resource's name in the resource encoding of 4.3, since a bucket name may hold a dot. The adapter's `LookupResources` is SpiceDB's on that type and permission, with the same caveat context, after the same suspension check.
+- Object IDs: `workload:<authz encoding of 4.3>` (the encoding's charset is a subset of SpiceDB's), `grant:<name>`, `service:<name>`, `team:<name>`, `aws_account:<id>`, `s3_bucket:<resource encoding of 4.3>`. Names in Git are DNS labels for this reason.
 
 Integration levels:
 - **L1 (v1):** `Store.Check(subject, grant)` gates issuance (SpiceDB: `CheckPermission(grant#assume, workload)`).
 - **L2 (v1):** service/team returned in `Decision.Tags` become session tags for ABAC.
-- **L3 (later, exceptions only):** `Store.LookupResources` fills template resource lists; every ARN is validated against the grant envelope at runtime; violations reject the request.
+- **L3:** a grant's lookup parameter is filled at issuance by `Store.LookupResources` with the resources the workload is related to (6.2); every rendered ARN is validated against the grant's envelope at runtime, and a violation rejects the request (`resource_outside_envelope`). The relations come from Git, as `kind: Access` documents, through the reconciler (SpiceDB) or the published assignments (static).
 
 Relationship writers (write access to the authz store is security-critical, whatever the backend). What Crachá requires is that the writer is trusted and that no relationship is derived from anything the workload controls:
 
 | Relationship | Source of truth | Writer |
 |---|---|---|
-| `grant#account`, `service#owner`, `service#member`, `grant#assignee_service`, `grant#assignee_workload`, `workload#suspended` | Git: the grant source tree of 6.2 (CODEOWNERS). **Never** workload-controlled annotations | `authz-reconciler` (`cracha-reconciler apply`) |
+| `grant#account`, `service#owner`, `service#member`, `grant#assignee_service`, `grant#assignee_workload`, `workload#suspended`, `s3_bucket#reader`, `s3_bucket#writer` (and `dynamodb_table`'s) | Git: the grant source tree of 6.2 (CODEOWNERS), the Access documents included. **Never** workload-controlled annotations, never a direct write | `authz-reconciler` (`cracha-reconciler apply`) |
 | The static backend's published assignments (6.3) | The same tree | The grant pipeline of 6.2: `grantc compile`, `sign`, `publish`, with the signing key |
 | Temporary / break-glass | Approval flow | `access-approver`, with caveat/expiry |
 
@@ -303,8 +346,10 @@ The reconciler's mapping, from the documents of 6.2 to relationships. A grant bo
 | Service `s`, each `spec.grants` `g` | `grant:g#assignee_service@service:s` | by the grant's bounds |
 | Assignment of `subject`, each `spec.grants` `g` | `grant:g#assignee_workload@workload:<subject>` | by the assignment's bounds |
 | Assignment of `subject` with `suspended: true` | `workload:<subject>#suspended@team:<team of its service, or none>` | none |
+| Access of `subject` to `{kind, name}` by `relation` | `<kind>:<resource ID of name>#<relation>@workload:<subject>` | by the access's bounds |
+| Access of `service` `s` to `{kind, name}` by `relation` | `<kind>:<resource ID of name>#<relation>@service:s#member` | by the access's bounds |
 
-Two Assignments that give one subject the same grant are one relationship, with the bounds that allow what either allows; when one caveat cannot express that union (one bound in time, the other in clusters, say) the reconciler refuses the tree. The reconciler owns every relationship whose resource is a `grant`, a `service` or a `workload`: it refuses a tree the loader or the lints of 6.2 reject, reads what SpiceDB holds, writes the difference (touches and deletes, in batches of at most 1,000) and reads back at least as fresh as its last write to confirm; a second run is a no-op, and a dry run writes nothing. It writes the schema with `cracha-reconciler schema`, which is idempotent.
+Two Assignments that give one subject the same grant are one relationship, with the bounds that allow what either allows; when one caveat cannot express that union (one bound in time, the other in clusters, say) the reconciler refuses the tree. Access documents that relate one holder to one resource by one relation are one relationship, merged the same way. The reconciler owns every relationship whose resource is a `grant`, a `service`, a `workload`, an `s3_bucket` or a `dynamodb_table` (the schema must hold the resource types before an apply reads them: run `cracha-reconciler schema` first after an upgrade): it refuses a tree the loader or the lints of 6.2 reject, reads what SpiceDB holds, writes the difference (touches and deletes, in batches of at most 1,000) and reads back at least as fresh as its last write to confirm; a second run is a no-op, and a dry run writes nothing. It writes the schema with `cracha-reconciler schema`, which is idempotent.
 
 Deployment (SpiceDB): one instance per region on its own Postgres. The reconciler writes to every region through the backend adapter (regions stay independent).
 
@@ -320,10 +365,13 @@ GET /v1/credentials
     Cracha-Bundle-Version: ...
     Cracha-Consistency-Token: ...
     Cracha-Cache: hit | miss | refresh      (6.7: served from the cache, issued by STS now, or served from the cache while a refresh-ahead started; absent with the cache off)
-403 { "reason": "no_grant" | "ambiguous" | "subject_suspended" | "envelope_violation" | "policy_too_large" }
+403 { "reason": "no_grant" | "ambiguous" | "subject_suspended" | "envelope_violation" | "policy_too_large"
+              | "resource_outside_envelope" | "no_resources" }
 
 GET /v1/grants                (same authorization) → the caller's shape, grants and composed session policy, for inspection
 ```
+
+`/v1/grants` also shows, per lookup grant, the resources its policy was rendered with (`resources`). `resource_outside_envelope` is a resource the store related the workload to that renders outside a lookup grant's envelope; `no_resources` is a workload whose every grant is a lookup grant with no resource related (6.2).
 
 The request is exactly what the SDK's container-credentials provider sends, relayed by the agent (7.3) with the pod's token added, and nothing workload-specific is in it: the identity in the token selects everything. The broker is therefore a drop-in credential source for any SDK. `ambiguous` means the caller's grants span more than one shape.
 
@@ -367,9 +415,9 @@ Authentication:
 
 ### 6.7 Caching
 
-- Broker cache key: `(shape, sorted grant set, bundleVersion, encoded workload)`. A change in the grant set is a new key, so an added or removed assignment takes effect at the next fetch. In-memory only, singleflight on miss, refresh-ahead at ~70% of the usable lifetime (the TTL less the 20-minute floor: 28 minutes into a one-hour session), never return creds with <20 min left.
+- Broker cache key: `(shape, sorted grant set, bundleVersion, encoded workload, resource set)`, the resource set being the SHA-256 of the resources each lookup grant was rendered with, grant by grant, sorted (empty without lookup grants). A change in the grant set or the resource set is a new key, so an added or removed assignment, or a bucket related or unrelated, takes effect at the next fetch. In-memory only, singleflight on miss, refresh-ahead at ~70% of the usable lifetime (the TTL less the 20-minute floor: 28 minutes into a one-hour session), never return creds with <20 min left.
 - **Re-check the authz store on every issuance, including cache hits** (cheap at refresh frequency).
-- `Store.Watch` invalidates affected cache entries on assignment changes. Backends without Watch degrade to TTL-only invalidation, and the broker exposes which mode is active. The static backend's Watch is minimal: after each swap of its assignments, one change naming no subject, which drops every entry. That is enough because the cache already re-checks the store on every issuance, so a swap takes effect at the next fetch whatever the cache holds, and because the published version is the bundle version in the key, which every swap changes: the flush only drops at once the sessions of the previous version, which no request could reach any more, instead of leaving them to age out, and keeps them from being served in degraded mode.
+- `Store.Watch` invalidates affected cache entries on assignment changes, resource relations included: SpiceDB's change of a workload's relation to a resource drops that subject's entries, one of a service's members drops every entry, and the static backend's swap drops every entry as it does for any change. Backends without Watch degrade to TTL-only invalidation, and the broker exposes which mode is active. The static backend's Watch is minimal: after each swap of its assignments, one change naming no subject, which drops every entry. That is enough because the cache already re-checks the store on every issuance, so a swap takes effect at the next fetch whatever the cache holds, and because the published version is the bundle version in the key, which every swap changes: the flush only drops at once the sessions of the previous version, which no request could reach any more, instead of leaving them to age out, and keeps them from being served in degraded mode.
 - Consistency: minimize latency by default; at-least-as-fresh when a caller (approver/revocation tool) supplies a consistency token.
 - Authz store unavailable: fail closed for new keys; serve cache hits only if the last successful check for that key is <10 min old.
 
@@ -600,7 +648,7 @@ A workload on an SDK that ignores the variables and needs more room sets it in t
 These hold regardless of backend, issuer or platform. Any implementation must be able to demonstrate each one.
 
 - Never fail open: an unavailable authz store, issuer or bundle results in denial, or in serving already-issued credentials within bounded staleness, never in broader access.
-- Every rendered session policy is checked against the grant's envelope before STS is called.
+- Every rendered session policy is checked against the grant's envelope before STS is called, including every resource a lookup grant is rendered with at issuance: the store relates a workload to resources, it never widens a grant beyond its envelope.
 - `SourceIdentity` is set on every assumed session and is reversible to a SPIFFE ID through the decision log.
 - Nothing writes AWS credentials or SVIDs to disk. The workload never holds an SVID: its JWT-SVID lives in the agent's memory and is presented to the broker, nowhere else.
 - Credentials are served to a workload over loopback only, from a listener bound inside that pod's network namespace and nowhere else. The pod a request is answered for is the pod the listener was bound in.
