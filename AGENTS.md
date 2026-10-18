@@ -312,6 +312,10 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   decodes the `helm_template` renderings of `BUILD.bazel`; an assertion
   on what a template renders goes there, since `helm_template_test` only
   renders).
+- The agent, the broker and the webhook have default resource requests and
+  memory limits and no CPU limits (`TestDefaultResources`): a BestEffort pod
+  on a busy node gets its probes starved and restarted, and a CPU limit
+  throttles the short bursts these binaries have.
 - The chart's version and image pins are stamped at package time: the
   version from `STABLE_CHART_VERSION`, each image's repository and digest
   from its `image_push` target (`{@//agent:image_push.digest}` in
