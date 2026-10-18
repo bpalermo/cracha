@@ -1,0 +1,23 @@
+{
+  "params": {
+    "buckets": { "type": "list", "description": "the buckets that may be written" },
+    "prefix": { "type": "string", "default": "" }
+  },
+  "policy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "Write",
+        "Effect": "Allow",
+        "Action": ["s3:PutObject", "s3:GetObject"],
+        "Resource": "arn:aws:s3:::${buckets}/${prefix}*"
+      },
+      {
+        "Sid": "List",
+        "Effect": "Allow",
+        "Action": ["s3:ListBucket"],
+        "Resource": "arn:aws:s3:::${buckets}"
+      }
+    ]
+  }
+}

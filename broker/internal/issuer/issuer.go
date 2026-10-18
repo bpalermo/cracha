@@ -144,6 +144,9 @@ func (d *Direct) resolve(ctx context.Context, id idenc.Identity) (Resolution, er
 	for _, g := range composed.Dropped {
 		r.Decision.Trace = append(r.Decision.Trace, "grant "+g+": no resource related; left out")
 	}
+	for _, res := range composed.Unplaced {
+		r.Decision.Trace = append(r.Decision.Trace, "resource "+res+": in no account of the bundle; no implicit grant renders it")
+	}
 
 	tags := map[string]string{
 		TagNamespace:      id.Namespace,

@@ -1,0 +1,9 @@
+# Written the short way: no baseRole, no envelope; the account's apply.
+kind: Grant
+metadata:
+  name: payments-ledger
+spec:
+  account: "111122223333"
+  sessionPolicy:
+    template: dynamo-table-read
+    params: { table: payments-ledger }

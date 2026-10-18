@@ -1,0 +1,19 @@
+# The suite's account (design 6.2 and 6.6): the fake account, its account
+# role (the role the STS stand-in is asked for, shape-e2e), the default
+# envelope of its grants, and its access table. A workload related to a
+# bucket of the account by an Access document gets the implicit grant
+# account:e2e:s3_bucket:read, the template rendered once per bucket it
+# reads, without any Grant naming it or any assignment: what the tests in
+# e2e/resources_test.go expect of the AssumeRole call comes from here.
+kind: Account
+metadata:
+  name: e2e
+spec:
+  id: "111122223333"
+  role: arn:aws:iam::111122223333:role/broker/shape-e2e
+  envelope:
+    - arn:aws:s3:::cracha-e2e-*
+  access:
+    - kind: s3_bucket
+      permission: read
+      template: s3-object-read

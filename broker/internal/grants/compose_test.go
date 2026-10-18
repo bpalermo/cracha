@@ -180,7 +180,7 @@ func TestComposeDenies(t *testing.T) {
 		{"only empty names", []ResolvedGrant{ledgerRW()}, []string{""}, ReasonNoGrant},
 		{"unknown grant", []ResolvedGrant{ledgerRW()}, []string{"payments-ledger-rw", "nope"}, ReasonNoGrant},
 		{"two shapes", []ResolvedGrant{ledgerRW(), otherShape()}, []string{"payments-ledger-rw", "payments-outbox-r"}, ReasonAmbiguous},
-		{"two accounts", []ResolvedGrant{ledgerRW(), otherAccount()}, []string{"payments-ledger-rw", "payments-outbox-r"}, ReasonAmbiguous},
+		{"two accounts", []ResolvedGrant{ledgerRW(), otherAccount()}, []string{"payments-ledger-rw", "payments-outbox-r"}, ReasonAccountsMixed},
 		{"tag conflict", []ResolvedGrant{ledgerRW(), teamConflict()}, []string{"payments-ledger-rw", "payments-outbox-r"}, ReasonAmbiguous},
 		{"inline too large", []ResolvedGrant{tooBigPolicy()}, []string{"payments-ledger-rw"}, ReasonPolicyTooLarge},
 		{"too many managed", []ResolvedGrant{manyManaged()}, []string{"payments-outbox-r"}, ReasonPolicyTooLarge},
@@ -189,6 +189,7 @@ func TestComposeDenies(t *testing.T) {
 		{"no resource", []ResolvedGrant{noResource()}, []string{"payments-ledger-rw"}, ReasonEnvelopeViolation},
 		{"not resource", []ResolvedGrant{notResource()}, []string{"payments-ledger-rw"}, ReasonEnvelopeViolation},
 		{"empty envelope", []ResolvedGrant{emptyEnvelope()}, []string{"payments-ledger-rw"}, ReasonEnvelopeViolation},
+		{"neither policy nor managed policies", []ResolvedGrant{{Name: "bare", Account: "111122223333", BaseRole: dynamoRole}}, []string{"bare"}, ReasonEnvelopeViolation},
 		{"envelope is per grant", []ResolvedGrant{ledgerRW(), otherGrantsEnvelope()}, []string{"payments-ledger-rw", "payments-outbox-r"}, ReasonEnvelopeViolation},
 	}
 	for _, tt := range tests {

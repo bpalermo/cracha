@@ -32,8 +32,9 @@ const (
 	systemNamespace = "cracha-system"
 	testNamespace   = "e2e"
 	// assignedSA holds one grant through the Service of e2e/grants;
-	// readerSA that grant and the lookup grant, whose bucket an Access
-	// document gives (resources_test.go); unassignedSA holds none. All are
+	// readerSA that grant and the account's implicit grant, for the bucket
+	// an Access document gives (resources_test.go); unassignedSA holds
+	// none. All are
 	// registered with SPIRE and opt in to the webhook.
 	assignedSA   = "client"
 	readerSA     = "reader"

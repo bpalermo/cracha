@@ -14,22 +14,25 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// Resource-level access (design 6.2 and 6.4, Level 3). The reader holds
-// two grants of the suite's shape: e2e-s3-reader, which names its bucket,
-// and e2e-s3-lookup, which leaves it to the authorization store. The
-// Access documents of e2e/grants relate the reader's service to
-// cracha-e2e-data and the client, not the reader, to cracha-e2e-other, the
-// other bucket of the stub's world. The broker renders the lookup grant at
-// issuance with the buckets it finds and checks each against the grant's
-// envelope (arn:aws:s3:::cracha-e2e-*). The tests run in both modes: in
-// static mode a change is a new publication (published_test.go's), in
-// spicedb mode a reconcile (spicedb_test.go's), and both are put back.
+// Resource-level access (design 6.2 and 6.4, Level 3) through the
+// account's implicit grant. The reader holds one grant, e2e-s3-reader,
+// which names its bucket; nothing assigns it another. The Account document
+// of e2e/grants (accounts/e2e.yaml) says what reading a bucket of the
+// account means, and its Access documents relate the reader's service to
+// cracha-e2e-data and a workload that runs nowhere to cracha-e2e-other,
+// the other bucket of the stub's world. The broker applies the implicit
+// grant account:e2e:s3_bucket:read at issuance, rendered with the buckets
+// it finds, and checks each against the account's envelope
+// (arn:aws:s3:::cracha-e2e-*), on the account role, which e2e-s3-reader
+// names as its own. The tests run in both modes: in static mode a change
+// is a new publication (published_test.go's), in spicedb mode a reconcile
+// (spicedb_test.go's), and both are put back.
 
 const (
-	lookupGrantName      = "e2e-s3-lookup"
+	lookupGrantName      = "account:e2e:s3_bucket:read"
 	readerSession        = "w.cracha.e2e.reader"
 	readerAccessDocument = "access/e2e-reader-data.yaml"
-	lookupGrantDocument  = "grants/e2e-s3-lookup.yaml"
+	accountDocument      = "accounts/e2e.yaml"
 	reasonOutside        = "resource_outside_envelope"
 
 	staticBucketARN = "arn:aws:s3:::cracha-e2e-bucket/*"
@@ -38,7 +41,7 @@ const (
 	outsideBucket   = "cracha-outside"
 )
 
-// bothGrants is Cracha-Grants for the reader with its lookup grant.
+// bothGrants is Cracha-Grants for the reader with the implicit grant.
 var bothGrants = lookupGrantName + ", " + grantName
 
 // policyResources is every Resource of a session policy's statements,
@@ -74,7 +77,14 @@ func policyResources(t *testing.T, policy string) []string {
 // the reader received after since.
 func lastReaderPolicy(ctx context.Context, t *testing.T, since time.Time) string {
 	t.Helper()
-	var policy string
+	return lastReaderRequest(ctx, t, since).Policy
+}
+
+// lastReaderRequest is the stub's last AssumeRole for the reader received
+// after since.
+func lastReaderRequest(ctx context.Context, t *testing.T, since time.Time) stsRequest {
+	t.Helper()
+	var last stsRequest
 	err := eventually(ctx, func() error {
 		reqs, err := stubRequests(ctx, readerSession)
 		if err != nil {
@@ -82,7 +92,7 @@ func lastReaderPolicy(ctx context.Context, t *testing.T, since time.Time) string
 		}
 		for i := len(reqs) - 1; i >= 0; i-- {
 			if reqs[i].Received.After(since) {
-				policy = reqs[i].Policy
+				last = reqs[i]
 				return nil
 			}
 		}
@@ -91,7 +101,7 @@ func lastReaderPolicy(ctx context.Context, t *testing.T, since time.Time) string
 	if err != nil {
 		t.Fatal(err)
 	}
-	return policy
+	return last
 }
 
 // fetchingReader starts the reader with fetches at fetchInterval and waits
@@ -151,8 +161,8 @@ func withoutReaderAccess(dir string) error {
 }
 
 // withOutsideAccess is the tree with the reader's service also related to
-// a bucket outside the lookup grant's envelope, and the envelope widened
-// to it so that the tree passes the lints: the assignments and the
+// a bucket outside the account's envelope, and the envelope widened to it
+// so that the tree passes the lints: the assignments and the
 // relationships of this tree are put in force, the bundle (with the
 // envelope as it was) is not.
 func withOutsideAccess(dir string) error {
@@ -167,7 +177,7 @@ spec:
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(dir, lookupGrantDocument)
+	path := filepath.Join(dir, accountDocument)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -179,11 +189,13 @@ spec:
 	return os.WriteFile(path, []byte(widened), 0o644)
 }
 
-// The lookup grant is rendered with the bucket the reader's Access
-// document gives and nothing else: the session policy STS was asked for
-// names the grant's own bucket and cracha-e2e-data, not cracha-e2e-other,
-// which is related to another workload.
-func TestLookupGrantNamesRelatedBuckets(t *testing.T) {
+// The account's implicit grant applies to the reader, which holds no grant
+// naming it, and is rendered with the bucket the reader's Access document
+// gives and nothing else: Cracha-Grants shows its generated name, and the
+// session policy STS was asked for names e2e-s3-reader's own bucket and
+// cracha-e2e-data, not cracha-e2e-other, which is related to another
+// workload.
+func TestImplicitGrantNamesRelatedBuckets(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 	start := time.Now()
@@ -194,7 +206,14 @@ func TestLookupGrantNamesRelatedBuckets(t *testing.T) {
 	if got := strings.Join(rep.Exchange.Headers["Cracha-Grants"], ","); got != bothGrants {
 		t.Errorf("Cracha-Grants = %q, want %q", got, bothGrants)
 	}
-	got := policyResources(t, lastReaderPolicy(ctx, t, start))
+	req := lastReaderRequest(ctx, t, start)
+	if req.RoleArn != baseRole {
+		t.Errorf("RoleArn = %q, want the account role %q", req.RoleArn, baseRole)
+	}
+	if want := lookupGrantName + "+" + grantName; req.Tags["grant"] != want {
+		t.Errorf("session tag grant = %q, want %q", req.Tags["grant"], want)
+	}
+	got := policyResources(t, req.Policy)
 	if want := []string{staticBucketARN, dataBucketARN}; !slices.Equal(got, want) {
 		t.Errorf("session policy resources = %v, want %v", got, want)
 	}
@@ -203,27 +222,27 @@ func TestLookupGrantNamesRelatedBuckets(t *testing.T) {
 	}
 }
 
-// The reader's Access document removed, the lookup grant finds no bucket
-// and is left out: the reader keeps its other grant, and its next
-// credentials are for that grant alone, issued anew (the resource set is
-// part of the cache key). Put back, the lookup grant returns.
-func TestLookupGrantFollowsAccess(t *testing.T) {
+// The reader's Access document removed, the implicit grant has no bucket
+// and does not apply: the reader keeps its grant, and its next credentials
+// are for that grant alone, issued anew (the grant set and the resource
+// set are part of the cache key). Put back, the implicit grant returns.
+func TestImplicitGrantFollowsAccess(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 	pod := fetchingReader(ctx, t, "reader-access")
 	changedAt := time.Now()
 	restore := changeTree(ctx, t, grantSource, modifiedSource(t, withoutReaderAccess))
-	alone := waitForFetch(ctx, t, pod, changedAt, "credentials without the lookup grant", func(e *exchange) bool {
+	alone := waitForFetch(ctx, t, pod, changedAt, "credentials without the implicit grant", func(e *exchange) bool {
 		return e.Status == 200 && strings.Join(e.Headers["Cracha-Grants"], ",") == grantName
 	})
-	t.Logf("the lookup grant left out %s after the change", alone.At.Sub(changedAt).Round(time.Millisecond))
+	t.Logf("the implicit grant left out %s after the change", alone.At.Sub(changedAt).Round(time.Millisecond))
 	if got, want := policyResources(t, lastReaderPolicy(ctx, t, changedAt)), []string{staticBucketARN}; !slices.Equal(got, want) {
 		t.Errorf("session policy resources without the access = %v, want %v", got, want)
 	}
 
 	restoredAt := time.Now()
 	restore(ctx)
-	waitForFetch(ctx, t, pod, restoredAt, "the lookup grant again", func(e *exchange) bool {
+	waitForFetch(ctx, t, pod, restoredAt, "the implicit grant again", func(e *exchange) bool {
 		return e.Status == 200 && strings.Join(e.Headers["Cracha-Grants"], ",") == bothGrants
 	})
 	if got, want := policyResources(t, lastReaderPolicy(ctx, t, restoredAt)), []string{staticBucketARN, dataBucketARN}; !slices.Equal(got, want) {
@@ -231,11 +250,11 @@ func TestLookupGrantFollowsAccess(t *testing.T) {
 	}
 }
 
-// A bucket related to the reader outside the lookup grant's envelope is
+// A bucket related to the reader outside the account's envelope is
 // refused at issuance with resource_outside_envelope, whatever the lints
 // of the tree that related it said (design 11: every rendered resource is
 // checked against the envelope before STS is called).
-func TestLookupOutsideEnvelopeIsRefused(t *testing.T) {
+func TestImplicitOutsideEnvelopeIsRefused(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 	pod := fetchingReader(ctx, t, "reader-outside")

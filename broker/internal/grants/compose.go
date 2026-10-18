@@ -24,6 +24,10 @@ const (
 	// ReasonNoResources: every grant the workload holds is a lookup grant
 	// and the store relates it to no resource of any.
 	ReasonNoResources Reason = "no_resources"
+	// ReasonAccountsMixed: the workload's grants, its implicit ones
+	// included, are in more than one AWS account. One credential is one
+	// AssumeRole, in one account.
+	ReasonAccountsMixed Reason = "accounts_mixed"
 )
 
 // DenyError is a denial with one of the reasons above. Detail is for the
@@ -78,6 +82,10 @@ type Composed struct {
 	// Dropped are the lookup grants held but left out, for want of any
 	// resource.
 	Dropped []string
+	// Unplaced are the resources (kind:name) the store relates the
+	// workload to that no account of the bundle places, so that no
+	// implicit grant renders them, sorted.
+	Unplaced []string
 }
 
 // Finder answers which resources of a kind the workload holds a
@@ -105,38 +113,87 @@ type Finder func(kind, permission string) ([]string, error)
 // denial is "no_resources". An error of find is returned as it is, for the
 // caller to tell a store that cannot answer from a deny.
 //
+// With an ImplicitSource, the implicit grants of the bundle's accounts
+// (design 6.2) are composed as well: one of a kind and permission that no
+// held lookup grant is of, rendered with the resources of that kind the
+// store relates the workload to in its account, and left out silently
+// when there are none. A workload that holds no grant and is related to
+// no such resource is "no_grant". Grants in more than one account, the
+// implicit ones included, are "accounts_mixed": a credential is one
+// AssumeRole, in one account.
+//
 // The grants are folded in name order, and the first fault found is the
-// one reported: for each grant, its shape and account, then its statements,
-// then its session tags; after all grants, the policy size, the managed
-// policy count and the duration.
+// one reported: for each grant, its account and shape, then its
+// statements, then its session tags; after all grants, the policy size,
+// the managed policy count and the duration.
 func Compose(src Source, names []string, find Finder) (Composed, error) {
 	names = sortedUnique(names)
-	if len(names) == 0 {
-		return Composed{}, &DenyError{ReasonNoGrant, "no grants assigned"}
-	}
 	resolved, err := resolveGrants(src, names)
 	if err != nil {
 		return Composed{}, err
 	}
-	filled, err := fillLookups(resolved, find)
-	if err != nil {
-		return Composed{}, err
+	implicit, place := implicitOf(src, resolved)
+	if len(resolved)+len(implicit) == 0 {
+		return Composed{}, &DenyError{ReasonNoGrant, "no grants assigned"}
 	}
+	f := newFiller(find, place)
+	for _, g := range append(resolved, implicit...) {
+		if err := f.add(g); err != nil {
+			return Composed{}, err
+		}
+	}
+	filled := f.out
 	if len(filled.grants) == 0 {
-		return Composed{}, &DenyError{ReasonNoResources, fmt.Sprintf("lookup grants %s: no resource is related to the workload", strings.Join(filled.dropped, ", "))}
+		return Composed{}, nothingFilled(names, filled)
 	}
+	sort.Slice(filled.grants, func(i, j int) bool { return filled.grants[i].Name < filled.grants[j].Name })
 	resolved, names = filled.grants, grantNames(filled.grants)
 	c, err := newComposition(resolved[0], names)
 	if err != nil {
 		return Composed{}, err
 	}
-	c.out.Resources, c.out.Dropped = filled.resources, filled.dropped
+	c.out.Resources, c.out.Dropped, c.out.Unplaced = filled.resources, filled.dropped, sortedKeys(f.unplaced)
 	for _, g := range resolved {
 		if err := c.add(g); err != nil {
 			return Composed{}, err
 		}
 	}
 	return c.finish()
+}
+
+// nothingFilled is the denial of a workload left with no grant once the
+// lookups found their resources: "no_grant" when it holds none and no
+// implicit grant applies, "no_resources" when its lookup grants found
+// nothing.
+func nothingFilled(held []string, filled filledGrants) error {
+	if len(held) == 0 {
+		return &DenyError{ReasonNoGrant, "no grants assigned, and no resource related in an account's access table"}
+	}
+	return &DenyError{ReasonNoResources, fmt.Sprintf("lookup grants %s: no resource is related to the workload", strings.Join(filled.dropped, ", "))}
+}
+
+// implicitOf are the implicit grants of src that may apply to a workload
+// holding held, those of a kind and permission no held lookup grant is
+// of, and where the source places a resource; none when src has no
+// accounts.
+func implicitOf(src Source, held []ResolvedGrant) ([]ResolvedGrant, func(kind, name string) (string, bool)) {
+	is, ok := src.(ImplicitSource)
+	if !ok {
+		return nil, nil
+	}
+	covered := map[string]bool{}
+	for _, g := range held {
+		if g.Lookup != nil {
+			covered[g.Lookup.Kind+"#"+g.Lookup.Permission] = true
+		}
+	}
+	var out []ResolvedGrant
+	for _, g := range is.ImplicitGrants() {
+		if g.Lookup != nil && !covered[g.Lookup.Kind+"#"+g.Lookup.Permission] {
+			out = append(out, g)
+		}
+	}
+	return out, is.AccountOf
 }
 
 // filledGrants are a workload's grants with their lookups rendered.
@@ -146,35 +203,71 @@ type filledGrants struct {
 	dropped   []string
 }
 
-// fillLookups renders every lookup grant with the resources find gives
-// its kind and permission, leaving out those it finds none for.
-func fillLookups(gs []ResolvedGrant, find Finder) (filledGrants, error) {
-	out := filledGrants{grants: make([]ResolvedGrant, 0, len(gs))}
-	found := map[string][]string{}
-	for _, g := range gs {
-		if g.Lookup == nil {
-			out.grants = append(out.grants, g)
-			continue
-		}
-		resources, err := findOnce(found, find, g)
-		if err != nil {
-			return filledGrants{}, err
-		}
-		if len(resources) == 0 {
-			out.dropped = append(out.dropped, g.Name)
-			continue
-		}
-		filled, err := fillLookup(g, resources)
-		if err != nil {
-			return filledGrants{}, err
-		}
-		if out.resources == nil {
-			out.resources = map[string][]string{}
-		}
-		out.resources[g.Name] = resources
-		out.grants = append(out.grants, filled)
+// filler renders a workload's lookup grants with the resources find gives
+// each kind and permission (one call per pair), an implicit grant with
+// those place puts in its account, and leaves out those it finds none for.
+type filler struct {
+	find     Finder
+	place    func(kind, name string) (string, bool)
+	found    map[string][]string
+	out      filledGrants
+	unplaced map[string]bool
+}
+
+func newFiller(find Finder, place func(kind, name string) (string, bool)) *filler {
+	return &filler{find: find, place: place, found: map[string][]string{}, unplaced: map[string]bool{}}
+}
+
+// add takes one grant in, rendered when it is a lookup grant.
+func (f *filler) add(g ResolvedGrant) error {
+	if g.Lookup == nil {
+		f.out.grants = append(f.out.grants, g)
+		return nil
 	}
-	return out, nil
+	resources, err := f.resources(g)
+	if err != nil {
+		return err
+	}
+	if len(resources) == 0 {
+		if !g.Implicit {
+			f.out.dropped = append(f.out.dropped, g.Name)
+		}
+		return nil
+	}
+	filled, err := fillLookup(g, resources)
+	if err != nil {
+		return err
+	}
+	if f.out.resources == nil {
+		f.out.resources = map[string][]string{}
+	}
+	f.out.resources[g.Name] = resources
+	f.out.grants = append(f.out.grants, filled)
+	return nil
+}
+
+// resources are a lookup grant's resources: all those of its kind and
+// permission, or, for an implicit grant, those in its account. A resource
+// no account places is recorded in unplaced.
+func (f *filler) resources(g ResolvedGrant) ([]string, error) {
+	all, err := findOnce(f.found, f.find, g)
+	if err != nil || !g.Implicit {
+		return all, err
+	}
+	var in []string
+	for _, r := range all {
+		account, ok := "", false
+		if f.place != nil {
+			account, ok = f.place(g.Lookup.Kind, r)
+		}
+		switch {
+		case !ok:
+			f.unplaced[g.Lookup.Kind+":"+r] = true
+		case account == g.Account:
+			in = append(in, r)
+		}
+	}
+	return in, nil
 }
 
 // findOnce asks find for a lookup grant's resources, once per kind and
@@ -326,14 +419,14 @@ func (c *composition) add(g ResolvedGrant) error {
 	return nil
 }
 
-// sameShape is "ambiguous" when g names another shape role or account than
-// the first grant.
+// sameShape is "accounts_mixed" when g is in another account than the
+// first grant, and "ambiguous" when it names another role.
 func (c *composition) sameShape(g ResolvedGrant) error {
+	if g.Account != c.out.Account {
+		return &DenyError{ReasonAccountsMixed, fmt.Sprintf("grant %q is in account %s, grant %q in %s; one credential is one account", c.first.Name, c.out.Account, g.Name, g.Account)}
+	}
 	if g.BaseRole != c.out.BaseRole {
 		return &DenyError{ReasonAmbiguous, fmt.Sprintf("grant %q has shape %s, grant %q has shape %s", c.first.Name, c.out.BaseRole, g.Name, g.BaseRole)}
-	}
-	if g.Account != c.out.Account {
-		return &DenyError{ReasonAmbiguous, fmt.Sprintf("grant %q is in account %s, grant %q in %s", c.first.Name, c.out.Account, g.Name, g.Account)}
 	}
 	return nil
 }
@@ -361,6 +454,11 @@ func (c *composition) finish() (Composed, error) {
 	}
 	c.out.Policy = policy
 	c.out.ManagedPolicyARNs = sortedKeys(c.managed)
+	if policy == "" && len(c.out.ManagedPolicyARNs) == 0 {
+		// A session with neither would have the role's whole identity
+		// policy, which on an account role is every workload's (6.6).
+		return Composed{}, &DenyError{ReasonEnvelopeViolation, fmt.Sprintf("grants %s carry neither a session policy nor managed policies", strings.Join(c.out.Grants, ", "))}
+	}
 	if len(c.out.ManagedPolicyARNs) > MaxManagedPolicies {
 		return Composed{}, &DenyError{ReasonPolicyTooLarge, fmt.Sprintf("%d managed policies, over %d", len(c.out.ManagedPolicyARNs), MaxManagedPolicies)}
 	}

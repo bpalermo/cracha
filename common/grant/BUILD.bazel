@@ -3,6 +3,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "grant",
     srcs = [
+        "account.go",
         "analyzer.go",
         "arnmatch.go",
         "assignments.go",
@@ -36,10 +37,12 @@ go_library(
 go_test(
     name = "grant_test",
     srcs = [
+        "account_test.go",
         "analyzer_test.go",
         "arnmatch_test.go",
         "assignments_test.go",
         "bundle_test.go",
+        "compat_test.go",
         "lint_test.go",
         "load_test.go",
         "lookup_test.go",

@@ -1,5 +1,5 @@
-# The reader's service may read cracha-e2e-data: the bucket the lookup grant
-# is rendered with for its members.
+# The reader's service may read cracha-e2e-data: the bucket the account's
+# implicit grant for s3_bucket#read is rendered with for its members.
 kind: Access
 metadata:
   name: e2e-reader-data

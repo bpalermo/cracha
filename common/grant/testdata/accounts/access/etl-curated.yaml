@@ -1,0 +1,10 @@
+# A workload with no grant and no service: its relations alone give it
+# credentials. A writer reads too, so both implicit grants of the kind
+# apply.
+kind: Access
+metadata:
+  name: etl-curated
+spec:
+  subject: prod/data/etl
+  resource: { kind: s3_bucket, name: data-curated, account: "111122223333" }
+  relation: writer

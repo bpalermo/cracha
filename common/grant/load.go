@@ -29,6 +29,8 @@ type Source struct {
 	Services []*Service
 	// Accesses, sorted by name.
 	Accesses []*Access
+	// Accounts, sorted by name.
+	Accounts []*Account
 	// Templates by name.
 	Templates map[string]*Template
 }
@@ -92,7 +94,8 @@ const (
 )
 
 // Load reads a source tree (see the package documentation): every *.yaml and
-// *.yml file under dir is a Grant, an Assignment, a Service or an Access, and every *.json file
+// *.yml file under dir is a Grant, an Assignment, a Service, an Access or an
+// Account, and every *.json file
 // under dir/templates is a template. Hidden directories under dir (.git,
 // .github) are skipped. It reports every problem it finds, not
 // only the first.
@@ -104,6 +107,7 @@ func Load(dir string) (*Source, error) {
 	sort.Slice(src.Assignments, func(i, j int) bool { return src.Assignments[i].Name() < src.Assignments[j].Name() })
 	sort.Slice(src.Services, func(i, j int) bool { return src.Services[i].Name() < src.Services[j].Name() })
 	sort.Slice(src.Accesses, func(i, j int) bool { return src.Accesses[i].Name() < src.Accesses[j].Name() })
+	sort.Slice(src.Accounts, func(i, j int) bool { return src.Accounts[i].Name() < src.Accounts[j].Name() })
 	if len(l.errs) > 0 {
 		return nil, errors.Join(l.errs...)
 	}
@@ -123,6 +127,7 @@ type loader struct {
 	seenAssignments map[string]string
 	seenServices    map[string]string
 	seenAccesses    map[string]string
+	seenAccounts    map[string]string
 }
 
 func newLoader(dir string) *loader {
@@ -134,6 +139,7 @@ func newLoader(dir string) *loader {
 		seenAssignments: map[string]string{},
 		seenServices:    map[string]string{},
 		seenAccesses:    map[string]string{},
+		seenAccounts:    map[string]string{},
 	}
 }
 
@@ -189,8 +195,8 @@ func (l *loader) loadTemplate(path, rel string) {
 	l.src.Templates[t.Name] = t
 }
 
-// loadDocument loads one YAML file as the Grant, Assignment, Service or
-// Access it declares.
+// loadDocument loads one YAML file as the Grant, Assignment, Service,
+// Access or Account it declares.
 func (l *loader) loadDocument(path, rel string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -211,7 +217,21 @@ func (l *loader) loadDocument(path, rel string) {
 		l.addService(o, rel)
 	case *Access:
 		l.addAccess(o, rel)
+	case *Account:
+		l.addAccount(o, rel)
 	}
+}
+
+// addAccount records an account document loaded from rel, which must not
+// redefine a name.
+func (l *loader) addAccount(a *Account, rel string) {
+	a.Path = rel
+	if prev, dup := l.seenAccounts[a.Name()]; dup {
+		l.errs.addf("%s: account %q already defined in %s", rel, a.Name(), prev)
+		return
+	}
+	l.seenAccounts[a.Name()] = rel
+	l.src.Accounts = append(l.src.Accounts, a)
 }
 
 // addAccess records an access document loaded from rel, which must not
@@ -262,7 +282,7 @@ func (l *loader) addService(s *Service, rel string) {
 }
 
 // ParseDocument parses one YAML document into a *Grant, an *Assignment, a
-// *Service or an *Access, chosen by its kind. Unknown fields are an error.
+// *Service, an *Access or an *Account, chosen by its kind. Unknown fields are an error.
 func ParseDocument(data []byte) (any, error) {
 	var head struct {
 		Kind string `json:"kind"`
@@ -279,10 +299,12 @@ func ParseDocument(data []byte) (any, error) {
 		return parseStrict(data, func(s *Service) *Metadata { return &s.Metadata })
 	case KindAccess:
 		return parseStrict(data, func(a *Access) *Metadata { return &a.Metadata })
+	case KindAccount:
+		return parseStrict(data, func(a *Account) *Metadata { return &a.Metadata })
 	case "":
 		return nil, errors.New("kind is required")
 	default:
-		return nil, fmt.Errorf("unknown kind %q (want %s, %s, %s or %s)", head.Kind, KindGrant, KindAssignment, KindService, KindAccess)
+		return nil, fmt.Errorf("unknown kind %q (want %s, %s, %s, %s or %s)", head.Kind, KindGrant, KindAssignment, KindService, KindAccess, KindAccount)
 	}
 }
 

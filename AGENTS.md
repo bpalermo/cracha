@@ -243,7 +243,12 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   what is `ResolveAssignments` and `ResolveAccess`, the one mapping from
   Services, Assignments and Access documents that both the published
   assignments document and the reconciler's relationships come from.
-  Its source tree holds four kinds: `Grant`, `Assignment` (a workload's own
+  Its source tree holds five kinds: `Account` (an AWS account's account
+  role, the default envelope of its grants and its access table, whose
+  entries compile into implicit lookup grants named
+  `account:<name>:<kind>:<permission>`, `account.go`), `Grant` (whose
+  `baseRole` and `envelope` default to its Account's; `baseRole` is the
+  dedicated-shape override), `Assignment` (a workload's own
   grants, optionally bounded, or its `suspended: true`), `Service` (a
   team's workloads and the grants they share, each bounded like an
   Assignment; a workload is a member of at most one service) and `Access`
@@ -253,8 +258,13 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   the bundle then carries the template and the compiled maximum of
   resources (`lookup.go`, `resource.go`), the broker renders it at
   issuance with `Template.RenderLookup`, the compiler's own rendering. The
-  composition lint unions a subject's grants from both, its lookup grants
-  rendered with its Access. Names are DNS labels without dots, because
+  composition lint unions a subject's grants from both and the implicit
+  grants its Access brings in, its lookup grants rendered with its Access,
+  and refuses a union of two accounts or two roles. Everything after
+  validation reads `Source.CompiledGrants`, the grants with their
+  account's defaults applied and the implicit ones, never `Source.Grants`.
+  A tree without Account documents must compile to the bytes and version
+  it did before them (`compat_test.go`). Names are DNS labels without dots, because
   they become SpiceDB object IDs; resource names may hold dots, so they go
   through `idenc.Resource`.
 - `common/spicedb` is the SpiceDB schema (design 6.4), embedded from
@@ -316,7 +326,13 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   resolved-grants fixture (`--grants-fixture`,
   `broker/internal/grants/fixture.go`), which the chart's default
   `broker.grants` renders; `broker.bundle` switches an install to the
-  bundle. The e2e installs the bundle path.
+  bundle. The e2e installs the bundle path. Only the bundle has accounts:
+  `bundle.Source` is a `grants.ImplicitSource`, whose implicit grants
+  `grants.Compose` applies by the workload's relations (one
+  `LookupResources` per kind and permission) and never resolves by name;
+  a composition of two accounts is `accounts_mixed`, and one with neither
+  a session policy nor managed policies is refused, since on a shared
+  account role it would be the role's whole policy.
 - `bazel/` holds build rules; `docs/` the design; `charts/cracha` the Helm
   chart; `e2e/` the end-to-end suite with its values files, the fixtures it
   deploys beside the chart and the two images only it uses.

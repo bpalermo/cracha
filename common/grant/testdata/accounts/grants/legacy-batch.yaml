@@ -1,0 +1,13 @@
+# A dedicated shape role, the override: issued on its own role, inside its
+# own envelope.
+kind: Grant
+metadata:
+  name: legacy-batch
+spec:
+  account: "111122223333"
+  baseRole: arn:aws:iam::111122223333:role/broker/shape-legacy
+  sessionPolicy:
+    template: s3-object-read
+    params: { bucket: legacy-batch }
+  envelope:
+    - arn:aws:s3:::legacy-*

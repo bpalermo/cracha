@@ -1,7 +1,7 @@
 # The namespace the suite runs its workloads in, with the identities
 # e2e/spire.sh registers: client, which holds a grant (the Service of
-# e2e/grants), reader, which holds that grant and the lookup grant whose
-# bucket the Access documents give, and unassigned, which holds none. All
+# e2e/grants), reader, which holds that grant and the account's implicit
+# grant for the bucket the Access documents give, and unassigned, which holds none. All
 # opt in to the webhook. The namespace's default ServiceAccount does not,
 # and its pods are left as they are.
 apiVersion: v1

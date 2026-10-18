@@ -44,6 +44,10 @@ type ResolvedGrant struct {
 	// the resources the authorization store relates the workload to
 	// (Level 3); SessionPolicy is then empty until Compose fills it.
 	Lookup *Lookup
+	// Implicit is set on an account's implicit grant (design 6.2): a lookup
+	// grant no workload is assigned, which Compose applies to a workload
+	// related to resources of its kind in its account.
+	Implicit bool
 }
 
 // Lookup is a grant's lookup parameter (design 6.2, Level 3).
@@ -65,6 +69,19 @@ type Source interface {
 	// Version identifies the bundle the grants came from; it is reported
 	// in Cracha-Bundle-Version.
 	Version() string
+}
+
+// ImplicitSource is a Source whose bundle has Account documents (design
+// 6.2): besides the grants it resolves by name, the implicit grants, which
+// apply by relation and are never resolved by name, and the account each
+// resource is in. Compose applies them when the Source is one.
+type ImplicitSource interface {
+	Source
+	// ImplicitGrants are the implicit grants, sorted by name.
+	ImplicitGrants() []ResolvedGrant
+	// AccountOf is the account a resource of a kind is in, and false when
+	// the bundle places it in none.
+	AccountOf(kind, name string) (string, bool)
 }
 
 // Static is an in-memory Source.

@@ -166,7 +166,8 @@ type Composition struct {
 	// holdings name no cluster, so the union applies everywhere.
 	Cluster string
 	// Sources are where the grants come from, in order: an assignment's
-	// name, or "service <name>" for a membership.
+	// name, "service <name>" for a membership, and "access" last when the
+	// subject's Access documents bring in implicit grants.
 	Sources []string
 	Grants  []string
 	// Resources are, per lookup grant, the resources its Access documents
@@ -246,6 +247,9 @@ type accessHolding struct {
 	resource Resource
 	relation string
 	clusters []string
+	// account is the account the resource is in (Source.ResourceAccount),
+	// which picks the implicit grant it is rendered into.
+	account string
 }
 
 // accessBySubject lists, per subject, the Access documents that relate it
@@ -263,7 +267,7 @@ func (r *CompositionReport) accessBySubject(src *Source, now time.Time) map[stri
 			r.Expired = append(r.Expired, "access "+a.Name())
 			continue
 		}
-		h := accessHolding{resource: a.Spec.Resource, relation: a.Spec.Relation, clusters: a.Spec.Clusters}
+		h := accessHolding{resource: a.Spec.Resource, relation: a.Spec.Relation, clusters: a.Spec.Clusters, account: src.ResourceAccount(a.Spec.Resource)}
 		subjects := []string{a.Spec.Subject}
 		if a.Spec.Service != "" {
 			subjects = nil
@@ -294,19 +298,38 @@ func (r *CompositionReport) accessBySubject(src *Source, now time.Time) map[stri
 // that scope, and each of its resources must match that grant's envelope
 // (the broker refuses resource_outside_envelope otherwise), within its
 // compiled maximum; one with no resource is left out of the union, as the
-// broker leaves it out. Holdings and access expired at now are left out
-// and reported. When a subject's holdings or access name clusters, one
-// union is checked per named cluster, taking in those that are not
-// cluster-bound; otherwise one union covers every cluster.
+// broker leaves it out. An account's implicit grant for a kind and a
+// permission joins the union, rendered with the subject's resources of the
+// kind in that account, when the subject is related to any and holds no
+// lookup grant of its own for the kind and permission, as the broker
+// applies it; a subject related to resources and holding no grant is
+// checked for those alone. The union is in one account (the broker
+// refuses accounts_mixed otherwise). Holdings and access expired at now
+// are left out and reported. When a subject's holdings or access name
+// clusters, one union is checked per named cluster, taking in those that
+// are not cluster-bound; otherwise one union covers every cluster.
 func LintComposition(src *Source, rendered map[string]string, lookups map[string]*BundleLookup, now time.Time) *CompositionReport {
 	r := &CompositionReport{}
 	bySubject := r.liveBySubject(holdings(src), now)
 	access := r.accessBySubject(src, now)
-	c := composer{src: src, rendered: rendered, lookups: lookups}
-	for _, subject := range sortedKeys(bySubject) {
+	c := newComposer(src, rendered, lookups)
+	subjects := map[string]bool{}
+	for subject := range bySubject {
+		subjects[subject] = true
+	}
+	if len(c.implicit) > 0 {
+		for subject := range access {
+			subjects[subject] = true
+		}
+	}
+	for _, subject := range sortedKeys(subjects) {
 		hs, as := bySubject[subject], access[subject]
 		for _, cluster := range clusterScopes(hs, as) {
-			r.add(c.compose(subject, cluster, holdingsInCluster(hs, cluster), accessInCluster(as, cluster)))
+			comp := c.compose(subject, cluster, holdingsInCluster(hs, cluster), accessInCluster(as, cluster))
+			if len(hs) == 0 && len(comp.Grants) == 0 && comp.Problems.OK() {
+				continue
+			}
+			r.add(comp)
 		}
 	}
 	return r
@@ -391,17 +414,55 @@ func (r *CompositionReport) add(c Composition) {
 
 // composer composes one subject's grants in one cluster scope.
 type composer struct {
-	src      *Source
+	// grants are the compiled grants by name (Source.CompiledGrants);
+	// implicit the implicit ones among them, sorted by name.
+	grants   map[string]*Grant
+	implicit []*Grant
 	rendered map[string]string
 	lookups  map[string]*BundleLookup
+}
+
+func newComposer(src *Source, rendered map[string]string, lookups map[string]*BundleLookup) composer {
+	c := composer{grants: map[string]*Grant{}, rendered: rendered, lookups: lookups}
+	for _, g := range src.CompiledGrants() {
+		c.grants[g.Name()] = g
+		if g.Implicit() {
+			c.implicit = append(c.implicit, g)
+		}
+	}
+	return c
+}
+
+// implicitFor are the implicit grants that apply to a subject holding
+// grants held and related to resources by as: those of a kind and
+// permission no held lookup grant is of, with a resource in their account.
+func (cp composer) implicitFor(held []string, as []accessHolding) []string {
+	covered := map[string]bool{}
+	for _, name := range held {
+		if l := cp.lookups[name]; l != nil {
+			covered[l.Kind+"#"+l.Permission] = true
+		}
+	}
+	var out []string
+	for _, g := range cp.implicit {
+		l := cp.lookups[g.Name()]
+		if l != nil && !covered[l.Kind+"#"+l.Permission] && len(relatedResources(as, l, g.Spec.Account)) > 0 {
+			out = append(out, g.Name())
+		}
+	}
+	return out
 }
 
 func (cp composer) compose(subject, cluster string, hs []holding, as []accessHolding) Composition {
 	c := Composition{Subject: subject, Cluster: cluster, SessionTags: map[string]string{}}
 	c.Sources, c.Grants = heldGrants(hs)
+	if implicit := cp.implicitFor(c.Grants, as); len(implicit) > 0 {
+		c.Sources = append(c.Sources, "access")
+		c.Grants = slices.Sorted(slices.Values(append(c.Grants, implicit...)))
+	}
 	u := newGrantUnion()
 	for _, name := range c.Grants {
-		g := cp.src.Grant(name)
+		g := cp.grants[name]
 		if g == nil {
 			c.Problems.addf("grant %q not found", name)
 			continue
@@ -412,6 +473,9 @@ func (cp composer) compose(subject, cluster string, hs []holding, as []accessHol
 		}
 	}
 	c.Grants = slices.DeleteFunc(c.Grants, func(name string) bool { return slices.Contains(c.Dropped, name) })
+	if accounts := sortedKeys(u.accounts); len(accounts) > 1 {
+		c.Problems.addf("grants span %d accounts (%s); one credential is one account (the broker refuses accounts_mixed)", len(accounts), strings.Join(accounts, ", "))
+	}
 	c.BaseRoles = sortedKeys(u.baseRoles)
 	if len(c.BaseRoles) > 1 {
 		c.Problems.addf("grants span %d base roles (%s); a workload has exactly one shape", len(c.BaseRoles), strings.Join(c.BaseRoles, ", "))
@@ -434,7 +498,11 @@ func (cp composer) policyOf(c *Composition, g *Grant, as []accessHolding) (strin
 	if !ok {
 		return cp.rendered[g.Name()], true
 	}
-	resources := relatedResources(as, l)
+	account := ""
+	if g.Implicit() {
+		account = g.Spec.Account
+	}
+	resources := relatedResources(as, l, account)
 	if len(resources) == 0 {
 		c.Dropped = append(c.Dropped, g.Name())
 		return "", false
@@ -458,12 +526,13 @@ func (cp composer) policyOf(c *Composition, g *Grant, as []accessHolding) (strin
 }
 
 // relatedResources are the names of the resources of the lookup's kind
-// that the access gives its permission on, sorted.
-func relatedResources(as []accessHolding, l *BundleLookup) []string {
+// that the access gives its permission on, sorted; only those in account,
+// when it is set (an implicit grant's).
+func relatedResources(as []accessHolding, l *BundleLookup, account string) []string {
 	relations, _ := RelationsOf(l.Permission)
 	var names []string
 	for _, a := range as {
-		if a.resource.Kind == l.Kind && slices.Contains(relations, a.relation) {
+		if a.resource.Kind == l.Kind && slices.Contains(relations, a.relation) && (account == "" || a.account == account) {
 			names = append(names, a.resource.Name)
 		}
 	}
@@ -488,6 +557,7 @@ func heldGrants(hs []holding) (origins, grants []string) {
 // grantUnion accumulates what a subject's grants put together, apart from
 // the session tags, which go straight on the Composition.
 type grantUnion struct {
+	accounts  map[string]bool
 	baseRoles map[string]bool
 	managed   map[string]bool
 	// tagSetBy is the grant that set each session tag, for the conflict
@@ -498,12 +568,13 @@ type grantUnion struct {
 }
 
 func newGrantUnion() *grantUnion {
-	return &grantUnion{baseRoles: map[string]bool{}, managed: map[string]bool{}, tagSetBy: map[string]string{}}
+	return &grantUnion{accounts: map[string]bool{}, baseRoles: map[string]bool{}, managed: map[string]bool{}, tagSetBy: map[string]string{}}
 }
 
 // add takes one grant into the union; policy is its rendered session
 // policy, empty for a grant without one.
 func (u *grantUnion) add(c *Composition, g *Grant, policy string) {
+	u.accounts[g.Spec.Account] = true
 	u.baseRoles[g.Spec.BaseRole] = true
 	for _, arn := range g.Spec.ManagedPolicyArns {
 		u.managed[arn] = true

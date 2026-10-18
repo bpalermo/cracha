@@ -1,0 +1,6 @@
+kind: Assignment
+metadata:
+  name: legacy
+spec:
+  subject: prod/legacy/batch
+  grants: [legacy-batch]

@@ -386,3 +386,59 @@ func TestConvertLookupGrant(t *testing.T) {
 		}
 	}
 }
+
+func TestConvertImplicitGrants(t *testing.T) {
+	lookup := &grant.BundleLookup{Param: "bucket", Kind: "s3_bucket", Permission: "read", MaxResources: 3}
+	implicit := func(account string) grant.BundleGrant {
+		return grant.BundleGrant{Name: "account:" + account + ":s3_bucket:read", Account: account, Lookup: lookup, Implicit: true}
+	}
+	accounts := []grant.BundleAccount{
+		{Name: "a", ID: "111122223333", Resources: []grant.Resource{{Kind: "s3_bucket", Name: "data-a"}}},
+		{Name: "b", ID: "444455556666", Resources: []grant.Resource{{Kind: "s3_bucket", Name: "data-b"}}},
+	}
+	b := &grant.Bundle{Version: "v1", Accounts: accounts, Grants: []grant.BundleGrant{implicit("444455556666"), implicit("111122223333"), {Name: "plain"}}}
+	snap, err := convert(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Source{}
+	s.current.Store(snap)
+	if _, ok := s.Lookup("account:111122223333:s3_bucket:read"); ok {
+		t.Error("an implicit grant is found by name; it is never held")
+	}
+	if _, ok := s.Lookup("plain"); !ok {
+		t.Error("the plain grant is not found")
+	}
+	got := s.ImplicitGrants()
+	if len(got) != 2 || got[0].Account != "111122223333" || !got[0].Implicit || got[0].Lookup == nil {
+		t.Errorf("implicit grants = %+v", got)
+	}
+	for name, want := range map[string]string{"data-a": "111122223333", "data-b": "444455556666", "data-c": ""} {
+		if id, ok := s.AccountOf("s3_bucket", name); id != want || ok != (want != "") {
+			t.Errorf("AccountOf(%s) = %q, %v, want %q", name, id, ok, want)
+		}
+	}
+
+	one := &grant.Bundle{Version: "v1", Accounts: accounts[:1], Grants: []grant.BundleGrant{implicit("111122223333")}}
+	snap, err = convert(one)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.current.Store(snap)
+	if id, ok := s.AccountOf("s3_bucket", "anything"); id != "111122223333" || !ok {
+		t.Errorf("with one account, AccountOf = %q, %v, want it", id, ok)
+	}
+
+	for name, bad := range map[string]*grant.Bundle{
+		"an implicit grant without a lookup": {Version: "v1", Accounts: accounts, Grants: []grant.BundleGrant{{Name: "x", Account: "111122223333", Implicit: true}}},
+		"an implicit grant of no account":    {Version: "v1", Accounts: accounts[:1], Grants: []grant.BundleGrant{implicit("444455556666")}},
+		"an account listed twice":            {Version: "v1", Accounts: []grant.BundleAccount{accounts[0], accounts[0]}, Grants: []grant.BundleGrant{}},
+		"a resource in two accounts": {Version: "v1", Grants: []grant.BundleGrant{}, Accounts: []grant.BundleAccount{
+			accounts[0], {Name: "b", ID: "444455556666", Resources: accounts[0].Resources},
+		}},
+	} {
+		if _, err := convert(bad); err == nil {
+			t.Errorf("a bundle with %s converted", name)
+		}
+	}
+}

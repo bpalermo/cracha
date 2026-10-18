@@ -1,0 +1,15 @@
+{
+  "params": {
+    "table": { "type": "string", "description": "the table that may be read" }
+  },
+  "policy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": ["dynamodb:GetItem", "dynamodb:Query"],
+        "Resource": "arn:aws:dynamodb:*:${account}:table/${table}"
+      }
+    ]
+  }
+}

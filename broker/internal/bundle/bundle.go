@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand/v2"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,6 +46,14 @@ var errNotLoaded = errors.New("no grant bundle loaded yet")
 type snapshot struct {
 	version string
 	grants  map[string]grants.ResolvedGrant
+	// implicit are the accounts' implicit grants, sorted by name, which
+	// apply by relation and are never looked up by name.
+	implicit []grants.ResolvedGrant
+	// placed maps kind\x00name to the account a resource is in; only is
+	// the bundle's one account, which holds every resource, when it has
+	// exactly one.
+	placed map[string]string
+	only   string
 }
 
 // Source is a grants.Source that serves the last good bundle.
@@ -102,6 +111,10 @@ func New(fetcher Fetcher, verifier grant.Verifier, opts Options) *Source {
 	return &Source{fetcher: fetcher, verifier: verifier, interval: opts.PollInterval, log: opts.Log, assignments: opts.Assignments}
 }
 
+// A bundle's accounts carry implicit grants, which Compose finds through
+// this interface.
+var _ grants.ImplicitSource = (*Source)(nil)
+
 // Lookup implements grants.Source. Nothing is found until a bundle loads.
 func (s *Source) Lookup(name string) (grants.ResolvedGrant, bool) {
 	snap := s.current.Load()
@@ -110,6 +123,29 @@ func (s *Source) Lookup(name string) (grants.ResolvedGrant, bool) {
 	}
 	g, ok := snap.grants[name]
 	return g, ok
+}
+
+// ImplicitGrants implements grants.ImplicitSource: the implicit grants of
+// the loaded bundle's accounts.
+func (s *Source) ImplicitGrants() []grants.ResolvedGrant {
+	snap := s.current.Load()
+	if snap == nil {
+		return nil
+	}
+	return snap.implicit
+}
+
+// AccountOf implements grants.ImplicitSource: the account the bundle
+// places a resource in, every resource being in a bundle's only account.
+func (s *Source) AccountOf(kind, name string) (string, bool) {
+	snap := s.current.Load()
+	if snap == nil {
+		return "", false
+	}
+	if id, ok := snap.placed[kind+"\x00"+name]; ok {
+		return id, true
+	}
+	return snap.only, snap.only != ""
 }
 
 // Version implements grants.Source: the loaded bundle's version field,
@@ -266,13 +302,19 @@ func (s *Source) reject(key, version string, err error) error {
 // design (common/grant's BundleGrant names the fields of ResolvedGrant).
 func convert(b *grant.Bundle) (*snapshot, error) {
 	snap := &snapshot{version: b.Version, grants: make(map[string]grants.ResolvedGrant, len(b.Grants))}
+	accounts, err := snap.placeAccounts(b.Accounts)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
 	for _, g := range b.Grants {
 		if g.Name == "" {
 			return nil, errors.New("bundle: a grant has no name")
 		}
-		if _, dup := snap.grants[g.Name]; dup {
+		if seen[g.Name] {
 			return nil, fmt.Errorf("bundle: grant %q listed twice", g.Name)
 		}
+		seen[g.Name] = true
 		if g.Duration < 0 || g.Duration > math.MaxInt32 {
 			return nil, fmt.Errorf("bundle: grant %q: duration %d is out of range", g.Name, g.Duration)
 		}
@@ -280,7 +322,10 @@ func convert(b *grant.Bundle) (*snapshot, error) {
 		if err != nil {
 			return nil, err
 		}
-		snap.grants[g.Name] = grants.ResolvedGrant{
+		if err := checkImplicit(g, accounts); err != nil {
+			return nil, err
+		}
+		rg := grants.ResolvedGrant{
 			Name:              g.Name,
 			Account:           g.Account,
 			BaseRole:          g.BaseRole,
@@ -290,9 +335,55 @@ func convert(b *grant.Bundle) (*snapshot, error) {
 			DurationSeconds:   int32(g.Duration),
 			Envelope:          g.Envelope,
 			Lookup:            lookup,
+			Implicit:          g.Implicit,
+		}
+		if g.Implicit {
+			snap.implicit = append(snap.implicit, rg)
+			continue
+		}
+		snap.grants[g.Name] = rg
+	}
+	sort.Slice(snap.implicit, func(i, j int) bool { return snap.implicit[i].Name < snap.implicit[j].Name })
+	return snap, nil
+}
+
+// placeAccounts records where the bundle's accounts place resources and
+// returns the account ids. An account listed twice, or a resource placed
+// in two, rejects the bundle.
+func (snap *snapshot) placeAccounts(accounts []grant.BundleAccount) (map[string]bool, error) {
+	ids := map[string]bool{}
+	snap.placed = map[string]string{}
+	for _, a := range accounts {
+		if a.ID == "" || ids[a.ID] {
+			return nil, fmt.Errorf("bundle: account %q (%q) is empty or listed twice", a.Name, a.ID)
+		}
+		ids[a.ID] = true
+		for _, r := range a.Resources {
+			key := r.Kind + "\x00" + r.Name
+			if prev, dup := snap.placed[key]; dup && prev != a.ID {
+				return nil, fmt.Errorf("bundle: %s is placed in accounts %s and %s", r, prev, a.ID)
+			}
+			snap.placed[key] = a.ID
 		}
 	}
-	return snap, nil
+	if len(accounts) == 1 {
+		snap.only = accounts[0].ID
+	}
+	return ids, nil
+}
+
+// checkImplicit rejects an implicit grant that is not a lookup grant or is
+// in no account of the bundle.
+func checkImplicit(g grant.BundleGrant, accounts map[string]bool) error {
+	switch {
+	case !g.Implicit:
+		return nil
+	case g.Lookup == nil:
+		return fmt.Errorf("bundle: implicit grant %q has no lookup", g.Name)
+	case !accounts[g.Account]:
+		return fmt.Errorf("bundle: implicit grant %q is in account %s, which the bundle does not list", g.Name, g.Account)
+	}
+	return nil
 }
 
 // lookupOf is a lookup grant's lookup, rendered by common/grant's own

@@ -27,13 +27,13 @@ broker:
   # grantc compiled from the Services and Assignments of e2e/grants and
   # published with the bundle, as every cluster of a fleet would read them.
   # The e2e namespace's client holds one grant through its service, the
-  # reader that grant and the lookup grant with the bucket its Access
-  # document gives; unassigned is not there at all.
+  # reader that grant and, through its Access document, the account's
+  # implicit grant for the bucket it gives; unassigned is not there at all.
   assignments:
     source: published
   # The grants come the production way: a bundle run.sh compiles from
-  # e2e/grants (one grant on one shape role, with a session policy inside
-  # its envelope), signs with a key it generates and publishes, with the
+  # e2e/grants (one grant and the account's implicit grant, on the account
+  # role, each with a session policy inside its envelope), signs with a key it generates and publishes, with the
   # assignments, into the ConfigMap cracha-e2e-bundle, mounted at this
   # directory. The volume (whose item paths carry the version) and the
   # public key are in the values file run.sh writes beside this one. The

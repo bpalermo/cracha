@@ -14,6 +14,7 @@ const (
 	KindAssignment = "Assignment"
 	KindService    = "Service"
 	KindAccess     = "Access"
+	KindAccount    = "Account"
 )
 
 // STS limits the pipeline lints against (design 6.2 step 4 and 6.6).
@@ -63,17 +64,27 @@ type Grant struct {
 	// Path is the file the grant was loaded from, relative to the source
 	// root, for messages.
 	Path string `json:"-"`
+	// implicit is set on a grant generated from an Account's access table
+	// (Source.CompiledGrants), never on one loaded from a file.
+	implicit bool
 }
 
 // Name returns the grant's name.
 func (g *Grant) Name() string { return g.Metadata.Name }
 
+// Implicit reports whether the grant was generated from an Account's
+// access table rather than written as a Grant document: it is never
+// assigned, and applies to a workload by the resources it is related to.
+func (g *Grant) Implicit() bool { return g.implicit }
+
 // GrantSpec is the body of a Grant.
 type GrantSpec struct {
 	// Account is the 12-digit AWS account the base role lives in.
 	Account string `json:"account"`
-	// BaseRole is the ARN of the shape role the broker assumes.
-	BaseRole string `json:"baseRole"`
+	// BaseRole is the ARN of the role the broker assumes. Empty means the
+	// role of the grant's account, its Account document's spec.role; set,
+	// it is a dedicated shape role, the override.
+	BaseRole string `json:"baseRole,omitempty"`
 	// SessionPolicy names a template and the parameters it is rendered with.
 	SessionPolicy *SessionPolicy `json:"sessionPolicy,omitempty"`
 	// ManagedPolicyArns are passed to STS as session managed policies.
@@ -83,7 +94,8 @@ type GrantSpec struct {
 	// Duration is the session duration in seconds; 0 means DefaultDuration.
 	Duration int `json:"duration,omitempty"`
 	// Envelope is the ARN allowlist every resource of the rendered policy
-	// must match.
+	// must match. Empty means the envelope of the grant's Account document,
+	// when it sets one.
 	Envelope []string `json:"envelope,omitempty"`
 }
 
@@ -297,10 +309,66 @@ type AccessSpec struct {
 type Resource struct {
 	Kind string `json:"kind"`
 	Name string `json:"name"`
+	// Account, on an Access document only, is the 12-digit account the
+	// resource is in, which decides the implicit grant it is rendered into
+	// (Source.ResourceAccount). Empty means the tree's only Account. It is
+	// never part of the published assignments: the store relates by name.
+	Account string `json:"account,omitempty"`
 }
 
 // String is kind:name, for messages.
 func (r Resource) String() string { return r.Kind + ":" + r.Name }
+
+// Account is a kind: Account document (design 6.2): one AWS account, the
+// role every grant of the account is issued on unless it names its own,
+// the default envelope of its grants, and its access table, the implicit
+// grants a workload gets by being related to a resource of the account.
+type Account struct {
+	Kind     string      `json:"kind"`
+	Metadata Metadata    `json:"metadata"`
+	Spec     AccountSpec `json:"spec"`
+	// Path is the file the account was loaded from, relative to the source
+	// root, for messages.
+	Path string `json:"-"`
+}
+
+// Name returns the account document's name.
+func (a *Account) Name() string { return a.Metadata.Name }
+
+// AccountSpec is the body of an Account.
+type AccountSpec struct {
+	// ID is the 12-digit AWS account.
+	ID string `json:"id"`
+	// Role is the ARN of the account role, in the account: the role of
+	// every grant of the account that names no baseRole, and of every
+	// implicit grant.
+	Role string `json:"role"`
+	// Envelope is the envelope of every grant of the account that sets
+	// none, and of every implicit grant; required with Access.
+	Envelope []string `json:"envelope,omitempty"`
+	// Access is the account's access table: what holding a permission on a
+	// resource of a kind in this account means in IAM.
+	Access []AccountAccess `json:"access,omitempty"`
+}
+
+// AccountAccess is one entry of an account's access table: a workload that
+// holds Permission on resources of Kind in the account gets Template
+// rendered for those resources, as a lookup grant named
+// ImplicitGrantName(account, kind, permission).
+type AccountAccess struct {
+	Kind       string `json:"kind"`
+	Permission string `json:"permission"`
+	Template   string `json:"template"`
+	// Param is the template parameter the resources fill. Empty means the
+	// one parameter of the template that neither Params gives nor has a
+	// default.
+	Param string `json:"param,omitempty"`
+	// Params are the template's other parameters; none is a lookup.
+	Params      map[string]Param  `json:"params,omitempty"`
+	SessionTags map[string]string `json:"sessionTags,omitempty"`
+	// Duration is the session duration in seconds; 0 means DefaultDuration.
+	Duration int `json:"duration,omitempty"`
+}
 
 // parseExpiry parses an expiresAt field; empty is the zero time.
 func parseExpiry(s string) (time.Time, error) {
@@ -320,6 +388,22 @@ type Bundle struct {
 	Version     string        `json:"version"`
 	GeneratedAt string        `json:"generatedAt"`
 	Grants      []BundleGrant `json:"grants"`
+	// Accounts are the tree's Account documents. Absent when it has none,
+	// so a bundle without them is what it was before them.
+	Accounts []BundleAccount `json:"accounts,omitempty"`
+}
+
+// BundleAccount is one Account as the broker needs it: which account its
+// implicit grants are in and which resources are in it.
+type BundleAccount struct {
+	Name     string   `json:"name"`
+	ID       string   `json:"id"`
+	Role     string   `json:"role"`
+	Envelope []string `json:"envelope"`
+	// Resources are the resources the tree's Access documents place in the
+	// account, sorted; listed only when the bundle has more than one
+	// account, since with one every resource is in it.
+	Resources []Resource `json:"resources,omitempty"`
 }
 
 // BundleGrant is one compiled grant: the Grant with its session policy
@@ -338,6 +422,11 @@ type BundleGrant struct {
 	// renders the policy at issuance. Absent on every other grant, so a
 	// bundle without lookup grants is what it was before them.
 	Lookup *BundleLookup `json:"lookup,omitempty"`
+	// Implicit is set on a grant generated from an Account's access table:
+	// a lookup grant the broker applies to a workload related to resources
+	// of its kind in its account, without its being assigned. Absent on
+	// every other grant.
+	Implicit bool `json:"implicit,omitempty"`
 }
 
 // BundleLookup is what the broker needs to render a lookup grant's policy

@@ -1,0 +1,12 @@
+# The other bucket of the stub's world, cracha-e2e-other, is another
+# workload's: it must not reach the reader's session policy. The bystander
+# runs nowhere in the suite; a workload that does, the client, would get
+# the account's implicit grant for it and change what the credentials
+# tests expect of the client.
+kind: Access
+metadata:
+  name: e2e-bystander-other
+spec:
+  subject: cracha/e2e/bystander
+  resource: { kind: s3_bucket, name: cracha-e2e-other }
+  relation: reader

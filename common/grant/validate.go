@@ -55,26 +55,51 @@ func validateName(what, name string) error {
 	return nil
 }
 
-// grantChecks are the rules ValidateGrant applies, in the order their
-// problems are reported.
-var grantChecks = []func(g *Grant) errList{
-	validateGrantHeader,
-	func(g *Grant) errList { return validateAccountAndRole(&g.Spec) },
-	func(g *Grant) errList { return validateSessionPolicy(&g.Spec) },
-	func(g *Grant) errList { return validateManagedPolicyArns(&g.Spec) },
-	func(g *Grant) errList { return validateDuration(&g.Spec) },
-	func(g *Grant) errList { return validateEnvelope(&g.Spec) },
-	func(g *Grant) errList { return validateTags(g.Spec.SessionTags) },
+// grantChecks are the rules validateGrant applies, in the order their
+// problems are reported. acct is the Account document of the grant's
+// account, or nil when the tree has none: it supplies the role and the
+// envelope a grant may leave out.
+var grantChecks = []func(g *Grant, acct *Account) errList{
+	func(g *Grant, _ *Account) errList { return validateGrantHeader(g) },
+	validateGrantSpec,
+}
+
+// grantSpecChecks are the rules on a grant's spec, which an implicit
+// grant, whose name is generated, is held to as well.
+var grantSpecChecks = []func(s *GrantSpec, acct *Account) errList{
+	validateAccountAndRole,
+	validateSessionPolicy,
+	func(s *GrantSpec, _ *Account) errList { return validateManagedPolicyArns(s) },
+	func(s *GrantSpec, _ *Account) errList { return validateDuration(s) },
+	func(s *GrantSpec, _ *Account) errList { return validateEnvelope(s.Envelope) },
+	func(s *GrantSpec, _ *Account) errList { return validateTags(s.SessionTags) },
 }
 
 // ValidateGrant checks a Grant against the rules of design 6.2 and the STS
-// limits, and returns every problem found, joined.
+// limits, and returns every problem found, joined. It knows no Account
+// document, so a grant that leaves its baseRole to its account's is
+// reported; ValidateSource checks such a grant against the tree's.
 func ValidateGrant(g *Grant) error {
+	return validateGrant(g, nil)
+}
+
+// validateGrant is ValidateGrant with the grant's Account document, nil
+// when the tree has none for its account.
+func validateGrant(g *Grant, acct *Account) error {
 	var errs errList
 	for _, check := range grantChecks {
-		errs = append(errs, check(g)...)
+		errs = append(errs, check(g, acct)...)
 	}
 	return errors.Join(errs...)
+}
+
+// validateGrantSpec applies grantSpecChecks.
+func validateGrantSpec(g *Grant, acct *Account) errList {
+	var errs errList
+	for _, check := range grantSpecChecks {
+		errs = append(errs, check(&g.Spec, acct)...)
+	}
+	return errs
 }
 
 // validateGrantHeader checks the kind and the name.
@@ -88,29 +113,44 @@ func validateGrantHeader(g *Grant) errList {
 }
 
 // validateAccountAndRole checks the account and that the base role is a
-// role of that account.
-func validateAccountAndRole(s *GrantSpec) errList {
+// role of that account. A grant without a base role takes its account's
+// role, which needs the account's Account document.
+func validateAccountAndRole(s *GrantSpec, acct *Account) errList {
 	var errs errList
 	if !accountRE.MatchString(s.Account) {
 		errs.addf("account %q: must be 12 digits", s.Account)
 	}
-	m := roleARNRE.FindStringSubmatch(s.BaseRole)
-	if m == nil {
-		errs.addf("baseRole %q: must be an IAM role ARN", s.BaseRole)
+	if s.BaseRole == "" {
+		if acct == nil {
+			errs.addf("baseRole: required, since no Account document of account %s gives the account role", s.Account)
+		}
 		return errs
 	}
-	if m[1] != s.Account {
-		errs.addf("baseRole %q: account %s does not match the grant's account %s", s.BaseRole, m[1], s.Account)
+	return append(errs, validateRole("baseRole", s.BaseRole, s.Account, "the grant's account")...)
+}
+
+// validateRole checks that arn is an IAM role ARN in account, with a role
+// name IAM accepts; field and whose name them in messages.
+func validateRole(field, arn, account, whose string) errList {
+	var errs errList
+	m := roleARNRE.FindStringSubmatch(arn)
+	if m == nil {
+		errs.addf("%s %q: must be an IAM role ARN", field, arn)
+		return errs
+	}
+	if m[1] != account {
+		errs.addf("%s %q: account %s does not match %s %s", field, arn, m[1], whose, account)
 	}
 	if len(m[2]) > 64 {
-		errs.addf("baseRole %q: role name longer than 64 characters", s.BaseRole)
+		errs.addf("%s %q: role name longer than 64 characters", field, arn)
 	}
 	return errs
 }
 
 // validateSessionPolicy checks the session policy reference, and that a
-// grant without one carries managed policies instead.
-func validateSessionPolicy(s *GrantSpec) errList {
+// grant without one carries managed policies instead. The envelope a
+// session policy needs may be the account's.
+func validateSessionPolicy(s *GrantSpec, acct *Account) errList {
 	var errs errList
 	sp := s.SessionPolicy
 	if sp == nil {
@@ -135,8 +175,8 @@ func validateSessionPolicy(s *GrantSpec) errList {
 	if lookups > 1 {
 		errs.addf("sessionPolicy.params: %d lookup parameters, at most one is allowed; a grant per kind of resource", lookups)
 	}
-	if len(s.Envelope) == 0 {
-		errs.addf("envelope is required when a sessionPolicy is set")
+	if len(s.Envelope) == 0 && (acct == nil || len(acct.Spec.Envelope) == 0) {
+		errs.addf("envelope is required when a sessionPolicy is set, on the grant or on its Account document")
 	}
 	return errs
 }
@@ -177,10 +217,10 @@ func validateDuration(s *GrantSpec) errList {
 
 // validateEnvelope checks that every envelope entry is an ARN pattern
 // listed once.
-func validateEnvelope(s *GrantSpec) errList {
+func validateEnvelope(envelope []string) errList {
 	var errs errList
 	seen := map[string]bool{}
-	for _, pattern := range s.Envelope {
+	for _, pattern := range envelope {
 		if seen[pattern] {
 			errs.addf("envelope: %q listed twice", pattern)
 		}
@@ -339,6 +379,9 @@ func ValidateAccess(a *Access) error {
 	} else {
 		errs.add(k.Validate(s.Resource.Name))
 	}
+	if s.Resource.Account != "" && !accountRE.MatchString(s.Resource.Account) {
+		errs.addf("resource.account %q: must be 12 digits", s.Resource.Account)
+	}
 	if !validRelation(s.Relation) {
 		errs.addf("relation %q: want %s or %s", s.Relation, RelationReader, RelationWriter)
 	}
@@ -372,6 +415,7 @@ func validateClusters(clusters []string) errList {
 // service must exist.
 func ValidateSource(src *Source) error {
 	var errs errList
+	errs = append(errs, validateSourceAccounts(src)...)
 	for _, g := range src.Grants {
 		errs.add(validateSourceGrant(src, g))
 	}
@@ -385,6 +429,7 @@ func ValidateSource(src *Source) error {
 	for _, a := range src.Accesses {
 		errs.add(validateSourceAccess(src, a))
 	}
+	errs = append(errs, validatePlacement(src)...)
 	return errors.Join(errs...)
 }
 
@@ -396,6 +441,12 @@ func validateSourceAccess(src *Source, a *Access) error {
 	}
 	if a.Spec.Service != "" && src.Service(a.Spec.Service) == nil {
 		return fmt.Errorf("access %s (%s): service %q not found", a.Name(), a.Path, a.Spec.Service)
+	}
+	switch account := a.Spec.Resource.Account; {
+	case account != "" && src.Account(account) == nil:
+		return fmt.Errorf("access %s (%s): resource.account %q: no Account document has that id", a.Name(), a.Path, account)
+	case account == "" && len(src.Accounts) > 1:
+		return fmt.Errorf("access %s (%s): resource.account is required: the tree has %d Account documents, and which one the resource is in decides its implicit grant", a.Name(), a.Path, len(src.Accounts))
 	}
 	return nil
 }
@@ -427,7 +478,7 @@ func validateSourceService(src *Source, s *Service, memberOf map[string]*Service
 // validateSourceGrant validates one grant and, when it is valid, that the
 // template it names exists.
 func validateSourceGrant(src *Source, g *Grant) error {
-	if err := ValidateGrant(g); err != nil {
+	if err := validateGrant(g, src.Account(g.Spec.Account)); err != nil {
 		return fmt.Errorf("grant %s (%s): %w", g.Name(), g.Path, err)
 	}
 	sp := g.Spec.SessionPolicy
