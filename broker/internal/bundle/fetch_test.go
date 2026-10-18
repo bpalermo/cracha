@@ -172,16 +172,6 @@ func TestPointerIsNotTrusted(t *testing.T) {
 	}
 }
 
-func TestObjectSizeIsBounded(t *testing.T) {
-	huge := bytes.Repeat([]byte("x"), maxObjectBytes+1)
-	if _, err := readAll(bytes.NewReader(huge)); err == nil {
-		t.Error("an oversized object was read")
-	}
-	if got, err := readAll(bytes.NewReader(huge[:maxObjectBytes])); err != nil || len(got) != maxObjectBytes {
-		t.Errorf("an object at the limit: %d bytes, %v", len(got), err)
-	}
-}
-
 // The S3 fetcher reads a version's assignments beside its bundle when
 // asked, and fails when they are not there.
 func TestS3FetcherAssignments(t *testing.T) {

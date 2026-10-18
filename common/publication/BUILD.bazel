@@ -1,0 +1,23 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "publication",
+    srcs = [
+        "fetch.go",
+        "poller.go",
+    ],
+    importpath = "github.com/bpalermo/cracha/common/publication",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//common/grant",
+        "@com_github_aws_aws_sdk_go_v2//aws",
+        "@com_github_aws_aws_sdk_go_v2_service_s3//:s3",
+    ],
+)
+
+go_test(
+    name = "publication_test",
+    srcs = ["publication_test.go"],
+    embed = [":publication"],
+    deps = ["//common/grant"],
+)
