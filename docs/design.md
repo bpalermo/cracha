@@ -344,7 +344,7 @@ Authentication:
 
 ### 6.8 Revocation
 
-1. Stop issuance: remove the relationship (or suspend the grant in the bundle) and flush the cache via Watch.
+1. Stop issuance: remove the relationship (or suspend the grant in the bundle) and flush the cache via Watch. The kind suite exercises this (`E2E_AUTHZ=spicedb e2e/run.sh`): the reconciler removes the assignment, the next fetch is refused within seconds and the broker's log shows the flush came from Watch.
 2. Kill live sessions: `revoke-tool` attaches an inline deny to the shape role, scoped to one workload, and removes it after 1h:
 
 ```json

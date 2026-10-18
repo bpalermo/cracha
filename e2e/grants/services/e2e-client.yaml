@@ -1,0 +1,16 @@
+# The suite's one service: the assigned workload, the team that owns it
+# and the grant every member holds. This is the source of what the
+# authorization store gives the client, in both of the suite's modes:
+# e2e/values.yaml carries the same service as the static backend's
+# assignments document (the suite checks the two agree), and in spicedb mode
+# e2e/run.sh has cracha-reconciler write this tree's relationships to
+# SpiceDB. The composition lint checks it against the grant at compile
+# time. Subjects are the authz encoding <trust-domain label>/<ns>/<sa>.
+kind: Service
+metadata:
+  name: e2e-client
+spec:
+  team: platform
+  members: [cracha/e2e/client]
+  grants:
+    - name: e2e-s3-reader

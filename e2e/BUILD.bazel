@@ -4,24 +4,28 @@ load("@rules_shell//shell:sh_library.bzl", "sh_library")
 go_test(
     name = "e2e_test",
     srcs = [
+        "assignments_test.go",
         "credentials_test.go",
         "csi_test.go",
         "main_test.go",
         "rotation_test.go",
+        "spicedb_test.go",
         "webhook_test.go",
     ],
     # What e2e/run.sh deploys beside the chart and runs: the manifests, the
-    # values files, the grant sources it compiles into the bundle, spire.sh
-    # and run.sh itself. The test reads none of them; they are its data so
-    # that a change to any of them impacts the test in the Bazel graph,
-    # which is how CI decides whether to run the kind job
-    # (bazel/ci-impacted-targets.sh).
+    # values files, the grant sources it compiles into the bundle and, in
+    # spicedb mode, reconciles into SpiceDB, spire.sh, run.sh itself and
+    # the reconciler. They are its data so that a change to any of them
+    # impacts the test in the Bazel graph, which is how CI decides whether
+    # to run the kind job (bazel/ci-impacted-targets.sh). The test reads
+    # the grant sources and values.yaml (assignments_test.go) and runs the
+    # reconciler (spicedb_test.go); the rest it never opens.
     data = glob([
         "grants/**",
         "manifests/*",
         "*.sh",
         "*.yaml",
-    ]),
+    ]) + ["//reconciler"],
     # Needs a cluster: excluded from `bazel test //...` by the e2e tag (see
     # .bazelrc) and run unsandboxed by e2e/run.sh, so it can read the
     # kubeconfig KUBECONFIG names.
@@ -30,10 +34,13 @@ go_test(
         "local",
     ],
     deps = [
+        "//common/grant",
+        "@in_gopkg_yaml_v3//:yaml_v3",
         "@io_k8s_api//core/v1:core",
         "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
         "@io_k8s_client_go//kubernetes",
         "@io_k8s_client_go//tools/clientcmd",
+        "@rules_go//go/runfiles",
     ],
 )
 

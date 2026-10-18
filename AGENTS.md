@@ -26,6 +26,7 @@ bazel build --config=ci //...   # what CI builds: lockfile must be current, shel
 
 ```bash
 e2e/run.sh                      # the whole system in a kind cluster
+E2E_AUTHZ=spicedb e2e/run.sh    # with SpiceDB as the authorization backend
 E2E_FILTER=TestName e2e/run.sh  # only the tests whose name matches
 E2E_KEEP_CLUSTER=1 e2e/run.sh   # leave the cluster up to look around
 ```
@@ -41,9 +42,19 @@ signed with a throwaway key and published into a ConfigMap,
 deploys the STS stand-in (`e2e/manifests/stsstub.yaml`, `e2e/stsstub`) and
 runs the tests against the ambient kubeconfig. The chart's generated CA is
 what the test workloads trust: run.sh copies it from the `cracha-ca` Secret
-into a ConfigMap of the test namespace. CI runs the same script. Every change
-that adds user-visible behaviour extends the suite, and a change to how
-Crachá is deployed goes in the chart, not in a manifest.
+into a ConfigMap of the test namespace. `E2E_AUTHZ` picks the broker's
+authorization backend: `static` (the default) is the assignments document
+in `e2e/values.yaml`; `spicedb` also deploys SpiceDB from
+`e2e/manifests/spicedb.yaml` (memory datastore, plaintext gRPC, a preshared
+key the script makes), runs `cracha-reconciler` built from the checkout on
+the host through a `kubectl port-forward` to write the schema and the
+relationships of `e2e/grants`, and installs the chart with
+`e2e/values-spicedb.yaml` on top. The tests that need SpiceDB (revocation
+through Watch, suspension, the cache's mode) skip in static mode; the rest
+run in both, and one of them checks that the static document and the grant
+tree assign the same things. CI runs the script once per backend. Every
+change that adds user-visible behaviour extends the suite, and a change to
+how Crachá is deployed goes in the chart, not in a manifest.
 
 Bazel is the only build. Never run the host `go` tool: not `go mod tidy`, not
 `go get`, not `go test`. Change a Go dependency through rules_go's SDK:
