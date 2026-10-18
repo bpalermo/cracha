@@ -383,7 +383,10 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   ClusterRole has `get` and `patch` on that one object by `resourceNames`).
   The configuration's `namespaceSelector` excludes the release namespace
   and `webhook.excludedNamespaces` (a list that replaces the default of
-  SPIRE's namespaces and `kube-system`). The webhook reads the agent's
+  SPIRE's namespaces and `kube-system`), and, when
+  `webhook.namespaceLabels` is set, requires those labels: with
+  `failurePolicy: Fail` an unreachable webhook refuses every pod it covers,
+  so a cluster shared with other workloads installs it opt-in. The webhook reads the agent's
   values `agent.image`, `agent.port`, `agent.enrol` (`init` injects the
   `cracha-enrol` init container, `cni` nothing but env and label),
   `agent.enrolPort`, `agent.enrolTimeout` and `agent.enrolResources`;
