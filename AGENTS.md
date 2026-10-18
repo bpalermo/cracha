@@ -312,6 +312,12 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   decodes the `helm_template` renderings of `BUILD.bazel`; an assertion
   on what a template renders goes there, since `helm_template_test` only
   renders).
+- `agent.brokerAPI.group` gives the agent the Broker API socket's group as
+  a supplementary group: SPIRE's socket is 0770, owned by the spire-agent's
+  uid and gid (1000 with the SPIRE chart), and the agent is root without
+  `CAP_DAC_OVERRIDE`. The e2e runs SPIRE's agent as 1000:1000 (run.sh owns
+  the socket directories on the node to it first) so a missing group fails
+  the suite (`TestAgentBrokerAPIGroup` covers the render).
 - The agent DaemonSet tolerates no taint by default
   (`TestAgentTolerations`): it must run exactly where the identity issuer's
   agent does, since its hostPath mounts of the issuer's sockets fail

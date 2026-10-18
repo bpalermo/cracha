@@ -341,6 +341,14 @@ agent:
   brokerAPI:
     hostPath: /run/spire/broker-sockets
     socket: broker.sock
+    # The group that owns the Broker API socket, given to the agent as a
+    # supplementary group. The agent runs as root with every capability
+    # dropped but SYS_ADMIN, so it cannot open a socket of another user
+    # without being in its group. The SPIRE chart creates the socket mode
+    # 0770, owned by the spire-agent's uid and gid (1000 with its
+    # recommended securityContext): set 1000 there. Empty when the issuer's
+    # agent runs as root.
+    group: ""
 
   # The port of the agent's /healthz and /readyz, on the node's address.
   healthzPort: 9799

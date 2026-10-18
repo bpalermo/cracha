@@ -168,6 +168,12 @@ for image in "${images[@]}"; do
 done
 
 # The identity issuer, with the entries of every component and test workload.
+# The SPIRE agent runs as 1000:1000, as on a real install of the SPIRE chart,
+# so the directories it puts its sockets in on the node are made its own
+# first (a hostPath DirectoryOrCreate is created root-owned).
+for node in $(kind get nodes --name "${cluster}"); do
+	docker exec "${node}" sh -c 'mkdir -p /run/spire/agent-sockets /run/spire/broker-sockets && chown 1000:1000 /run/spire/agent-sockets /run/spire/broker-sockets'
+done
 e2e/spire.sh
 
 # The grants, the production way (design 6.2): the bundle is compiled from

@@ -1,6 +1,7 @@
 package cracha
 
 import (
+	"fmt"
 	"reflect"
 	"slices"
 	"strings"
@@ -331,6 +332,25 @@ func TestAgentTolerations(t *testing.T) {
 			if path(tol, "key") == nil && path(tol, "operator") == "Exists" {
 				t.Errorf("%s: a toleration of every taint", tc.rendering)
 			}
+		}
+	}
+}
+
+// TestAgentBrokerAPIGroup: agent.brokerAPI.group becomes the agent pod's one
+// supplementary group, so it can open an issuer socket another user owns;
+// the defaults add none.
+func TestAgentBrokerAPIGroup(t *testing.T) {
+	for _, tc := range []struct {
+		rendering, name string
+		want            []any
+	}{
+		{"defaults", "cracha-agent", nil},
+		{"overrides", "custom-agent", []any{1000}},
+	} {
+		ds := object(t, rendered(t, tc.rendering), "DaemonSet", tc.name)
+		got, _ := path(ds, "spec", "template", "spec", "securityContext", "supplementalGroups").([]any)
+		if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+			t.Errorf("%s: supplementalGroups %v, want %v", tc.rendering, got, tc.want)
 		}
 	}
 }

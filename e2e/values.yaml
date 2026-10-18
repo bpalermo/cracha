@@ -69,6 +69,9 @@ agent:
   brokerAPI:
     hostPath: /run/spire/broker-sockets
     socket: broker.sock
+    # The SPIRE agent runs as 1000:1000 (e2e/spire.yaml), as the SPIRE chart
+    # recommends, so its 0770 socket is reachable through its group only.
+    group: 1000
   # The kind node's containerd: its CRI socket, and the directory its CNI
   # bind-mounts the sandboxes' network namespaces into (cni-<id> files under
   # /var/run/netns, /var/run being /run on the node image).
