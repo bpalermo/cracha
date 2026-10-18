@@ -117,8 +117,10 @@ func run(ctx context.Context, cfg config) error {
 	log.Info("connected to the workload api", "socket", cfg.workloadAPISocket, "spiffe_id", own.ID.String(), "agent_spiffe_id", agent.String())
 
 	direct := &issuer.Direct{
-		Store:   store.Store,
-		Grants:  src,
+		Store: store.Store,
+		// The source itself, not its readiness wrapper, so that a bundle's
+		// implicit grants (grants.ImplicitSource) reach Compose.
+		Grants:  src.Source,
 		STS:     sts.NewFromConfig(awsCfg),
 		Labels:  cfg.labels,
 		Cluster: cfg.cluster,

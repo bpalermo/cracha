@@ -111,6 +111,10 @@ func New(fetcher Fetcher, verifier grant.Verifier, opts Options) *Source {
 	return &Source{fetcher: fetcher, verifier: verifier, interval: opts.PollInterval, log: opts.Log, assignments: opts.Assignments}
 }
 
+// A bundle's accounts carry implicit grants, which Compose finds through
+// this interface.
+var _ grants.ImplicitSource = (*Source)(nil)
+
 // Lookup implements grants.Source. Nothing is found until a bundle loads.
 func (s *Source) Lookup(name string) (grants.ResolvedGrant, bool) {
 	snap := s.current.Load()
