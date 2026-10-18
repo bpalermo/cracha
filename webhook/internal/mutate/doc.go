@@ -1,5 +1,5 @@
 // Package mutate turns a Pod admission request into the JSON Patch that wires
-// the pod up to Crachá (docs/design.md, section 7.4). It is pure: everything
+// the pod up to Crachá (docs/design.md, section 7.5). It is pure: everything
 // it needs from the cluster comes through the ServiceAccounts and Regions
 // interfaces, so the whole decision can be unit tested with a fake clientset.
 //
@@ -8,33 +8,54 @@
 // For a pod whose ServiceAccount carries the annotation
 // "cracha.dev/enabled: true", every container and init container gets:
 //
-//   - the CSI ephemeral inline volume "cracha" (driver csi.cracha.dev,
-//     read-only), mounted read-only at /var/run/cracha. Init containers are
-//     included because they may call AWS as well, and the token is already
-//     there before any of them starts: kubelet publishes the volume before it
-//     creates containers (design 7.3).
-//   - AWS_CONTAINER_CREDENTIALS_FULL_URI, the broker's credentials endpoint;
-//     AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE, the token path in that volume;
-//     and AWS_REGION.
+//   - AWS_CONTAINER_CREDENTIALS_FULL_URI, the loopback endpoint the node agent
+//     binds inside the pod's network namespace (design 7.1):
+//     http://127.0.0.1:<agent port>/v1/credentials. Init containers are
+//     included because they may call AWS as well, and the listener is there
+//     before any of them starts (design 7.2).
+//   - AWS_REGION.
 //
-// The pod is marked with the annotation "cracha.dev/injected: true".
+// and the pod gets the label "cracha.dev/credentials: true", the enrolment
+// mark the agent checks before it binds anything (design 7.2).
+//
+// In the init enrolment mode (Config.Enrol) the pod also gets what enrolment
+// needs: the init container "cracha-enrol", first in the list so that it
+// holds every other init container too, running `enrol` from the agent image
+// against the node's address (NODE_IP, from status.hostIP) and the agent's
+// enrolment port (CRACHA_ENROL_PORT) for at most CRACHA_ENROL_TIMEOUT; and
+// the projected ServiceAccount token it authenticates with (audience
+// "cracha-agent", the shortest lifetime the API allows, bound to the pod), in
+// the volume "cracha-enrol" mounted into that container only, at
+// EnrolTokenPath (CRACHA_ENROL_TOKEN_FILE). The container runs under the
+// restricted Pod Security standard: non-root, no privileges, no writable
+// filesystem, no capabilities. The pattern is aether's identity-gate init
+// container; the label, not the container, is the idempotency key. In the
+// cni mode nothing enters the pod but the variables and the label.
+//
+// There is no token file, no AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE, no CA
+// bundle and no volume for the app containers: the pod holds nothing.
 // Ephemeral containers are not touched: the API refuses them on CREATE, and
 // a debugging container should not get the workload's credentials anyway.
 //
 // # AWS_REGION
 //
-// The design says the region comes from the node's topology region, or the
-// cluster default. The webhook runs at admission, before the pod is
-// scheduled, so the node is not known and the cluster default (the
-// --default-region flag) is what it has. The Regions hook overrides the
-// default per namespace: the binary serves it from the Namespace annotation
+// The webhook runs at admission, before the pod is scheduled, so the node's
+// topology region is not known and the cluster default (the --default-region
+// flag) is what it has. The Regions hook overrides the default per
+// namespace: the binary serves it from the Namespace annotation
 // "cracha.dev/region" (webhook/internal/nsregion), read from an informer's
 // cache, so a namespace the cache does not hold yet keeps the default, and
 // an annotation that is not an AWS region denies the pod as invalid. A
 // container that sets AWS_REGION itself keeps its own value: choosing a
 // region is the workload's business, only the credentials are Crachá's.
 //
-// # Conflicting environment
+// # Refusals
+//
+// A pod with hostNetwork has no network namespace of its own, so a loopback
+// listener there would serve every process on the node: it is refused
+// (design 7.1). A pod that already carries an init container or a volume
+// named "cracha-enrol" without the label is refused too: the webhook did not
+// put it there, and it would be taken for the webhook's.
 //
 // The AWS SDK's default credential chain tries static keys, the shared
 // config and credentials files, web identity and role settings before the
@@ -50,13 +71,12 @@
 // variable. Variables that reach the container through envFrom are not
 // visible at admission and are not checked.
 //
-// A pod that already mounts something else at /var/run/cracha, or below it,
-// is refused, as is a pod whose volume "cracha" is not the Crachá CSI volume.
-//
 // # Idempotence
 //
-// Everything is added only when missing, so a pod that already carries the
-// volume, the mounts, the variables and the annotation yields no patch.
+// The label is the idempotency key: a pod that already carries
+// "cracha.dev/credentials: true" is left unchanged, whatever else it
+// carries, so a pod the webhook has already wired (or one that was wired by
+// hand, which the agent treats the same) yields no patch.
 //
 // # Failing closed
 //

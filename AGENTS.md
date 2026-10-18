@@ -133,11 +133,25 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 - No `cmd/`. Each binary lives in a root-level directory with its `main.go`:
   `broker/`, `csi/`, `webhook/`, `grantc/`, `reconciler/`.
 - Code private to a binary goes under its `internal/`. The webhook's
-  `internal/mutate` is the admission decision, pure over two interfaces:
-  ServiceAccount lookups (`internal/sacache`, a Get remembered for a TTL)
-  and the per-namespace `AWS_REGION` override (`internal/nsregion`, the
-  `cracha.dev/region` Namespace annotation served from an informer; the
-  chart's ClusterRole lists and watches namespaces for it).
+  `internal/mutate` is the admission decision (design 7.5), pure over two
+  interfaces: ServiceAccount lookups (`internal/sacache`, a Get remembered
+  for a TTL) and the per-namespace `AWS_REGION` override
+  (`internal/nsregion`, the `cracha.dev/region` Namespace annotation served
+  from an informer; the chart's ClusterRole lists and watches namespaces
+  for it). It injects the loopback `AWS_CONTAINER_CREDENTIALS_FULL_URI`
+  (`--agent-port`), `AWS_REGION`, the label `cracha.dev/credentials` (the
+  idempotency key) and, with `--enrol=init`, the `cracha-enrol` init
+  container from `--agent-image` with its projected token (audience
+  `cracha-agent`, at `mutate.EnrolTokenPath`, also in
+  `CRACHA_ENROL_TOKEN_FILE`; `NODE_IP`, `CRACHA_ENROL_PORT`,
+  `CRACHA_ENROL_TIMEOUT`); the golden pods of each mode are
+  `internal/mutate/testdata/*.golden.json` (refresh with
+  `--test_env=UPDATE_GOLDEN=1`). `internal/server` serves HTTPS with the
+  `*tls.Config` it is given, which `main.go` builds from the webhook's
+  X.509-SVID (`--workload-api-socket`); `internal/cabundle` keeps the
+  `caBundle` of the chart's `MutatingWebhookConfiguration`
+  (`--webhook-config-name`) at the trust bundle of the webhook's trust
+  domain, on start, on every Workload API update and on a resync.
 - Code shared between binaries goes under `common/`. `common/idenc` is the
   single identity-encoding library (design 4.3): nothing else formats a
   SourceIdentity or an authorization subject ID.
@@ -211,12 +225,12 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 ## Chart
 
 - `charts/cracha` is the Helm chart: the CSIDriver, the CSI DaemonSet, the
-  broker and the webhook with its TLS. It is built, linted, templated and
+  broker and the webhook. It is built, linted, templated and
   installed with the helm that rules_helm pins (`@helm//:helm`, the version
   in `MODULE.bazel` and `.bazelrc`); never a helm from PATH.
   `bazel build //charts/cracha:cracha` packages it as
   `bazel-bin/charts/cracha/cracha.tgz`; `bazel test //charts/cracha/...`
-  runs the lint, template (defaults, every override, cert-manager) and pin
+  runs the lint, template (defaults, every override) and pin
   tests, and the Go assertions over the rendered objects (`render_test.go`
   decodes the `helm_template` renderings of `BUILD.bazel`; an assertion
   on what a template renders goes there, since `helm_template_test` only
@@ -254,9 +268,20 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   the downward API. The kubelet's probes cannot present an SVID, so
   `/healthz` and `/readyz` are served plaintext on `broker.healthPort`
   (`--health-listen`), a port that serves nothing else and is not on the
-  Service. The `tls` block (generated, existing or cert-manager) is now the
-  webhook's serving certificate alone, and goes when the webhook serves its
-  SVID (design 7.5).
+  Service.
+- The webhook has no certificate from the chart either, so the chart has no
+  TLS values at all: it serves its X.509-SVID from the Workload API
+  (`webhook.workloadAPI`, the volume with its `type` and socket shaped as
+  the broker's), and the `MutatingWebhookConfiguration`
+  is rendered without a `caBundle`, which the webhook patches in itself (its
+  ClusterRole has `get` and `patch` on that one object by `resourceNames`).
+  The configuration's `namespaceSelector` excludes the release namespace
+  and `webhook.excludedNamespaces` (a list that replaces the default of
+  SPIRE's namespaces and `kube-system`). The webhook reads the agent's
+  values `agent.image`, `agent.port`, `agent.enrol` (`init` injects the
+  `cracha-enrol` init container, `cni` nothing but env and label),
+  `agent.enrolPort` and `agent.enrolTimeout`; `render_test.go` asserts the
+  configuration and the Deployment's arguments in both modes.
 - The chart is published to `chart_registry_url("cracha")` of
   `bazel/registry.bzl` by the publish workflow (below).
 

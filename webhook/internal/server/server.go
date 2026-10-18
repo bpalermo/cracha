@@ -7,9 +7,10 @@
 // [v1]. Any non-200 answer (too large, not JSON, not a review) is a webhook
 // failure to the apiserver, resolved by the configuration's failurePolicy.
 //
-// TLS is mandatory. The certificate and key are read when the server starts
-// and again whenever either file changes on disk, so a renewed certificate
-// (cert-manager or otherwise) is picked up without a restart.
+// TLS is mandatory and comes in as a *tls.Config: the binary builds it from
+// its X.509-SVID source (go-spiffe's tlsconfig.TLSServerConfig, design
+// 7.5), which serves the current SVID to every handshake and so follows the
+// Workload API's rotation. The server only insists on TLS 1.2 or later.
 package server
 
 import (
@@ -23,8 +24,6 @@ import (
 	"mime"
 	"net"
 	"net/http"
-	"os"
-	"sync"
 	"time"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -39,9 +38,9 @@ type Admitter interface {
 type Config struct {
 	// Listen is the TCP address, such as ":8443".
 	Listen string
-	// CertFile and KeyFile hold the PEM certificate chain and private key.
-	CertFile string
-	KeyFile  string
+	// TLS is the serving configuration. It is cloned, and its MinVersion
+	// raised to TLS 1.2 when lower.
+	TLS *tls.Config
 	// MaxRequestBytes bounds the size of a request body. Zero means
 	// DefaultMaxRequestBytes.
 	MaxRequestBytes int64
@@ -70,12 +69,11 @@ type Server struct {
 	cfg      Config
 	admitter Admitter
 	log      *slog.Logger
-	certs    *certReloader
+	tls      *tls.Config
 	handler  http.Handler
 }
 
-// New validates the configuration, loads the certificate once so that a bad
-// one fails at start, and returns the server.
+// New validates the configuration and returns the server.
 func New(cfg Config, admitter Admitter) (*Server, error) {
 	if admitter == nil {
 		return nil, errors.New("admitter must be set")
@@ -83,8 +81,8 @@ func New(cfg Config, admitter Admitter) (*Server, error) {
 	if cfg.Listen == "" {
 		return nil, errors.New("listen address must be set")
 	}
-	if cfg.CertFile == "" || cfg.KeyFile == "" {
-		return nil, errors.New("TLS certificate and key must be set")
+	if cfg.TLS == nil {
+		return nil, errors.New("TLS configuration must be set")
 	}
 	if cfg.MaxRequestBytes <= 0 {
 		cfg.MaxRequestBytes = DefaultMaxRequestBytes
@@ -95,11 +93,11 @@ func New(cfg Config, admitter Admitter) (*Server, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	certs, err := newCertReloader(cfg.CertFile, cfg.KeyFile, cfg.Logger)
-	if err != nil {
-		return nil, err
+	tlsConfig := cfg.TLS.Clone()
+	if tlsConfig.MinVersion < tls.VersionTLS12 {
+		tlsConfig.MinVersion = tls.VersionTLS12
 	}
-	s := &Server{cfg: cfg, admitter: admitter, log: cfg.Logger, certs: certs}
+	s := &Server{cfg: cfg, admitter: admitter, log: cfg.Logger, tls: tlsConfig}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mutate", s.handleMutate)
 	mux.HandleFunc("/healthz", s.handleHealthz)
@@ -124,12 +122,9 @@ func (s *Server) Run(ctx context.Context) error {
 // ShutdownTimeout. It returns nil after a clean shutdown.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
-		Addr:    s.cfg.Listen,
-		Handler: s.handler,
-		TLSConfig: &tls.Config{
-			MinVersion:     tls.VersionTLS12,
-			GetCertificate: s.certs.getCertificate,
-		},
+		Addr:      s.cfg.Listen,
+		Handler:   s.handler,
+		TLSConfig: s.tls,
 		// The apiserver gives a webhook at most 30s; these bound a slow or
 		// stalled client without getting in the way of that.
 		ReadHeaderTimeout: 5 * time.Second,
@@ -278,67 +273,4 @@ func podName(req *admissionv1.AdmissionRequest) string {
 func methodNotAllowed(w http.ResponseWriter, allow string) {
 	w.Header().Set("Allow", allow)
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-}
-
-// certReloader serves the certificate from CertFile and KeyFile, reading
-// them again when either changes on disk. A failed reload keeps the last
-// good certificate and is logged, so a half-written renewal cannot take the
-// webhook down.
-type certReloader struct {
-	certFile, keyFile string
-	log               *slog.Logger
-
-	mu      sync.Mutex
-	cert    *tls.Certificate
-	certMod time.Time
-	keyMod  time.Time
-}
-
-func newCertReloader(certFile, keyFile string, log *slog.Logger) (*certReloader, error) {
-	r := &certReloader{certFile: certFile, keyFile: keyFile, log: log}
-	certMod, keyMod, err := r.modTimes()
-	if err != nil {
-		return nil, err
-	}
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("loading the TLS certificate: %w", err)
-	}
-	r.cert, r.certMod, r.keyMod = &cert, certMod, keyMod
-	return r, nil
-}
-
-func (r *certReloader) modTimes() (certMod, keyMod time.Time, err error) {
-	certInfo, err := os.Stat(r.certFile)
-	if err != nil {
-		return certMod, keyMod, fmt.Errorf("TLS certificate: %w", err)
-	}
-	keyInfo, err := os.Stat(r.keyFile)
-	if err != nil {
-		return certMod, keyMod, fmt.Errorf("TLS key: %w", err)
-	}
-	return certInfo.ModTime(), keyInfo.ModTime(), nil
-}
-
-func (r *certReloader) getCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	certMod, keyMod, err := r.modTimes()
-	if err != nil {
-		r.log.Warn("checking the TLS files, keeping the loaded certificate", "error", err)
-		return r.cert, nil
-	}
-	if certMod.Equal(r.certMod) && keyMod.Equal(r.keyMod) {
-		return r.cert, nil
-	}
-	cert, err := tls.LoadX509KeyPair(r.certFile, r.keyFile)
-	if err != nil {
-		r.log.Warn("reloading the TLS certificate, keeping the loaded one", "error", err)
-		// Not recorded as seen: the next handshake tries again, which is
-		// what a renewal that is still being written needs.
-		return r.cert, nil
-	}
-	r.log.Info("TLS certificate reloaded", "cert", r.certFile)
-	r.cert, r.certMod, r.keyMod = &cert, certMod, keyMod
-	return r.cert, nil
 }
