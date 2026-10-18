@@ -84,9 +84,19 @@ func workloadContainers(pod *corev1.Pod) []corev1.Container {
 	return out
 }
 
+// The SDK timeouts the webhook injects with the chart's defaults
+// (webhook.sdkTimeouts, design 7.5 and 7.7).
+const (
+	envSDKTimeout  = "AWS_METADATA_SERVICE_TIMEOUT"
+	envSDKAttempts = "AWS_METADATA_SERVICE_NUM_ATTEMPTS"
+	sdkTimeout     = "5"
+	sdkAttempts    = "3"
+)
+
 // checkWired asserts the wiring of design 7.5 that both enrolment modes
-// share: the label, and in every container the loopback endpoint and the
-// region, with no token file and nothing mounted for the app.
+// share: the label, and in every container the loopback endpoint, the
+// region and the SDK timeouts, with no token file and nothing mounted for
+// the app.
 func checkWired(t *testing.T, pod *corev1.Pod) {
 	t.Helper()
 	if pod.Labels[enrolLabel] != "true" {
@@ -96,6 +106,8 @@ func checkWired(t *testing.T, pod *corev1.Pod) {
 		for name, want := range map[string]string{
 			"AWS_CONTAINER_CREDENTIALS_FULL_URI": credentialsURI,
 			"AWS_REGION":                         region,
+			envSDKTimeout:                        sdkTimeout,
+			envSDKAttempts:                       sdkAttempts,
 		} {
 			if v, ok := envValue(c, name); !ok || v != want {
 				t.Errorf("container %q: %s = %q (set %t), want %q", c.Name, name, v, ok, want)
@@ -206,6 +218,32 @@ func TestWebhookWiresEnabledPods(t *testing.T) {
 			checkEnrolInjected(ctx, t, got)
 		case enrolCNI:
 			checkNothingEnrolInjected(t, got)
+		}
+	})
+
+	t.Run("the container's own SDK timeouts are kept", func(t *testing.T) {
+		pod := sleeper("own-timeouts", assignedSA,
+			corev1.EnvVar{Name: envSDKTimeout, Value: "20"}, corev1.EnvVar{Name: envSDKAttempts, Value: "7"})
+		pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
+			Name: "other", Image: busybox, Command: []string{"sleep", "3600"},
+		})
+		got := mustCreatePod(ctx, t, pod)
+		for _, c := range got.Spec.Containers {
+			wantTimeout, wantAttempts := sdkTimeout, sdkAttempts
+			if c.Name == "main" {
+				wantTimeout, wantAttempts = "20", "7"
+			}
+			for name, want := range map[string]string{envSDKTimeout: wantTimeout, envSDKAttempts: wantAttempts} {
+				n := 0
+				for _, e := range c.Env {
+					if e.Name == name {
+						n++
+					}
+				}
+				if v, _ := envValue(c, name); v != want || n != 1 {
+					t.Errorf("container %q: %s = %q (%d times), want %q once", c.Name, name, v, n, want)
+				}
+			}
 		}
 	})
 

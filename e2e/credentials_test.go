@@ -64,6 +64,8 @@ type report struct {
 	Error    string    `json:"error"`
 	Exchange *exchange `json:"exchange"`
 	Attempts int       `json:"attempts"`
+	// LatencyMillis is how long the SDK took for the first credentials.
+	LatencyMillis float64 `json:"latencyMillis"`
 }
 
 // exchange is one HTTP answer of the broker as e2e/client recorded it.

@@ -8,7 +8,7 @@
 // Its first action is the credential fetch, and the SDK's provider is told
 // not to retry: the listener must be there at first use (design 7.2,
 // "Ordering"), and the report says how many requests the first credentials
-// took. It prints one JSON report line to stdout with the credentials it
+// took and how long. It prints one JSON report line to stdout with the credentials it
 // got, the broker's raw HTTP answer as the agent relayed it (status,
 // Cracha-* headers, body) and the request count, then one line with the
 // answer to GET /v1/grants, the inspection endpoint of design 6.5, through
@@ -56,6 +56,10 @@ type Report struct {
 	// Attempts is how many HTTP requests the SDK's provider made for the
 	// first credentials: one, when the listener was there at first use.
 	Attempts int `json:"attempts"`
+	// LatencyMillis is how long the SDK took to retrieve the first
+	// credentials, in milliseconds: what the provider's timeout is up
+	// against.
+	LatencyMillis float64 `json:"latencyMillis"`
 }
 
 // Credentials is the SDK's view, secrets included: this is a test fixture
@@ -132,7 +136,9 @@ func main() {
 	report := Report{Kind: "report"}
 
 	rec := &recording{inner: http.Client{Timeout: 30 * time.Second}}
+	start := time.Now()
 	retrieve(ctx, rec, &report)
+	report.LatencyMillis = float64(time.Since(start).Microseconds()) / 1000
 	report.Exchange, report.Attempts = rec.exchange()
 	if err := out.Encode(report); err != nil {
 		fmt.Fprintf(os.Stderr, "client: %v\n", err)
