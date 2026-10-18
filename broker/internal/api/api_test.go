@@ -20,9 +20,9 @@ import (
 	"github.com/bpalermo/cracha/broker/internal/cache"
 	"github.com/bpalermo/cracha/broker/internal/grants"
 	"github.com/bpalermo/cracha/broker/internal/issuer"
-	"github.com/bpalermo/cracha/common/spiffetest"
 	"github.com/bpalermo/cracha/broker/internal/sts"
 	"github.com/bpalermo/cracha/common/idenc"
+	"github.com/bpalermo/cracha/common/spiffetest"
 )
 
 const (

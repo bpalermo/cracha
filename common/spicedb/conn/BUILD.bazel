@@ -12,7 +12,9 @@ go_library(
         "@com_github_spiffe_go_spiffe_v2//spiffetls/tlsconfig",
         "@com_github_spiffe_go_spiffe_v2//svid/x509svid",
         "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//backoff",
         "@org_golang_google_grpc//credentials",
+        "@org_golang_google_grpc//keepalive",
     ],
 )
 

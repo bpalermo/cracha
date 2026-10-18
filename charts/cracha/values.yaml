@@ -585,7 +585,9 @@ spicedb:
 
   # SpiceDB's preshared key: a Secret you keep, mounted by this pod alone
   # (SpiceDB reads it, the gateway adds it to every call it forwards). No
-  # client of SpiceDB holds it. Required.
+  # client of SpiceDB holds it. One line with no trailing newline, since it
+  # travels as a header value (`openssl rand -hex 32 | tr -d '\n'`).
+  # Required.
   presharedKeySecret:
     name: ""
     key: preshared-key

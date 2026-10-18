@@ -145,4 +145,3 @@ func TestDefaultServerID(t *testing.T) {
 		t.Fatal("an empty namespace was accepted")
 	}
 }
-

@@ -244,11 +244,11 @@ func TestParseConfigAuthz(t *testing.T) {
 		t.Errorf("config %+v", c)
 	}
 	env := envOf(map[string]string{
-		"CRACHA_CLUSTER":            "prod-b",
-		"CRACHA_GRANTS_FIXTURE":     "g.yaml",
-		"CRACHA_NAMESPACE":          "cracha-system",
-		"CRACHA_AUTHZ_BACKEND":      "spicedb",
-		"CRACHA_SPICEDB_ENDPOINT":   "spicedb.spicedb.svc:50051",
+		"CRACHA_CLUSTER":                  "prod-b",
+		"CRACHA_GRANTS_FIXTURE":           "g.yaml",
+		"CRACHA_NAMESPACE":                "cracha-system",
+		"CRACHA_AUTHZ_BACKEND":            "spicedb",
+		"CRACHA_SPICEDB_ENDPOINT":         "spicedb.spicedb.svc:50051",
 		"CRACHA_SPICEDB_SERVER_SPIFFE_ID": "/ns/authz/sa/spicedb",
 	})
 	c, err = parseConfig(nil, env, io.Discard)

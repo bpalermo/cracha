@@ -229,8 +229,10 @@ func TestSchemaWithSVIDFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	args := []string{"schema", "-endpoint", lis.Addr().String(), "-server-spiffe-id", gatewayID,
-		"-svid", writePEM(t, dir, "svid.pem", certs), "-svid-key", writePEM(t, dir, "key.pem", key), "-bundle", writePEM(t, dir, "bundle.pem", bundle)}
+	args := []string{
+		"schema", "-endpoint", lis.Addr().String(), "-server-spiffe-id", gatewayID,
+		"-svid", writePEM(t, dir, "svid.pem", certs), "-svid-key", writePEM(t, dir, "key.pem", key), "-bundle", writePEM(t, dir, "bundle.pem", bundle),
+	}
 	var stdout, stderr bytes.Buffer
 	if code := run(args, &stdout, &stderr, dial); code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr.String())

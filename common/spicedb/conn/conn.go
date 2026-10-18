@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"time"
 
 	authzed "github.com/authzed/authzed-go/v1"
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
@@ -17,7 +18,9 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 )
 
 // GatewayServiceAccount is the service account of the pods that serve
@@ -69,7 +72,18 @@ func Dial(cfg Config, opts ...grpc.DialOption) (*authzed.Client, error) {
 	case cfg.SVIDs == nil || cfg.Bundles == nil:
 		return nil, errors.New("spicedb: an X.509-SVID source and a bundle source are required")
 	}
-	opts = append([]grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(TLSConfig(cfg)))}, opts...)
+	opts = append([]grpc.DialOption{
+		grpc.WithTransportCredentials(credentials.NewTLS(TLSConfig(cfg))),
+		// A gateway pod that goes (a rollout, a node drain) is redialed
+		// within seconds, not after gRPC's default backoff of up to two
+		// minutes, during which every call would fail.
+		grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff:           backoff.Config{BaseDelay: 250 * time.Millisecond, Multiplier: 1.6, Jitter: 0.2, MaxDelay: 5 * time.Second},
+			MinConnectTimeout: 5 * time.Second,
+		}),
+		// And one that vanished without closing the connection is noticed.
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 30 * time.Second, Timeout: 10 * time.Second, PermitWithoutStream: true}),
+	}, opts...)
 	client, err := authzed.NewClient(cfg.Endpoint, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("spicedb: dial %s: %w", cfg.Endpoint, err)
