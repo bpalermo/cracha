@@ -319,20 +319,27 @@ Authentication:
   - `SourceIdentity` = `RoleSessionName` = idenc STS encoding (per workload, not per pod)
   - `Policy` / `PolicyArns` = rendered session policy
   - session tags: `spiffe-ns`, `spiffe-sa`, `cluster`, `grant`, `team`, `service` (non-transitive)
-- Shape role trust policy:
+- Shape role trust policy, two statements: STS evaluates `sts:TagSession` as its own action, without the `sts:SourceIdentity` key, so a single statement conditioned on both refuses every tagged session (seen on the first real-cluster run, while the IAM policy simulator allowed it).
 
 ```json
-{
-  "Effect": "Allow",
-  "Principal": { "AWS": "arn:aws:iam::PLATFORM:role/cracha-broker-prod" },
-  "Action": ["sts:AssumeRole", "sts:SetSourceIdentity", "sts:TagSession"],
-  "Condition": {
-    "StringLike": { "sts:SourceIdentity": "w.*" },
-    "ForAllValues:StringEquals": {
-      "aws:TagKeys": ["spiffe-ns", "spiffe-sa", "cluster", "grant", "team", "service"]
+[
+  {
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::PLATFORM:role/cracha-broker-prod" },
+    "Action": ["sts:AssumeRole", "sts:SetSourceIdentity"],
+    "Condition": { "StringLike": { "sts:SourceIdentity": "w.*" } }
+  },
+  {
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::PLATFORM:role/cracha-broker-prod" },
+    "Action": "sts:TagSession",
+    "Condition": {
+      "ForAllValues:StringEquals": {
+        "aws:TagKeys": ["spiffe-ns", "spiffe-sa", "cluster", "grant", "team", "service"]
+      }
     }
   }
-}
+]
 ```
 
 - Shape role ceiling: permission boundary with explicit denies on `iam:*`, `sts:AssumeRole*`, `organizations:*`, key administration; backed by SCPs.
