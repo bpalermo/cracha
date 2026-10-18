@@ -125,6 +125,15 @@ helm_lint_test(
     ]
 ]
 
+# The agent's cni enrolment mode (the defaults and the overrides render
+# init).
+helm_template_test(
+    name = "cracha_agent_cni_template_test",
+    size = "small",
+    chart = ":cracha",
+    values = REQUIRED_VALUES + ["test/agent-cni.yaml"],
+)
+
 # The chart rendered with the pinned helm, for the assertions the Go tests
 # below make on the objects (render_test.go decodes them): helm_template_test
 # only renders. One rendering per values set the tests look at.
@@ -140,6 +149,10 @@ helm_lint_test(
             "overrides",
             ["test/overrides.yaml"],
         ),
+        (
+            "cni",
+            REQUIRED_VALUES + ["test/agent-cni.yaml"],
+        ),
     ]
 ]
 
@@ -147,11 +160,13 @@ go_test(
     name = "cracha_test",
     size = "small",
     srcs = [
+        "agent_test.go",
         "rbac_test.go",
         "render_test.go",
         "volumes_test.go",
     ],
     data = [
+        ":rendered_cni",
         ":rendered_defaults",
         ":rendered_overrides",
     ],

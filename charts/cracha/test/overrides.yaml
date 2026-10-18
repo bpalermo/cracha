@@ -99,9 +99,38 @@ agent:
     digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     pullPolicy: Always
   port: 17171
+  # init with every knob; test/agent-cni.yaml renders the cni mode.
   enrol: init
   enrolPort: 17172
   enrolTimeout: 30s
+  cni:
+    socket: /var/run/cracha/agent.sock
+  fetchDeadline: 1500ms
+  brokerUrl: https://credentials.example.org:9443
+  brokerSpiffeID: spiffe://prod.example.org/ns/cracha/sa/broker
+  brokerTimeout: 5s
+  criSocket: /var/run/crio/crio.sock
+  netnsDir: /run/netns
+  workloadAPI:
+    hostPath: /run/spiffe/agent
+    socket: api.sock
+  brokerAPI:
+    hostPath: /run/spiffe/broker
+    socket: api.sock
+  healthzPort: 17173
+  logLevel: warn
+  priorityClassName: ""
+  tolerations: []
+  nodeSelector:
+    kubernetes.io/os: linux
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+  podAnnotations:
+    example.com/scrape: "true"
 webhook:
   image:
     repository: registry.example.com/cracha/webhook

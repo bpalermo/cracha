@@ -1,0 +1,5 @@
+# The cni enrolment mode (design 7.2): the agent's Unix socket is rendered
+# for the plugin, the init-mode endpoint and its TokenReview are not. The
+# plugin and its installer are a later slice.
+agent:
+  enrol: cni

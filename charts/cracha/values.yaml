@@ -227,10 +227,11 @@ broker:
   resources: {}
   podAnnotations: {}
 
-# The node agent (design 7), one pod per node: serves the AWS SDK's credential
-# requests over a loopback listener it binds inside each enrolled pod's
-# network namespace, with an answer the broker issued for that pod's
-# identity.
+# The node agent (design 7), one pod per node, in the host network: binds a
+# loopback listener inside each enrolled pod's network namespace before the
+# pod's app containers start, and serves the AWS SDK's credential requests
+# on it with what the broker issued for that pod's identity. Nothing in the
+# pod is trusted, mounted or protected.
 agent:
   image:
     repository: "{@//agent:image_push.repository}"
@@ -243,8 +244,16 @@ agent:
   port: 9797
 
   # How a new pod's listener is bound before its app containers start
-  # (design 7.2): init (the webhook injects the cracha-enrol init container,
-  # which calls the agent's enrolment endpoint) or cni.
+  # (design 7.2):
+  #   init  the webhook injects an init container, cracha-enrol, which calls
+  #         the agent's enrolment endpoint on the node's address with the
+  #         pod's bound ServiceAccount token. Needs nothing of the node but
+  #         the agent.
+  #   cni   a chained CNI plugin, cracha-cni, tells the agent over its Unix
+  #         socket on every sandbox's ADD and DEL. Nothing enters the pod
+  #         spec but the env and the label. THE PLUGIN AND ITS INSTALLER
+  #         ARE NOT PART OF THIS CHART YET: cni renders the agent's socket
+  #         and no installer, so until they land it enrols nothing.
   enrol: init
 
   # With enrol init: the port of the enrolment endpoint on every node's
@@ -252,6 +261,64 @@ agent:
   # non-zero and kubelet restarts it (fail closed).
   enrolPort: 9798
   enrolTimeout: 2m
+
+  # With enrol cni: the agent's Unix socket, in a host directory it owns.
+  cni:
+    socket: /run/cracha/cni.sock
+
+  # How long one credential request retries a pod the issuer does not know
+  # yet (its entry on its way to the node's issuer agent) or an issuer that
+  # is unavailable, before answering 503 for the SDK to retry (design 7.3).
+  # Keep it under the SDKs' request timeouts.
+  fetchDeadline: 3s
+
+  # The broker (design 7.3): its URL, empty for the broker Service of this
+  # release, https://<name>-broker.<namespace>.svc:<broker.port>; the
+  # SPIFFE ID it must present, verified instead of any DNS name or CA: a
+  # full ID, or empty for /ns/<namespace>/sa/<name>-broker in the agent's
+  # own trust domain; and how long one call may take.
+  brokerUrl: ""
+  brokerSpiffeID: ""
+  brokerTimeout: 10s
+
+  # The container runtime's CRI socket, through which a pod's network
+  # namespace is resolved (design 7.2, init mode, and 7.4); mounted
+  # read-only. /run/containerd/containerd.sock for containerd,
+  # /var/run/crio/crio.sock for CRI-O.
+  criSocket: /run/containerd/containerd.sock
+
+  # The directory the runtime keeps the sandboxes' network namespaces in,
+  # which the paths it reports are under; mounted read-only, at the same
+  # path, following the host's mounts. /var/run/netns for containerd and
+  # CRI-O.
+  netnsDir: /var/run/netns
+
+  # The identity issuer's two sockets on each node, from a SPIRE agent
+  # (design 4.2): the Workload API, for the agent's own identity, and the
+  # Broker API, which hands out the pods' JWT-SVIDs. Each is a host
+  # directory and the socket's file name in it; both are mounted read-only.
+  workloadAPI:
+    hostPath: /run/spire/agent-sockets
+    socket: spire-agent.sock
+  brokerAPI:
+    hostPath: /run/spire/broker-sockets
+    socket: broker.sock
+
+  # The port of the agent's /healthz and /readyz, on the node's address.
+  healthzPort: 9799
+
+  # The log level: debug, info, warn or error.
+  logLevel: info
+
+  priorityClassName: system-node-critical
+
+  # Listeners must be bound on every node pods can run on.
+  tolerations:
+    - operator: Exists
+
+  nodeSelector: {}
+  resources: {}
+  podAnnotations: {}
 
 # The mutating webhook (design 7.5): for pods whose ServiceAccount opts in,
 # the loopback credentials endpoint in every container's environment, the
