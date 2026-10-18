@@ -14,6 +14,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
@@ -184,31 +185,147 @@ func (v *LocalVerifier) Verify(_ context.Context, bundle []byte, sig *Signature)
 	return nil
 }
 
+// KeyRing verifies with any one of several public keys, the one whose key
+// identity the envelope names: what makes rotating the signing key
+// possible, since a reader trusts the old and the new key while the
+// publication moves from one to the other.
+type KeyRing struct {
+	keys map[string]*LocalVerifier
+	ids  []string
+}
+
+// NewKeyRing makes a key ring of P-256 public keys. Listing a key twice is
+// an error, as is an empty ring.
+func NewKeyRing(pubs ...*ecdsa.PublicKey) (*KeyRing, error) {
+	if len(pubs) == 0 {
+		return nil, errors.New("no verification key")
+	}
+	r := &KeyRing{keys: map[string]*LocalVerifier{}}
+	for _, pub := range pubs {
+		v, err := NewLocalVerifier(pub)
+		if err != nil {
+			return nil, err
+		}
+		if _, dup := r.keys[v.keyID]; dup {
+			return nil, fmt.Errorf("verification key %s listed twice", v.keyID)
+		}
+		r.keys[v.keyID] = v
+		r.ids = append(r.ids, v.keyID)
+	}
+	return r, nil
+}
+
+// KeyIDs returns the identities of the ring's keys, in the order given.
+func (r *KeyRing) KeyIDs() []string { return append([]string(nil), r.ids...) }
+
+// Verify implements Verifier: the envelope's keyId selects the key.
+func (r *KeyRing) Verify(ctx context.Context, data []byte, sig *Signature) error {
+	if sig == nil {
+		return errors.New("no signature")
+	}
+	v, ok := r.keys[sig.KeyID]
+	if !ok {
+		return fmt.Errorf("signature by key %q, which is not one of the %d verification keys", sig.KeyID, len(r.keys))
+	}
+	return v.Verify(ctx, data, sig)
+}
+
+// ParseECPublicKeys reads every PEM-encoded ("PUBLIC KEY", PKIX) ECDSA
+// public key in pemData, in order; at least one is required, and anything
+// but PEM blocks between them (comments, blank lines) is ignored.
+func ParseECPublicKeys(pemData []byte) ([]*ecdsa.PublicKey, error) {
+	var keys []*ecdsa.PublicKey
+	rest := pemData
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		key, err := ParseECPublicKey(pem.EncodeToMemory(block))
+		if err != nil {
+			return nil, fmt.Errorf("key %d: %w", len(keys)+1, err)
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return nil, errors.New("no PEM block")
+	}
+	return keys, nil
+}
+
 // KMSAPI is the part of the KMS client the signer and verifier use, so
-// tests can substitute a fake.
+// tests can substitute a fake. Nothing here calls kms:Verify: signatures
+// are verified with the key's public key, the way a broker does offline.
 type KMSAPI interface {
 	Sign(ctx context.Context, in *kms.SignInput, opts ...func(*kms.Options)) (*kms.SignOutput, error)
-	Verify(ctx context.Context, in *kms.VerifyInput, opts ...func(*kms.Options)) (*kms.VerifyOutput, error)
+	GetPublicKey(ctx context.Context, in *kms.GetPublicKeyInput, opts ...func(*kms.Options)) (*kms.GetPublicKeyOutput, error)
+}
+
+// kmsPublicKey fetches a KMS key's public key once, through
+// kms:GetPublicKey, and keeps it. A failure is not kept: the next call
+// tries again.
+type kmsPublicKey struct {
+	api   KMSAPI
+	keyID string
+
+	mu       sync.Mutex
+	verifier *LocalVerifier
+}
+
+// get returns the verifier of the key's public key, fetching it the first
+// time. The key must be an ECC_NIST_P256 signing key.
+func (k *kmsPublicKey) get(ctx context.Context) (*LocalVerifier, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.verifier != nil {
+		return k.verifier, nil
+	}
+	out, err := k.api.GetPublicKey(ctx, &kms.GetPublicKeyInput{KeyId: aws.String(k.keyID)})
+	if err != nil {
+		return nil, fmt.Errorf("kms GetPublicKey %s: %w", k.keyID, err)
+	}
+	pub, err := x509.ParsePKIXPublicKey(out.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("kms key %s: public key: %w", k.keyID, err)
+	}
+	ec, ok := pub.(*ecdsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("kms key %s: public key is %T, want ECDSA P-256", k.keyID, pub)
+	}
+	v, err := NewLocalVerifier(ec)
+	if err != nil {
+		return nil, fmt.Errorf("kms key %s: %w", k.keyID, err)
+	}
+	k.verifier = v
+	return v, nil
 }
 
 // KMSSigner signs with an asymmetric KMS key (ECC_NIST_P256, SIGN_VERIFY)
-// through kms:Sign over the bundle's digest. keyID is the key's ARN, and is
-// what the envelope carries.
+// through kms:Sign over the document's digest. The envelope's keyId is the
+// identity of the key's public key (KeyID), which it fetches once through
+// kms:GetPublicKey: exactly what a LocalVerifier of the exported PEM
+// computes, so a KMS signature verifies with the PEM alone, offline.
 type KMSSigner struct {
-	api   KMSAPI
-	keyID string
+	api KMSAPI
+	pub kmsPublicKey
 }
 
-// NewKMSSigner makes a signer for the KMS key.
+// NewKMSSigner makes a signer for the KMS key: its ARN, ID or alias.
 func NewKMSSigner(api KMSAPI, keyID string) *KMSSigner {
-	return &KMSSigner{api: api, keyID: keyID}
+	return &KMSSigner{api: api, pub: kmsPublicKey{api: api, keyID: keyID}}
 }
 
-// Sign implements Signer.
-func (s *KMSSigner) Sign(ctx context.Context, bundle []byte) (*Signature, error) {
-	sum := sha256.Sum256(bundle)
+// Sign implements Signer. The signature KMS returns is checked against the
+// public key before it is handed out.
+func (s *KMSSigner) Sign(ctx context.Context, data []byte) (*Signature, error) {
+	verifier, err := s.pub.get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(data)
 	out, err := s.api.Sign(ctx, &kms.SignInput{
-		KeyId:            aws.String(s.keyID),
+		KeyId:            aws.String(s.pub.keyID),
 		Message:          sum[:],
 		MessageType:      kmstypes.MessageTypeDigest,
 		SigningAlgorithm: kmstypes.SigningAlgorithmSpecEcdsaSha256,
@@ -216,48 +333,38 @@ func (s *KMSSigner) Sign(ctx context.Context, bundle []byte) (*Signature, error)
 	if err != nil {
 		return nil, fmt.Errorf("kms Sign: %w", err)
 	}
-	return &Signature{
+	sig := &Signature{
 		Version:   SignatureVersion,
 		Algorithm: AlgorithmECDSASHA256,
-		KeyID:     s.keyID,
-		Digest:    Digest(bundle),
+		KeyID:     verifier.KeyID(),
+		Digest:    Digest(data),
 		Signature: base64.StdEncoding.EncodeToString(out.Signature),
-	}, nil
+	}
+	if err := verifier.Verify(ctx, data, sig); err != nil {
+		return nil, fmt.Errorf("kms Sign: the signature does not verify with the key's public key: %w", err)
+	}
+	return sig, nil
 }
 
-// KMSVerifier verifies through kms:Verify with the same key.
+// KMSVerifier verifies with a KMS key's public key, fetched once through
+// kms:GetPublicKey (the only KMS permission it needs) and then used as a
+// LocalVerifier would: no kms:Verify, no AWS call per verification.
 type KMSVerifier struct {
-	api   KMSAPI
-	keyID string
+	pub kmsPublicKey
 }
 
-// NewKMSVerifier makes a verifier for the KMS key; keyID must be what the
-// signer used, the key's ARN.
+// NewKMSVerifier makes a verifier for the KMS key: its ARN, ID or alias.
 func NewKMSVerifier(api KMSAPI, keyID string) *KMSVerifier {
-	return &KMSVerifier{api: api, keyID: keyID}
+	return &KMSVerifier{pub: kmsPublicKey{api: api, keyID: keyID}}
 }
 
 // Verify implements Verifier.
-func (v *KMSVerifier) Verify(ctx context.Context, bundle []byte, sig *Signature) error {
-	raw, err := checkEnvelope(bundle, sig, v.keyID)
+func (v *KMSVerifier) Verify(ctx context.Context, data []byte, sig *Signature) error {
+	verifier, err := v.pub.get(ctx)
 	if err != nil {
 		return err
 	}
-	sum := sha256.Sum256(bundle)
-	out, err := v.api.Verify(ctx, &kms.VerifyInput{
-		KeyId:            aws.String(v.keyID),
-		Message:          sum[:],
-		MessageType:      kmstypes.MessageTypeDigest,
-		Signature:        raw,
-		SigningAlgorithm: kmstypes.SigningAlgorithmSpecEcdsaSha256,
-	})
-	if err != nil {
-		return fmt.Errorf("kms Verify: %w", err)
-	}
-	if !out.SignatureValid {
-		return errors.New("signature does not verify")
-	}
-	return nil
+	return verifier.Verify(ctx, data, sig)
 }
 
 // ParseECPrivateKey reads a PEM-encoded ECDSA private key, in PKCS #8

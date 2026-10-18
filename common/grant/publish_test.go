@@ -29,11 +29,111 @@ func signedBundle(t *testing.T) ([]byte, *Signature) {
 	return data, sig
 }
 
+// signedVersion is the good tree's bundle and assignments, version abc123,
+// each signed.
+func signedVersion(t *testing.T) Publication {
+	t.Helper()
+	c := compileGoodAll(t, "abc123")
+	signer, err := NewLocalSigner(mustKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pub Publication
+	if pub.Bundle, err = Marshal(c.Bundle); err != nil {
+		t.Fatal(err)
+	}
+	if pub.Assignments, err = MarshalAssignments(c.Assignments); err != nil {
+		t.Fatal(err)
+	}
+	if pub.BundleSignature, err = signer.Sign(context.Background(), pub.Bundle); err != nil {
+		t.Fatal(err)
+	}
+	if pub.AssignmentsSignature, err = signer.Sign(context.Background(), pub.Assignments); err != nil {
+		t.Fatal(err)
+	}
+	return pub
+}
+
+func TestPublishWithAssignments(t *testing.T) {
+	pub := signedVersion(t)
+	root := t.TempDir()
+	res, err := (&LocalPublisher{Root: root}).Publish(context.Background(), pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Assignments != "bundles/abc123/assignments.json" || res.AssignmentsSignature != "bundles/abc123/assignments.json.sig" {
+		t.Errorf("result = %+v", res)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "bundles", "abc123", "assignments.json"))
+	if err != nil || string(got) != string(pub.Assignments) {
+		t.Errorf("published assignments = %q, %v", got, err)
+	}
+	sigData, err := os.ReadFile(filepath.Join(root, "bundles", "abc123", "assignments.json.sig"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed, err := ParseSignature(sigData); err != nil || parsed.Digest != Digest(pub.Assignments) {
+		t.Errorf("published assignments signature = %+v, %v", parsed, err)
+	}
+	// The pointer is unchanged by the assignments: a reader that predates
+	// them decodes it as before.
+	latestData, _ := os.ReadFile(filepath.Join(root, "latest"))
+	if strings.Contains(string(latestData), "assignments") {
+		t.Errorf("latest names the assignments: %s", latestData)
+	}
+
+	api := &fakeS3{}
+	if _, err := NewS3Publisher(api, "bucket", "p").Publish(context.Background(), pub); err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	for _, put := range api.puts {
+		keys = append(keys, aws.ToString(put.Key))
+	}
+	if got, want := strings.Join(keys, " "), "p/bundles/abc123/bundle.json p/bundles/abc123/bundle.json.sig p/bundles/abc123/assignments.json p/bundles/abc123/assignments.json.sig p/latest"; got != want {
+		t.Errorf("keys = %s, want %s", got, want)
+	}
+}
+
+func TestPublishRejectsAssignments(t *testing.T) {
+	ctx := context.Background()
+	p := &LocalPublisher{Root: t.TempDir()}
+	pub := signedVersion(t)
+	noSig := pub
+	noSig.AssignmentsSignature = nil
+	if _, err := p.Publish(ctx, noSig); err == nil || !strings.Contains(err.Error(), "assignments: no signature") {
+		t.Errorf("error = %v", err)
+	}
+	swapped := pub
+	swapped.AssignmentsSignature = pub.BundleSignature
+	if _, err := p.Publish(ctx, swapped); err == nil || !strings.Contains(err.Error(), "assignments: signature digest") {
+		t.Errorf("error = %v", err)
+	}
+	other := pub
+	other.Assignments = []byte(strings.Replace(string(pub.Assignments), `"version": "abc123"`, `"version": "def456"`, 1))
+	if _, err := p.Publish(ctx, other); err == nil || !strings.Contains(err.Error(), `assignments are version "def456"`) {
+		t.Errorf("error = %v", err)
+	}
+	if _, err := p.Publish(ctx, Publication{Bundle: pub.Bundle, BundleSignature: pub.BundleSignature, Assignments: []byte("junk"), AssignmentsSignature: pub.AssignmentsSignature}); err == nil || !strings.Contains(err.Error(), "assignments:") {
+		t.Errorf("error = %v", err)
+	}
+}
+
+func TestParseLatestIgnoresUnknownFields(t *testing.T) {
+	l, err := ParseLatest([]byte(`{"version":"v1","bundle":"bundles/v1/bundle.json","signature":"bundles/v1/bundle.json.sig","later":"x"}`))
+	if err != nil || l.Version != "v1" {
+		t.Errorf("ParseLatest = %+v, %v", l, err)
+	}
+	if _, err := ParseLatest([]byte(`{"version":"v1"} {}`)); err == nil {
+		t.Error("ParseLatest accepted trailing data")
+	}
+}
+
 func TestLocalPublisher(t *testing.T) {
 	bundle, sig := signedBundle(t)
 	root := t.TempDir()
 	p := &LocalPublisher{Root: root}
-	res, err := p.Publish(context.Background(), bundle, sig)
+	res, err := p.Publish(context.Background(), Publication{Bundle: bundle, BundleSignature: sig})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +173,7 @@ func TestLocalPublisher(t *testing.T) {
 	bundle2 := []byte(strings.Replace(string(bundle), `"version": "abc123"`, `"version": "def456"`, 1))
 	signer, _ := NewLocalSigner(mustKey(t))
 	sig2, _ := signer.Sign(context.Background(), bundle2)
-	if _, err := p.Publish(context.Background(), bundle2, sig2); err != nil {
+	if _, err := p.Publish(context.Background(), Publication{Bundle: bundle2, BundleSignature: sig2}); err != nil {
 		t.Fatal(err)
 	}
 	latestData, _ = os.ReadFile(filepath.Join(root, "latest"))
@@ -89,13 +189,13 @@ func TestPublishRejects(t *testing.T) {
 	bundle, sig := signedBundle(t)
 	p := &LocalPublisher{Root: t.TempDir()}
 	ctx := context.Background()
-	if _, err := p.Publish(ctx, bundle, nil); err == nil || !strings.Contains(err.Error(), "no signature") {
+	if _, err := p.Publish(ctx, Publication{Bundle: bundle, BundleSignature: nil}); err == nil || !strings.Contains(err.Error(), "no signature") {
 		t.Errorf("error = %v", err)
 	}
-	if _, err := p.Publish(ctx, []byte("junk"), sig); err == nil || !strings.Contains(err.Error(), "bundle:") {
+	if _, err := p.Publish(ctx, Publication{Bundle: []byte("junk"), BundleSignature: sig}); err == nil || !strings.Contains(err.Error(), "bundle:") {
 		t.Errorf("error = %v", err)
 	}
-	if _, err := p.Publish(ctx, []byte(`{"version":"x","generatedAt":"t","grants":[]}`), sig); err == nil || !strings.Contains(err.Error(), "digest") {
+	if _, err := p.Publish(ctx, Publication{Bundle: []byte(`{"version":"x","generatedAt":"t","grants":[]}`), BundleSignature: sig}); err == nil || !strings.Contains(err.Error(), "digest") {
 		t.Errorf("error = %v", err)
 	}
 }
@@ -126,7 +226,7 @@ func TestS3Publisher(t *testing.T) {
 	bundle, sig := signedBundle(t)
 	api := &fakeS3{}
 	p := NewS3Publisher(api, "bucket", "/cracha/prod/")
-	res, err := p.Publish(context.Background(), bundle, sig)
+	res, err := p.Publish(context.Background(), Publication{Bundle: bundle, BundleSignature: sig})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,12 +253,12 @@ func TestS3Publisher(t *testing.T) {
 	}
 
 	noPrefix := NewS3Publisher(&fakeS3{}, "bucket", "")
-	if _, err := noPrefix.Publish(context.Background(), bundle, sig); err != nil {
+	if _, err := noPrefix.Publish(context.Background(), Publication{Bundle: bundle, BundleSignature: sig}); err != nil {
 		t.Fatal(err)
 	}
 
 	failing := NewS3Publisher(&fakeS3{err: errors.New("AccessDenied")}, "bucket", "p")
-	if _, err := failing.Publish(context.Background(), bundle, sig); err == nil || !strings.Contains(err.Error(), "s3 PutObject p/bundles/abc123/bundle.json: AccessDenied") {
+	if _, err := failing.Publish(context.Background(), Publication{Bundle: bundle, BundleSignature: sig}); err == nil || !strings.Contains(err.Error(), "s3 PutObject p/bundles/abc123/bundle.json: AccessDenied") {
 		t.Errorf("error = %v", err)
 	}
 }

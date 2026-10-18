@@ -14,8 +14,18 @@ var generatedAt = time.Date(2026, 10, 17, 12, 34, 56, 0, time.UTC)
 
 func compileGood(t *testing.T, version string) (*Bundle, []byte) {
 	t.Helper()
+	c := compileGoodAll(t, version)
+	data, err := Marshal(c.Bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c.Bundle, data
+}
+
+func compileGoodAll(t *testing.T, version string) *Compiled {
+	t.Helper()
 	src := loadGood(t)
-	b, report, err := Compile(context.Background(), src, CompileOptions{
+	c, report, err := Compile(context.Background(), src, CompileOptions{
 		Version:     version,
 		GeneratedAt: generatedAt,
 		Lint:        LintOptions{Now: lintNow},
@@ -23,26 +33,38 @@ func compileGood(t *testing.T, version string) (*Bundle, []byte) {
 	if err != nil {
 		t.Fatalf("Compile: %v (problems: %v)", err, report.Problems)
 	}
-	data, err := Marshal(b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return b, data
+	return c
 }
 
-func TestCompileGolden(t *testing.T) {
-	_, got := compileGood(t, "abc123")
-	golden := filepath.Join("testdata", "golden", "bundle.json")
-	want, err := os.ReadFile(golden)
+// golden compares data with testdata/golden/<name>, leaving what it got in
+// the test's undeclared outputs when they differ.
+func golden(t *testing.T, name string, got []byte) {
+	t.Helper()
+	path := filepath.Join("testdata", "golden", name)
+	want, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read golden: %v", err)
 	}
 	if !bytes.Equal(got, want) {
 		if dir := os.Getenv("TEST_UNDECLARED_OUTPUTS_DIR"); dir != "" {
-			_ = os.WriteFile(filepath.Join(dir, "bundle.json"), got, 0o644)
+			_ = os.WriteFile(filepath.Join(dir, name), got, 0o644)
 		}
-		t.Errorf("compiled bundle differs from %s; got:\n%s", golden, got)
+		t.Errorf("compiled document differs from %s; got:\n%s", path, got)
 	}
+}
+
+func TestCompileGolden(t *testing.T) {
+	c := compileGoodAll(t, "abc123")
+	bundle, err := Marshal(c.Bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	golden(t, "bundle.json", bundle)
+	assignments, err := MarshalAssignments(c.Assignments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	golden(t, "assignments.json", assignments)
 }
 
 func TestCompileDeterministic(t *testing.T) {
@@ -57,23 +79,37 @@ func TestCompileDeterministic(t *testing.T) {
 	if b1.GeneratedAt != "2026-10-17T12:34:56Z" {
 		t.Errorf("generatedAt = %q", b1.GeneratedAt)
 	}
-	// The version is of the grants alone: a different generatedAt keeps it.
+	// The version is of the content alone: a different generatedAt keeps it.
 	src := loadGood(t)
-	b3, _, err := Compile(context.Background(), src, CompileOptions{GeneratedAt: generatedAt.Add(time.Hour), Lint: LintOptions{Now: lintNow}})
+	c3, _, err := Compile(context.Background(), src, CompileOptions{GeneratedAt: generatedAt.Add(time.Hour), Lint: LintOptions{Now: lintNow}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b3.Version != b1.Version {
-		t.Errorf("version changed with generatedAt: %s vs %s", b3.Version, b1.Version)
+	if c3.Bundle.Version != b1.Version || c3.Assignments.Version != b1.Version {
+		t.Errorf("version changed with generatedAt: %s, %s vs %s", c3.Bundle.Version, c3.Assignments.Version, b1.Version)
 	}
-	// And changes with the grants.
+	// It changes with the grants.
 	src.Grants[0].Spec.Duration = 900
-	b4, _, err := Compile(context.Background(), src, CompileOptions{GeneratedAt: generatedAt, Lint: LintOptions{Now: lintNow}})
+	c4, _, err := Compile(context.Background(), src, CompileOptions{GeneratedAt: generatedAt, Lint: LintOptions{Now: lintNow}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b4.Version == b1.Version {
+	if c4.Bundle.Version == b1.Version {
 		t.Error("version did not change with a grant")
+	}
+	// And with the assignments alone, the bundle's bytes otherwise the same.
+	src = loadGood(t)
+	src.Services[0].Spec.Members = src.Services[0].Spec.Members[:1]
+	c5, _, err := Compile(context.Background(), src, CompileOptions{GeneratedAt: generatedAt, Lint: LintOptions{Now: lintNow}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c5.Bundle.Version == b1.Version || c5.Assignments.Version != c5.Bundle.Version {
+		t.Errorf("versions %s and %s after an assignment change, from %s", c5.Bundle.Version, c5.Assignments.Version, b1.Version)
+	}
+	c5.Bundle.Version = b1.Version
+	if d5, _ := Marshal(c5.Bundle); !bytes.Equal(d5, d1) {
+		t.Error("an assignment change changed the bundle beyond its version")
 	}
 }
 
@@ -112,9 +148,9 @@ func TestCompileRefusesProblems(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, report, err := Compile(context.Background(), src, CompileOptions{})
-	if err == nil || b != nil || report == nil || report.OK() {
-		t.Errorf("Compile = %v, %v, %v; want a report with problems and no bundle", b, report, err)
+	c, report, err := Compile(context.Background(), src, CompileOptions{})
+	if err == nil || c != nil || report == nil || report.OK() {
+		t.Errorf("Compile = %v, %v, %v; want a report with problems and no bundle", c, report, err)
 	}
 	if _, _, err := Compile(context.Background(), loadGood(t), CompileOptions{Version: "v/1"}); err == nil || !strings.Contains(err.Error(), "version") {
 		t.Errorf("error = %v, want a version error", err)

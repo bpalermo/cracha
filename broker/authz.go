@@ -7,6 +7,7 @@ import (
 	"github.com/bpalermo/cracha/broker/internal/authz"
 	"github.com/bpalermo/cracha/broker/internal/authz/spicedb"
 	"github.com/bpalermo/cracha/broker/internal/authz/static"
+	"github.com/bpalermo/cracha/broker/internal/bundle"
 )
 
 // authzStore is the broker's authorization store with whatever the backend
@@ -17,6 +18,10 @@ import (
 type authzStore struct {
 	authz.Store
 	close func() error
+	// assignments is the static store when it reads its assignments from
+	// the publication: the grant source hands it every version's
+	// assignments with the bundle (grants.go). nil otherwise.
+	assignments bundle.AssignmentsSink
 }
 
 // Close releases what the backend holds open.
@@ -28,17 +33,23 @@ func (s authzStore) Close() error {
 }
 
 // newStore opens the authorization backend the configuration names (design
-// 6.3): the static assignments file, read once, or SpiceDB, dialed lazily
-// so a SpiceDB that is down denies requests rather than keeping the broker
-// from starting.
+// 6.3): the static backend, with the assignments file read once or, empty
+// until the grant source verifies a first version, the published
+// assignments; or SpiceDB, dialed lazily so a SpiceDB that is down denies
+// requests rather than keeping the broker from starting.
 func newStore(cfg config, log *slog.Logger) (authzStore, error) {
 	switch cfg.authzBackend {
 	case backendStatic:
+		if cfg.assignmentsSource == assignmentsPublished {
+			s := static.NewEmpty()
+			log.Info("authorization backend static", "assignments_source", assignmentsPublished, "bundle_source", cfg.bundleSource)
+			return authzStore{Store: s, assignments: s}, nil
+		}
 		s, err := static.Load(cfg.assignments)
 		if err != nil {
 			return authzStore{}, err
 		}
-		log.Info("authorization backend static", "path", cfg.assignments, "consistency_token", string(s.Token()))
+		log.Info("authorization backend static", "assignments_source", assignmentsFile, "path", cfg.assignments, "consistency_token", string(s.Token()))
 		return authzStore{Store: s}, nil
 	case backendSpiceDB:
 		s, err := spicedb.Dial(spicedb.Config{

@@ -10,7 +10,8 @@
 # unless E2E_KEEP_CLUSTER=1.
 #
 # E2E_AUTHZ chooses the broker's authorization backend: static (the default)
-# is the assignments document of e2e/values.yaml; spicedb also deploys
+# reads the assignments grantc compiled from e2e/grants and published with
+# the bundle (broker.assignments.source published); spicedb also deploys
 # SpiceDB (e2e/manifests/spicedb.yaml) with a preshared key made here, has
 # cracha-reconciler, built from this checkout and run from the host through a
 # port-forward, write the schema and the relationships of e2e/grants, and
@@ -176,46 +177,66 @@ for node in $(kind get nodes --name "${cluster}"); do
 done
 e2e/spire.sh
 
-# The grants, the production way (design 6.2): the bundle is compiled from
-# e2e/grants, signed with a throwaway P-256 key, published in the layout the
-# broker polls (latest, bundles/<version>/bundle.json and .sig) and handed
-# to the broker as a ConfigMap mounted at broker.bundle.source, with the
-# public key in the chart's Secret. The version is the content hash grantc
-# gives a bundle, which the test reads back from the ConfigMap's latest
-# pointer and expects in Cracha-Bundle-Version.
+# The grants and the assignments, the production way (design 6.2): grantc
+# compiles e2e/grants into the bundle and, beside it, the assignments of
+# its Services and Assignments, signs both with a throwaway P-256 key,
+# publishes them as one version in the layout the broker polls (latest,
+# bundles/<version>/bundle.json, assignments.json and their .sig) and hands
+# the publication to the broker as a ConfigMap mounted at
+# broker.bundle.source, with the public key in the chart's Secret. The
+# version is the content hash grantc gives a compilation, which the tests
+# read back from the ConfigMap's latest pointer and expect in
+# Cracha-Bundle-Version. The volume also lays out, optionally, a second
+# version, e2e-republished, under keys the ConfigMap does not have yet:
+# the test that republishes the tree (published_test.go) compiles it under
+# that version with the private key (E2E_BUNDLE_KEY) and adds the keys, so
+# the new version reaches the running broker without a change to its pod.
 openssl ecparam -name prime256v1 -genkey -noout -out "${bundle}/key.pem"
 openssl ec -in "${bundle}/key.pem" -pubout -out "${bundle}/pub.pem" 2>/dev/null
 "${grantc}" compile -o "${bundle}/bundle.json" e2e/grants
-"${grantc}" sign -key "${bundle}/key.pem" "${bundle}/bundle.json"
-"${grantc}" verify -pub "${bundle}/pub.pem" "${bundle}/bundle.json"
-"${grantc}" publish -dir "${bundle}/published" "${bundle}/bundle.json"
+"${grantc}" sign -key "${bundle}/key.pem" "${bundle}/bundle.json" "${bundle}/assignments.json"
+"${grantc}" verify -pub "${bundle}/pub.pem" "${bundle}/bundle.json" "${bundle}/assignments.json"
+"${grantc}" publish -dir "${bundle}/published" "${bundle}/bundle.json" "${bundle}/assignments.json"
 version="$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "${bundle}/published/latest")"
 [[ -n "${version}" ]] || {
 	echo "e2e: no version in ${bundle}/published/latest" >&2
 	exit 1
 }
+republished=e2e-republished
+published="${bundle}/published/bundles/${version}"
 kubectl create namespace cracha-system --dry-run=client -o yaml | kubectl apply -f -
 kubectl create configmap cracha-e2e-bundle -n cracha-system \
 	--from-file=latest="${bundle}/published/latest" \
-	--from-file=bundle.json="${bundle}/published/bundles/${version}/bundle.json" \
-	--from-file=bundle.json.sig="${bundle}/published/bundles/${version}/bundle.json.sig" \
+	--from-file=bundle.json="${published}/bundle.json" \
+	--from-file=bundle.json.sig="${published}/bundle.json.sig" \
+	--from-file=assignments.json="${published}/assignments.json" \
+	--from-file=assignments.json.sig="${published}/assignments.json.sig" \
 	--dry-run=client -o yaml | kubectl apply -f -
-cat >"${bundle}/values.yaml" <<EOF
-# Written by e2e/run.sh: the published bundle's layout in the ConfigMap and
-# the key it was signed with. See broker.bundle in e2e/values.yaml.
+{
+	cat <<EOF
+# Written by e2e/run.sh: the published version's layout in the ConfigMap,
+# and the slot of the version a test republishes, whose keys are absent
+# until it does (optional). See broker.bundle in e2e/values.yaml.
 broker:
   bundle:
     volume:
       configMap:
         name: cracha-e2e-bundle
+        optional: true
         items:
           - key: latest
             path: latest
-          - key: bundle.json
-            path: bundles/${version}/bundle.json
-          - key: bundle.json.sig
-            path: bundles/${version}/bundle.json.sig
 EOF
+	for file in bundle.json bundle.json.sig assignments.json assignments.json.sig; do
+		cat <<EOF
+          - key: ${file}
+            path: bundles/${version}/${file}
+          - key: ${republished}.${file}
+            path: bundles/${republished}/${file}
+EOF
+	done
+} >"${bundle}/values.yaml"
+export E2E_BUNDLE_KEY="${bundle}/key.pem"
 
 # The authorization backend. In spicedb mode SpiceDB runs beside the chart
 # on its memory datastore, which supports the Watch API the broker's cache
@@ -224,9 +245,8 @@ EOF
 # older one), and never after. The reconciler, the writer of design 6.4,
 # runs from the host through a port-forward kubectl picks a local port for,
 # which stays open for the tests, with the schema first and then the
-# relationships of e2e/grants: the same tree the bundle was compiled from,
-# and the same assignments as the static document of e2e/values.yaml, which
-# the suite checks.
+# relationships of e2e/grants: the same tree the bundle and the published
+# assignments were compiled from.
 authz_values=()
 if [[ "${authz}" == spicedb ]]; then
 	openssl rand -hex 32 >"${spicedb}/token"

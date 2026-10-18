@@ -3,8 +3,11 @@
 // session policy templates from a Git checkout, validates them, renders the
 // templates, runs the lints of the grant-compiler pipeline, compiles the
 // signed bundle the broker consumes, and signs and publishes it. The same
-// tree is the source of truth of the authorization store: the reconciler
-// (reconciler/) turns its Assignments and Services into relationships.
+// tree is the source of truth of the authorization store: its Assignments
+// and Services compile into the assignments document published beside the
+// bundle, which the broker's static backend reads, and the reconciler
+// (reconciler/) turns them into SpiceDB relationships, both through
+// ResolveAssignments.
 //
 // # Source tree
 //
@@ -149,29 +152,55 @@
 //
 // Its bytes are canonical: object keys sorted, grants sorted by name, two
 // space indentation and a trailing newline, so the same sources compile to
-// the same bytes, and the version, when none is given, is the SHA-256 of
-// the grants alone. Assignments are not part of the bundle: who holds a
-// grant is the authorization store's answer (design 6.1).
+// the same bytes.
+//
+// # Assignments
+//
+// Compile also produces, under the same version and generatedAt, the
+// assignments document: who holds which grant, as the tree's Services and
+// Assignments say (ResolveAssignments), for the broker's static
+// authorization backend to read from the publication instead of a file of
+// each cluster's:
+//
+//	{
+//	  "version", "generatedAt",
+//	  "services":  [ { "name", "team", "members", "grants": [ { "name", "expiresAt"?, "clusters"? } ] } ],
+//	  "workloads": [ { "subject", "suspended", "grants": [ { "name", "expiresAt"?, "clusters"? } ] } ]
+//	}
+//
+// A workload is every Assignment of one subject, merged: suspended when any
+// is, and each grant once, with the union of the bounds the Assignments give
+// it, the way the reconciler writes the same tree to SpiceDB (the mapping is
+// one function, ResolveAssignments). Its bytes are canonical as the
+// bundle's are. The version, when none is given, is the SHA-256 of the
+// grants and of the services and workloads together, so a change to who
+// holds a grant alone is a new version.
 //
 // # Signature envelope
 //
-// A signature is a small JSON document kept next to the bundle
-// (bundle.json.sig), detached from it:
+// A signature is a small JSON document kept next to the document it signs
+// (bundle.json.sig, assignments.json.sig), detached from it:
 //
 //	{
 //	  "version": 1,
 //	  "algorithm": "ECDSA_SHA_256",
-//	  "keyId": "<local: sha256:<hex> of the public key's DER; KMS: the key ARN>",
-//	  "digest": "sha256:<hex of the bundle bytes>",
+//	  "keyId": "sha256:<hex> of the signing key's public key, PKIX DER",
+//	  "digest": "sha256:<hex of the document's bytes>",
 //	  "signature": "<base64 of the ASN.1 DER ECDSA signature over the digest>"
 //	}
 //
-// The signature covers the exact bytes of the published bundle file. The
+// The signature covers the exact bytes of the published file. The
 // local signer uses an ECDSA P-256 key; the KMS signer uses an asymmetric
 // ECC_NIST_P256 signing key through kms:Sign, and the two produce
-// interchangeable signatures, so a bundle signed by KMS verifies offline
-// with the key's exported public key. Cosign signing (design 6.2 step 6) is
-// a later addition.
+// interchangeable signatures: the KMS signer names the key by its public
+// key's identity too (fetched once with kms:GetPublicKey), so a document
+// signed by KMS verifies offline with the key's exported PEM, and nothing
+// calls kms:Verify. KMSVerifier is that same local check with the public
+// key fetched from KMS. Cosign signing (design 6.2 step 6) is a later
+// addition.
+//
+// A reader may trust several keys (KeyRing): the envelope's keyId selects
+// the one that verifies, which is how a signing key is rotated.
 //
 // # Publication layout
 //
@@ -179,9 +208,15 @@
 //
 //	bundles/<version>/bundle.json
 //	bundles/<version>/bundle.json.sig
+//	bundles/<version>/assignments.json       optional: published with the bundle
+//	bundles/<version>/assignments.json.sig
 //	latest                         {"version","bundle","signature"}
 //
 // The versioned keys are written first and the latest pointer last, so a
-// reader that follows the pointer always finds a complete bundle and its
-// signature.
+// reader that follows the pointer always finds a complete version. The
+// pointer does not name the assignments: a reader finds them where the
+// layout puts a version's, so that a reader which predates them, and
+// decodes the pointer strictly, keeps working. This package's ParseLatest
+// ignores fields it does not know, so the next additive change need not
+// wait for that.
 package grant

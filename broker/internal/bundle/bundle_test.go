@@ -75,7 +75,7 @@ func (p *publication) publish(t *testing.T, data []byte, key *ecdsa.PrivateKey) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (&grant.LocalPublisher{Root: p.root}).Publish(context.Background(), data, sig); err != nil {
+	if _, err := (&grant.LocalPublisher{Root: p.root}).Publish(context.Background(), grant.Publication{Bundle: data, BundleSignature: sig}); err != nil {
 		t.Fatal(err)
 	}
 }

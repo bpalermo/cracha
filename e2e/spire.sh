@@ -60,8 +60,8 @@ register "spiffe://${trust_domain}/ns/cracha-system/sa/cracha-webhook" \
 	-dns cracha-webhook.cracha-system.svc \
 	-dns cracha-webhook.cracha-system.svc.cluster.local
 
-# The test workloads: client holds a grant (e2e/values.yaml, the chart's
-# assignments document), unassigned holds none. The agent fetches their
+# The test workloads: client holds a grant (the Service of e2e/grants),
+# unassigned holds none. The agent fetches their
 # JWT-SVIDs through the Broker API, with the server's default lifetime.
 for sa in client unassigned; do
 	register "spiffe://${trust_domain}/ns/e2e/sa/${sa}" \

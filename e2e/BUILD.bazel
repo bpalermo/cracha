@@ -4,22 +4,22 @@ load("@rules_shell//shell:sh_library.bzl", "sh_library")
 go_test(
     name = "e2e_test",
     srcs = [
-        "assignments_test.go",
         "credentials_test.go",
         "enrol_test.go",
         "main_test.go",
+        "published_test.go",
         "spicedb_test.go",
         "webhook_test.go",
     ],
     # What e2e/run.sh deploys beside the chart and runs: the manifests, the
     # values files, the grant sources it compiles into the bundle and, in
     # spicedb mode, reconciles into SpiceDB, spire.sh, run.sh itself, the
-    # kind node image it creates the cluster from and the reconciler. They
-    # are its data so that a change to any of them impacts the test in the
-    # Bazel graph, which is how CI decides whether to run the kind job
-    # (bazel/ci-impacted-targets.sh). The test reads
-    # the grant sources and values.yaml (assignments_test.go) and runs the
-    # reconciler (spicedb_test.go); the rest it never opens.
+    # kind node image it creates the cluster from, the grant compiler and
+    # the reconciler. They are its data so that a change to any of them
+    # impacts the test in the Bazel graph, which is how CI decides whether
+    # to run the kind job (bazel/ci-impacted-targets.sh). The test copies
+    # the grant sources, runs grantc on the copy (published_test.go) and
+    # the reconciler (spicedb_test.go); the rest it never opens.
     data = glob([
         "grants/**",
         "manifests/*",
@@ -27,6 +27,7 @@ go_test(
         "*.yaml",
     ]) + [
         "kind-node-image",
+        "//grantc",
         "//reconciler",
     ],
     # Needs a cluster: excluded from `bazel test //...` by the e2e tag (see
@@ -38,7 +39,6 @@ go_test(
     ],
     deps = [
         "//common/grant",
-        "@in_gopkg_yaml_v3//:yaml_v3",
         "@io_k8s_api//apps/v1:apps",
         "@io_k8s_api//core/v1:core",
         "@io_k8s_apimachinery//pkg/api/errors",

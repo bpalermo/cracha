@@ -1,12 +1,22 @@
 // Command cracha-grantc is the grant compiler (docs/design.md, section 6.2):
-// it lints a Git checkout of grants, compiles the bundle the broker consumes,
-// signs it, verifies a signature and publishes a signed bundle.
+// it lints a Git checkout of grants, compiles the bundle the broker consumes
+// and the assignments document its static backend reads, signs them,
+// verifies their signatures and publishes a signed version.
 //
 //	cracha-grantc lint <dir> [-access-analyzer [-region r]]
-//	cracha-grantc compile <dir> -o bundle.json [-version v] [-generated-at t] [-access-analyzer [-region r]]
-//	cracha-grantc sign (-key priv.pem | -kms-key arn [-region r]) [-o bundle.json.sig] bundle.json
-//	cracha-grantc verify (-pub pub.pem | -kms-key arn [-region r]) [-sig bundle.json.sig] bundle.json
-//	cracha-grantc publish (-dir path | -s3 bucket[/prefix] [-region r]) [-sig bundle.json.sig] bundle.json
+//	cracha-grantc compile <dir> -o bundle.json [-assignments assignments.json] [-version v] [-generated-at t] [-access-analyzer [-region r]]
+//	cracha-grantc sign (-key priv.pem | -kms-key arn [-region r]) [-o FILE.sig] bundle.json [assignments.json]
+//	cracha-grantc verify (-pub pub.pem | -kms-key arn [-region r]) [-sig FILE.sig] bundle.json [assignments.json]
+//	cracha-grantc publish (-dir path | -s3 bucket[/prefix] [-region r]) [-sig bundle.json.sig] bundle.json [assignments.json]
+//
+// sign, verify and publish take either document, told apart by their
+// content; each one's signature is <file>.sig unless -o or -sig names it,
+// which only a single file allows (publish's -sig is the bundle's). -pub
+// may hold several public keys, any of which verifies: the one the
+// signature names. A KMS signature names the key by its public key, so the
+// key's exported PEM (aws kms get-public-key) verifies it; verify -kms-key
+// fetches that public key (kms:GetPublicKey) and checks locally, never
+// calling kms:Verify.
 //
 // The exit status is 0 on success, 1 when a lint finds problems or a
 // signature does not verify, and 2 on a usage or operational error.
@@ -19,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -36,10 +47,11 @@ const usage = `usage: cracha-grantc <command> [flags] [args]
 
 commands:
   lint     <dir>           run the pipeline's lints on a grant source tree
-  compile  <dir> -o FILE   lint, then compile the bundle
-  sign     bundle.json     sign a bundle with a local key or a KMS key
-  verify   bundle.json     verify a bundle's signature
-  publish  bundle.json     publish a signed bundle to a directory or S3
+  compile  <dir> -o FILE   lint, then compile the bundle and, beside it, the assignments
+  sign     FILE...         sign a bundle or assignments with a local key or a KMS key
+  verify   FILE...         verify a bundle's or assignments' signature
+  publish  bundle.json [assignments.json]
+                           publish a signed version to a directory or S3
   --version                print the version
 
 Run "cracha-grantc <command> -h" for a command's flags.`
@@ -206,7 +218,8 @@ func runCompile(ctx context.Context, args []string, stdout, stderr io.Writer, cl
 	var lf lintFlags
 	lf.register(fs)
 	out := fs.String("o", "", "where to write the bundle (required)")
-	ver := fs.String("version", "", "the bundle's version, such as the git commit (default: the content hash)")
+	assignOut := fs.String("assignments", "", "where to write the assignments (default: "+grant.AssignmentsFile+" beside the bundle)")
+	ver := fs.String("version", "", "the version of the bundle and the assignments, such as the git commit (default: the content hash of both)")
 	at := fs.String("generated-at", "", "the generatedAt stamp, RFC 3339 (default: now)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -232,7 +245,7 @@ func runCompile(ctx context.Context, args []string, stdout, stderr io.Writer, cl
 	if copts.Lint, err = lf.options(ctx, clients); err != nil {
 		return err
 	}
-	bundle, report, err := grant.Compile(ctx, src, copts)
+	compiled, report, err := grant.Compile(ctx, src, copts)
 	if report != nil {
 		printReport(stdout, report)
 	}
@@ -242,14 +255,34 @@ func runCompile(ctx context.Context, args []string, stdout, stderr io.Writer, cl
 		}
 		return err
 	}
-	data, err := grant.Marshal(bundle)
+	if *assignOut == "" {
+		*assignOut = filepath.Join(filepath.Dir(*out), grant.AssignmentsFile)
+	}
+	return writeCompiled(stdout, compiled, *out, *assignOut)
+}
+
+// writeCompiled writes the bundle and the assignments of one compilation.
+func writeCompiled(stdout io.Writer, c *grant.Compiled, bundlePath, assignmentsPath string) error {
+	if bundlePath == assignmentsPath {
+		return fmt.Errorf("compile: the bundle and the assignments cannot both be written to %s", bundlePath)
+	}
+	data, err := grant.Marshal(c.Bundle)
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(*out, data, 0o644); err != nil {
+	assignments, err := grant.MarshalAssignments(c.Assignments)
+	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "compiled %s: version %s, %d grants, %d bytes\n", *out, bundle.Version, len(bundle.Grants), len(data))
+	if err := os.WriteFile(bundlePath, data, 0o644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(assignmentsPath, assignments, 0o644); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "compiled %s: version %s, %d grants, %d bytes\n", bundlePath, c.Bundle.Version, len(c.Bundle.Grants), len(data))
+	fmt.Fprintf(stdout, "compiled %s: version %s, %d services, %d workloads, %d bytes\n", assignmentsPath, c.Assignments.Version,
+		len(c.Assignments.Services), len(c.Assignments.Workloads), len(assignments))
 	return nil
 }
 
@@ -321,39 +354,70 @@ func (f *keyFlags) verifier(ctx context.Context, clients awsClients) (grant.Veri
 	if api != nil {
 		return grant.NewKMSVerifier(api, f.kmsKey), nil
 	}
-	pub, err := grant.ParseECPublicKey(pemData)
+	pubs, err := grant.ParseECPublicKeys(pemData)
 	if err != nil {
 		return nil, f.wrap(err)
 	}
-	verifier, err := grant.NewLocalVerifier(pub)
+	ring, err := grant.NewKeyRing(pubs...)
 	if err != nil {
 		return nil, f.wrap(err)
 	}
-	return verifier, nil
+	return ring, nil
 }
 
 func runSign(ctx context.Context, args []string, stdout, stderr io.Writer, clients awsClients) error {
 	fs := newFlags("sign", stderr)
 	kf := keyFlags{cmd: "sign", local: "key"}
 	kf.register(fs, "PEM file with the ECDSA P-256 private key", "ARN of the KMS signing key (ECC_NIST_P256)")
-	out := fs.String("o", "", "where to write the signature (default: <bundle>.sig)")
+	out := fs.String("o", "", "where to write the signature, with a single file (default: <file>.sig)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
-		return errors.New("sign: want exactly one bundle file")
+	files, err := documentArgs("sign", fs.Args(), *out, "-o")
+	if err != nil {
+		return err
 	}
 	signer, err := kf.signer(ctx, clients)
 	if err != nil {
 		return err
 	}
-	bundlePath := fs.Arg(0)
-	data, err := os.ReadFile(bundlePath)
+	for _, path := range files {
+		if err := signFile(ctx, stdout, signer, path, sigPathOf(path, *out)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// documentArgs checks the files a command was given: at least one, and
+// the single-file flag (flagName, set to value) only with exactly one.
+func documentArgs(cmd string, files []string, value, flagName string) ([]string, error) {
+	switch {
+	case len(files) == 0:
+		return nil, fmt.Errorf("%s: want a bundle or assignments file", cmd)
+	case value != "" && len(files) > 1:
+		return nil, fmt.Errorf("%s: %s names one signature; give one file with it", cmd, flagName)
+	}
+	return files, nil
+}
+
+// sigPathOf is the signature file of a document: the one given, or
+// <file>.sig.
+func sigPathOf(path, given string) string {
+	if given != "" {
+		return given
+	}
+	return path + ".sig"
+}
+
+// signFile signs one document, a bundle or assignments, into sigPath.
+func signFile(ctx context.Context, stdout io.Writer, signer grant.Signer, path, sigPath string) error {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	if _, err := grant.ParseBundle(data); err != nil {
-		return err
+	if _, _, err := grant.ParseArtifact(data); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
 	}
 	sig, err := signer.Sign(ctx, data)
 	if err != nil {
@@ -363,41 +427,39 @@ func runSign(ctx context.Context, args []string, stdout, stderr io.Writer, clien
 	if err != nil {
 		return err
 	}
-	sigPath := *out
-	if sigPath == "" {
-		sigPath = bundlePath + ".sig"
-	}
 	if err := os.WriteFile(sigPath, sigData, 0o644); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "signed %s with %s: %s\n", bundlePath, sig.KeyID, sigPath)
+	fmt.Fprintf(stdout, "signed %s with %s: %s\n", path, sig.KeyID, sigPath)
 	return nil
 }
 
 func runVerify(ctx context.Context, args []string, stdout, stderr io.Writer, clients awsClients) error {
 	fs := newFlags("verify", stderr)
 	kf := keyFlags{cmd: "verify", local: "pub"}
-	kf.register(fs, "PEM file with the ECDSA P-256 public key", "ARN of the KMS key that signed")
-	sigPath := fs.String("sig", "", "the signature file (default: <bundle>.sig)")
+	kf.register(fs, "PEM file with the ECDSA P-256 public key, or several: any of them verifies", "ARN or alias of the KMS key that signed; only its public key is fetched")
+	sigPath := fs.String("sig", "", "the signature file, with a single file (default: <file>.sig)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
-		return errors.New("verify: want exactly one bundle file")
+	files, err := documentArgs("verify", fs.Args(), *sigPath, "-sig")
+	if err != nil {
+		return err
 	}
 	verifier, err := kf.verifier(ctx, clients)
 	if err != nil {
 		return err
 	}
-	bundlePath := fs.Arg(0)
-	data, sig, err := readSigned(bundlePath, *sigPath)
-	if err != nil {
-		return err
+	for _, path := range files {
+		data, sig, err := readSigned(path, sigPathOf(path, *sigPath))
+		if err != nil {
+			return err
+		}
+		if err := verifier.Verify(ctx, data, sig); err != nil {
+			return fmt.Errorf("%w: %s: %v", errNotVerified, path, err)
+		}
+		fmt.Fprintf(stdout, "verified %s: signed by %s\n", path, sig.KeyID)
 	}
-	if err := verifier.Verify(ctx, data, sig); err != nil {
-		return fmt.Errorf("%w: %v", errNotVerified, err)
-	}
-	fmt.Fprintf(stdout, "verified %s: signed by %s\n", bundlePath, sig.KeyID)
 	return nil
 }
 
@@ -406,52 +468,103 @@ func runPublish(ctx context.Context, args []string, stdout, stderr io.Writer, cl
 	dir := fs.String("dir", "", "publish into this directory")
 	s3Dest := fs.String("s3", "", "publish into this bucket, as bucket or bucket/prefix")
 	region := fs.String("region", "", "AWS region for S3 (default: the SDK's)")
-	sigPath := fs.String("sig", "", "the signature file (default: <bundle>.sig)")
+	sigPath := fs.String("sig", "", "the bundle's signature file (default: <bundle>.sig)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
-		return errors.New("publish: want exactly one bundle file")
+	if fs.NArg() < 1 || fs.NArg() > 2 {
+		return errors.New("publish: want a bundle file and, optionally, its assignments file")
 	}
-	var publisher grant.Publisher
-	switch {
-	case *dir != "" && *s3Dest != "":
-		return errors.New("publish: -dir and -s3 are exclusive")
-	case *dir != "":
-		publisher = &grant.LocalPublisher{Root: *dir}
-	case *s3Dest != "":
-		bucket, prefix, _ := strings.Cut(strings.TrimPrefix(*s3Dest, "s3://"), "/")
-		if bucket == "" {
-			return errors.New("publish: -s3 needs a bucket")
-		}
-		api, err := clients.s3(ctx, *region)
-		if err != nil {
-			return err
-		}
-		publisher = grant.NewS3Publisher(api, bucket, prefix)
-	default:
-		return errors.New("publish: one of -dir or -s3 is required")
-	}
-	data, sig, err := readSigned(fs.Arg(0), *sigPath)
+	publisher, err := newPublisher(ctx, *dir, *s3Dest, *region, clients)
 	if err != nil {
 		return err
 	}
-	res, err := publisher.Publish(ctx, data, sig)
+	pub, err := readPublication(fs.Args(), *sigPath)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "published version %s: %s, %s, %s\n", res.Version, res.Bundle, res.Signature, res.Latest)
+	res, err := publisher.Publish(ctx, *pub)
+	if err != nil {
+		return err
+	}
+	written := []string{res.Bundle, res.Signature}
+	if res.Assignments != "" {
+		written = append(written, res.Assignments, res.AssignmentsSignature)
+	} else {
+		fmt.Fprintf(stderr, "cracha-grantc: publish: version %s has no assignments; a broker reading its assignments from the publication refuses it\n", res.Version)
+	}
+	fmt.Fprintf(stdout, "published version %s: %s, %s\n", res.Version, strings.Join(written, ", "), res.Latest)
 	return nil
 }
 
-// readSigned reads a bundle and its signature envelope.
-func readSigned(bundlePath, sigPath string) ([]byte, *grant.Signature, error) {
-	data, err := os.ReadFile(bundlePath)
+// newPublisher makes the publisher the destination flags name.
+func newPublisher(ctx context.Context, dir, s3Dest, region string, clients awsClients) (grant.Publisher, error) {
+	switch {
+	case dir != "" && s3Dest != "":
+		return nil, errors.New("publish: -dir and -s3 are exclusive")
+	case dir != "":
+		return &grant.LocalPublisher{Root: dir}, nil
+	case s3Dest != "":
+		bucket, prefix, _ := strings.Cut(strings.TrimPrefix(s3Dest, "s3://"), "/")
+		if bucket == "" {
+			return nil, errors.New("publish: -s3 needs a bucket")
+		}
+		api, err := clients.s3(ctx, region)
+		if err != nil {
+			return nil, err
+		}
+		return grant.NewS3Publisher(api, bucket, prefix), nil
+	default:
+		return nil, errors.New("publish: one of -dir or -s3 is required")
+	}
+}
+
+// readPublication reads the documents to publish and their signatures:
+// exactly one bundle and at most one assignments document, in any order.
+// bundleSig, when given, is the bundle's signature file.
+func readPublication(files []string, bundleSig string) (*grant.Publication, error) {
+	pub := &grant.Publication{}
+	for _, path := range files {
+		if err := addDocument(pub, path, bundleSig); err != nil {
+			return nil, err
+		}
+	}
+	if pub.Bundle == nil {
+		return nil, errors.New("publish: no bundle among the files")
+	}
+	return pub, nil
+}
+
+// addDocument reads one document and its signature into the publication,
+// in the place its kind says.
+func addDocument(pub *grant.Publication, path, bundleSig string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	kind, _, err := grant.ParseArtifact(data)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	doc, sig, given := &pub.Bundle, &pub.BundleSignature, bundleSig
+	if kind == grant.ArtifactAssignments {
+		doc, sig, given = &pub.Assignments, &pub.AssignmentsSignature, ""
+	}
+	if *doc != nil {
+		return fmt.Errorf("publish: %s is a second %s", path, kind)
+	}
+	if _, *sig, err = readSigned(path, sigPathOf(path, given)); err != nil {
+		return err
+	}
+	*doc = data
+	return nil
+}
+
+// readSigned reads a document and its signature envelope.
+func readSigned(path, sigPath string) ([]byte, *grant.Signature, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, nil, err
-	}
-	if sigPath == "" {
-		sigPath = bundlePath + ".sig"
 	}
 	sigData, err := os.ReadFile(sigPath)
 	if err != nil {

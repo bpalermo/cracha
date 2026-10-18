@@ -22,18 +22,23 @@ const maxObjectBytes = 16 << 20
 
 // Fetched is one publication as found behind the latest pointer: the
 // version the pointer names and the exact bytes of the versioned bundle and
-// signature objects.
+// signature objects and, when they were asked for, of the version's
+// assignments and their signature.
 type Fetched struct {
-	Version   string
-	Bundle    []byte
-	Signature []byte
+	Version              string
+	Bundle               []byte
+	Signature            []byte
+	Assignments          []byte
+	AssignmentsSignature []byte
 }
 
 // Fetcher reads the current publication: it resolves the latest pointer
 // and then the versioned objects it names (common/grant's publication
-// layout). It does no verification.
+// layout), the version's assignments too when withAssignments is set. It
+// does no verification. A version published without assignments fails a
+// fetch that asks for them, as any object that cannot be read does.
 type Fetcher interface {
-	Fetch(ctx context.Context) (*Fetched, error)
+	Fetch(ctx context.Context, withAssignments bool) (*Fetched, error)
 }
 
 // Location is a parsed bundle source: a local directory or an S3 prefix.
@@ -77,7 +82,7 @@ type readObject func(ctx context.Context, key string) ([]byte, error)
 // pointer is not signed, so nothing in it is trusted beyond the version:
 // the objects read are the ones the layout gives that version, and the
 // pointer has to agree.
-func resolve(ctx context.Context, read readObject) (*Fetched, error) {
+func resolve(ctx context.Context, read readObject, withAssignments bool) (*Fetched, error) {
 	data, err := read(ctx, grant.LatestFile)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", grant.LatestFile, err)
@@ -102,7 +107,17 @@ func resolve(ctx context.Context, read readObject) (*Fetched, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", sigKey, err)
 	}
-	return &Fetched{Version: latest.Version, Bundle: bundle, Signature: sig}, nil
+	f := &Fetched{Version: latest.Version, Bundle: bundle, Signature: sig}
+	if withAssignments {
+		key, sigKey := grant.AssignmentsKeys(latest.Version)
+		if f.Assignments, err = read(ctx, key); err != nil {
+			return nil, fmt.Errorf("version %s publishes no readable assignments: %s: %w", latest.Version, key, err)
+		}
+		if f.AssignmentsSignature, err = read(ctx, sigKey); err != nil {
+			return nil, fmt.Errorf("%s: %w", sigKey, err)
+		}
+	}
+	return f, nil
 }
 
 // Local fetches from a directory laid out the way grant.LocalPublisher
@@ -112,7 +127,7 @@ type Local struct {
 }
 
 // Fetch implements Fetcher.
-func (l *Local) Fetch(ctx context.Context) (*Fetched, error) {
+func (l *Local) Fetch(ctx context.Context, withAssignments bool) (*Fetched, error) {
 	return resolve(ctx, func(_ context.Context, key string) ([]byte, error) {
 		f, err := os.Open(filepath.Join(l.Root, filepath.FromSlash(key)))
 		if err != nil {
@@ -120,7 +135,7 @@ func (l *Local) Fetch(ctx context.Context) (*Fetched, error) {
 		}
 		defer f.Close()
 		return readAll(f)
-	})
+	}, withAssignments)
 }
 
 // S3API is the part of the S3 client the fetcher uses, so tests can
@@ -143,7 +158,7 @@ func NewS3(api S3API, bucket, prefix string) *S3 {
 }
 
 // Fetch implements Fetcher.
-func (s *S3) Fetch(ctx context.Context) (*Fetched, error) {
+func (s *S3) Fetch(ctx context.Context, withAssignments bool) (*Fetched, error) {
 	return resolve(ctx, func(ctx context.Context, key string) ([]byte, error) {
 		if s.prefix != "" {
 			key = s.prefix + "/" + key
@@ -154,7 +169,7 @@ func (s *S3) Fetch(ctx context.Context) (*Fetched, error) {
 		}
 		defer out.Body.Close()
 		return readAll(out.Body)
-	})
+	}, withAssignments)
 }
 
 // readAll reads an object, refusing one over maxObjectBytes.

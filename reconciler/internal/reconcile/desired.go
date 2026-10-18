@@ -1,10 +1,7 @@
 package reconcile
 
 import (
-	"fmt"
 	"slices"
-	"sort"
-	"time"
 
 	"github.com/bpalermo/cracha/common/grant"
 	"github.com/bpalermo/cracha/common/spicedb"
@@ -22,24 +19,32 @@ import (
 //	                                                          the subject's service, or "none"
 //
 // A bound in time alone is the within_window caveat, in clusters alone
-// in_clusters, both bounded, neither no caveat. Two assignments that give
-// one subject the same grant are one relationship, with the bounds that
-// allow what either allows; when no single caveat can express that union
-// (one bound in time, the other in clusters, say) the tree is refused. The
-// source must have passed the loader and the lints; this does not validate
-// it again. The result is sorted by key.
+// in_clusters, both bounded, neither no caveat. Who holds what is
+// grant.ResolveAssignments, the mapping the published assignments document
+// of the static backend carries too: two assignments that give one subject
+// the same grant are one relationship, with the bounds that allow what
+// either allows, and a tree whose union no single caveat can express (one
+// bound in time, the other in clusters, say) is refused. The source must
+// have passed the loader and the lints; this does not validate it again.
+// The result is sorted by key.
 func Desired(src *grant.Source) ([]Relationship, error) {
 	b := builder{rels: map[string]Relationship{}}
 	for _, g := range src.Grants {
 		b.add(plain(spicedb.TypeGrant, g.Name(), spicedb.RelationAccount, spicedb.TypeAWSAccount, g.Spec.Account))
 	}
-	for _, s := range src.Services {
-		if err := b.addService(s); err != nil {
-			return nil, err
+	services, workloads, err := grant.ResolveAssignments(src)
+	if err != nil {
+		return nil, err
+	}
+	teams := map[string]string{}
+	for _, s := range services {
+		b.addService(s)
+		for _, m := range s.Members {
+			teams[m] = s.Team
 		}
 	}
-	if err := b.addAssignments(src); err != nil {
-		return nil, err
+	for _, w := range workloads {
+		b.addWorkload(w, teams)
 	}
 	out := make([]Relationship, 0, len(b.rels))
 	for _, r := range b.rels {
@@ -60,115 +65,40 @@ func plain(resourceType, resourceID, relation, subjectType, subjectID string) Re
 	return Relationship{ResourceType: resourceType, ResourceID: resourceID, Relation: relation, SubjectType: subjectType, SubjectID: subjectID}
 }
 
-func (b *builder) addService(s *grant.Service) error {
-	b.add(plain(spicedb.TypeService, s.Name(), spicedb.RelationOwner, spicedb.TypeTeam, s.Spec.Team))
-	for _, member := range s.Spec.Members {
-		b.add(plain(spicedb.TypeService, s.Name(), spicedb.RelationMember, spicedb.TypeWorkload, member))
+func (b *builder) addService(s grant.AssignedService) {
+	b.add(plain(spicedb.TypeService, s.Name, spicedb.RelationOwner, spicedb.TypeTeam, s.Team))
+	for _, member := range s.Members {
+		b.add(plain(spicedb.TypeService, s.Name, spicedb.RelationMember, spicedb.TypeWorkload, member))
 	}
-	for _, g := range s.Spec.Grants {
-		bd, err := newBounds(g.ExpiresAt, g.Clusters)
-		if err != nil {
-			return fmt.Errorf("service %s: grant %s: %w", s.Name(), g.Name, err)
-		}
-		r := plain(spicedb.TypeGrant, g.Name, spicedb.RelationAssigneeService, spicedb.TypeService, s.Name())
-		bd.caveat(&r)
+	for _, g := range s.Grants {
+		r := plain(spicedb.TypeGrant, g.Name, spicedb.RelationAssigneeService, spicedb.TypeService, s.Name)
+		caveat(&r, g)
 		b.add(r)
 	}
-	return nil
 }
 
-// assigned is one assignment's bounds on one grant, for merging.
-type assigned struct {
-	assignment string
-	bounds     bounds
-}
-
-// addAssignments adds the direct assignments, merging the ones that give a
-// subject the same grant, and the suspensions.
-func (b *builder) addAssignments(src *grant.Source) error {
-	byPair := map[[2]string][]assigned{}
-	var pairs [][2]string
-	for _, a := range src.Assignments {
-		bd, err := newBounds(a.Spec.ExpiresAt, a.Spec.Clusters)
-		if err != nil {
-			return fmt.Errorf("assignment %s: %w", a.Name(), err)
-		}
-		for _, g := range a.Spec.Grants {
-			pair := [2]string{a.Spec.Subject, g}
-			if _, seen := byPair[pair]; !seen {
-				pairs = append(pairs, pair)
-			}
-			byPair[pair] = append(byPair[pair], assigned{a.Name(), bd})
-		}
-		if a.Spec.Suspended {
-			b.add(plain(spicedb.TypeWorkload, a.Spec.Subject, spicedb.RelationSuspended, spicedb.TypeTeam, teamOf(src, a.Spec.Subject)))
-		}
-	}
-	for _, pair := range pairs {
-		merged, err := mergeAssigned(byPair[pair])
-		if err != nil {
-			return fmt.Errorf("subject %s, grant %s: %w", pair[0], pair[1], err)
-		}
-		r := plain(spicedb.TypeGrant, pair[1], spicedb.RelationAssigneeWorkload, spicedb.TypeWorkload, pair[0])
-		merged.caveat(&r)
+// addWorkload adds a subject's direct assignments and its suspension,
+// whose subject is the team of its service (teams), or spicedb.TeamNone.
+func (b *builder) addWorkload(w grant.AssignedWorkload, teams map[string]string) {
+	for _, g := range w.Grants {
+		r := plain(spicedb.TypeGrant, g.Name, spicedb.RelationAssigneeWorkload, spicedb.TypeWorkload, w.Subject)
+		caveat(&r, g)
 		b.add(r)
 	}
-	return nil
-}
-
-// teamOf is the team of the subject's service, or spicedb.TeamNone.
-func teamOf(src *grant.Source, subject string) string {
-	if s := src.ServiceOf(subject); s != nil {
-		return s.Spec.Team
-	}
-	return spicedb.TeamNone
-}
-
-// mergeAssigned unions the bounds of every assignment of one grant to one
-// subject, or says which two cannot be expressed as one caveat.
-func mergeAssigned(as []assigned) (bounds, error) {
-	acc := as[0]
-	for _, a := range as[1:] {
-		u, ok := acc.bounds.union(a.bounds)
-		if !ok {
-			return bounds{}, fmt.Errorf("assignments %s and %s bound it in ways one relationship cannot express; give it the same bounds in both, or merge them into one", acc.assignment, a.assignment)
+	if w.Suspended {
+		team := teams[w.Subject]
+		if team == "" {
+			team = spicedb.TeamNone
 		}
-		acc = assigned{acc.assignment + "+" + a.assignment, u}
+		b.add(plain(spicedb.TypeWorkload, w.Subject, spicedb.RelationSuspended, spicedb.TypeTeam, team))
 	}
-	return acc.bounds, nil
 }
 
-// bounds are the time and cluster bounds of one assignment of a grant.
-type bounds struct {
-	// expiresAt is the zero time when unbounded in time.
-	expiresAt time.Time
-	// clusters is nil when unbounded in clusters; otherwise sorted, without
-	// repeats.
-	clusters []string
-}
-
-func newBounds(expiresAt string, clusters []string) (bounds, error) {
-	var b bounds
-	if expiresAt != "" {
-		t, err := time.Parse(time.RFC3339, expiresAt)
-		if err != nil {
-			return b, fmt.Errorf("expiresAt: %w", err)
-		}
-		b.expiresAt = t.UTC()
-	}
-	if len(clusters) > 0 {
-		b.clusters = slices.Compact(slices.Sorted(slices.Values(clusters)))
-	}
-	return b, nil
-}
-
-// caveat sets the relationship's caveat from the bounds.
-func (b bounds) caveat(r *Relationship) {
-	if !b.expiresAt.IsZero() {
-		r.ExpiresAt = b.expiresAt.Format(time.RFC3339)
-	}
-	if b.clusters != nil {
-		r.Allowed = slices.Clone(b.clusters)
+// caveat sets the relationship's caveat from a grant's normalized bounds.
+func caveat(r *Relationship, g grant.BoundedGrant) {
+	r.ExpiresAt = g.ExpiresAt
+	if len(g.Clusters) > 0 {
+		r.Allowed = slices.Clone(g.Clusters)
 	}
 	switch {
 	case r.ExpiresAt != "" && r.Allowed != nil:
@@ -178,39 +108,4 @@ func (b bounds) caveat(r *Relationship) {
 	case r.Allowed != nil:
 		r.Caveat = spicedb.CaveatInClusters
 	}
-}
-
-// subsumes reports whether b allows at least everything o allows.
-func (b bounds) subsumes(o bounds) bool {
-	inTime := b.expiresAt.IsZero() || (!o.expiresAt.IsZero() && !b.expiresAt.Before(o.expiresAt))
-	inClusters := b.clusters == nil || (o.clusters != nil && subset(o.clusters, b.clusters))
-	return inTime && inClusters
-}
-
-// union returns the bounds that allow what either allows, when one caveat
-// can express it: one subsumes the other, or they expire together and
-// differ in clusters only.
-func (b bounds) union(o bounds) (bounds, bool) {
-	switch {
-	case b.subsumes(o):
-		return b, true
-	case o.subsumes(b):
-		return o, true
-	case b.expiresAt.Equal(o.expiresAt):
-		all := append(slices.Clone(b.clusters), o.clusters...)
-		sort.Strings(all)
-		return bounds{expiresAt: b.expiresAt, clusters: slices.Compact(all)}, true
-	default:
-		return bounds{}, false
-	}
-}
-
-// subset reports whether every element of a is in b.
-func subset(a, b []string) bool {
-	for _, x := range a {
-		if !slices.Contains(b, x) {
-			return false
-		}
-	}
-	return true
 }

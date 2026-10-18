@@ -103,6 +103,10 @@ type brokerLine struct {
 	Client  string    `json:"client"`
 	Path    string    `json:"path"`
 	Status  int       `json:"status"`
+	// What a bundle load reports (broker/internal/bundle).
+	NewVersion string `json:"new_version"`
+	Services   int    `json:"services"`
+	Workloads  int    `json:"workloads"`
 }
 
 // brokerLogs returns every JSON line of every broker pod's log, in order.

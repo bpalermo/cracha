@@ -1,10 +1,13 @@
 # What E2E_AUTHZ=spicedb adds to e2e/values.yaml: the broker asks SpiceDB
-# (e2e/manifests/spicedb.yaml) instead of the static assignments document,
-# which the chart then leaves out. Plaintext gRPC inside the cluster, with
+# (e2e/manifests/spicedb.yaml) instead of the static backend, which takes
+# the published assignments; the assignments.source a SpiceDB install
+# leaves at its default. Plaintext gRPC inside the cluster, with
 # the preshared key from the Secret e2e/run.sh creates; the relationships
 # come from e2e/grants through cracha-reconciler, which run.sh runs from the
 # host.
 broker:
+  assignments:
+    source: file
   authz:
     backend: spicedb
     spicedb:

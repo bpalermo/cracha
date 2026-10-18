@@ -165,8 +165,40 @@ func TestParseConfigBundle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.bundle.Dir != "/etc/cracha/bundle" || c.bundle.IsS3() || c.pollInterval != 5*time.Minute || c.bundleVerifyKey != "/etc/cracha/bundle-key/public.pem" {
+	if c.bundle.Dir != "/etc/cracha/bundle" || c.bundle.IsS3() || c.pollInterval != 5*time.Minute || c.bundleVerifyKey.String() != "/etc/cracha/bundle-key/public.pem" {
 		t.Errorf("config %+v", c)
+	}
+}
+
+// The published assignments, and the verification keys as a list: from
+// repeated flags, and from the environment's comma-separated list, which a
+// flag replaces.
+func TestParseConfigPublishedAssignments(t *testing.T) {
+	base := []string{"--cluster", "c", "--namespace", "n", "--bundle-source", "local:/b", "--assignments-source", "published"}
+	c, err := parseConfig(append(base, "--bundle-verify-key", "old.pem", "--bundle-verify-key", "new.pem"), envOf(nil), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.assignmentsSource != "published" || c.assignments != "" || strings.Join(c.bundleVerifyKey.paths, " ") != "old.pem new.pem" {
+		t.Errorf("config %+v", c)
+	}
+	env := envOf(map[string]string{"CRACHA_BUNDLE_VERIFY_KEY": "a.pem, b.pem", "CRACHA_ASSIGNMENTS_SOURCE": "published"})
+	c, err = parseConfig([]string{"--cluster", "c", "--namespace", "n", "--bundle-source", "local:/b"}, env, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.assignmentsSource != "published" || strings.Join(c.bundleVerifyKey.paths, " ") != "a.pem b.pem" {
+		t.Errorf("env config %+v", c)
+	}
+	c, err = parseConfig(append(base, "--bundle-verify-key", "flag.pem"), env, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(c.bundleVerifyKey.paths, " ") != "flag.pem" {
+		t.Errorf("the flag did not replace the environment's keys: %v", c.bundleVerifyKey.paths)
+	}
+	if _, err := parseConfig(append(base, "--bundle-verify-key", ""), envOf(nil), io.Discard); err == nil {
+		t.Error("an empty --bundle-verify-key was accepted")
 	}
 }
 
@@ -254,6 +286,10 @@ func TestParseConfigAuthzRejects(t *testing.T) {
 		"spicedb without endpoint":   {with("--authz-backend", "spicedb", "--spicedb-token-file", "t"), "--spicedb-endpoint is required"},
 		"spicedb without token file": {with("--authz-backend", "spicedb", "--spicedb-endpoint", "e"), "--spicedb-token-file is required"},
 		"spicedb with assignments":   {with(append(spicedb, "--assignments", "a")...), "--assignments needs --authz-backend static"},
+		"spicedb with published":     {with(append(spicedb, "--assignments-source", "published")...), "--assignments-source published needs --authz-backend static"},
+		"unknown source":             {with("--assignments-source", "git", "--assignments", "a"), `--assignments-source "git" is not file or published`},
+		"published and a file":       {with("--assignments-source", "published", "--assignments", "a"), "are exclusive"},
+		"published without a bundle": {with("--assignments-source", "published"), "needs --bundle-source"},
 		"insecure with ca":           {with(append(spicedb, "--spicedb-insecure", "--spicedb-ca", "ca")...), "excludes --spicedb-ca"},
 		"zero timeout":               {with(append(spicedb, "--spicedb-timeout", "0s")...), "not positive"},
 	}

@@ -151,7 +151,7 @@ spec:
     - arn:aws:dynamodb:*:111122223333:table/payments-*
 ```
 
-Who holds a grant is recorded beside it, in the same tree, as a `kind: Service` (a team's workloads and the grants they share) and `kind: Assignment` (one workload's own grants, or its suspension) documents. They are not part of the bundle: the authorization store answers who holds what (6.1), and the `authz-reconciler` of 6.4 writes it there from these documents, which also let the composition lint (step 5) check what each workload will hold.
+Who holds a grant is recorded beside it, in the same tree, as a `kind: Service` (a team's workloads and the grants they share) and `kind: Assignment` (one workload's own grants, or its suspension) documents. They are not part of the bundle: the authorization store answers who holds what (6.1). For SpiceDB the `authz-reconciler` of 6.4 writes it there from these documents; for the static backend the compiler publishes them, beside the bundle, as the assignments document (below). They also let the composition lint (step 5) check what each workload will hold.
 
 ```yaml
 kind: Service
@@ -191,7 +191,24 @@ CI (`grant-compiler`) pipeline:
 
 The grant tree is a repository of its own, not this one. Its CI runs the pipeline with a released `grantc`, verified against the signed checksums of its Crachá release, through the reusable workflow `.github/workflows/grants.yml`: lint and compile on a pull request; lint, compile, sign with a KMS key, verify and publish to S3 on a merge ([grants-repository.md](grants-repository.md)).
 
-Broker polls the bundle, verifies signature, swaps atomically, and **keeps the last good bundle on failure (never fails open).**
+One compilation is one published version, of two artifacts:
+
+- `bundle.json`, the grants: what each grant is.
+- `assignments.json`, who holds them, for the static backend (6.3): every Service with its team, members and bounded grants, and every subject's Assignments merged into one workload, suspended when any of them suspends it and holding each grant once, with the union of the bounds its Assignments give it. The mapping is one function (`grant.ResolveAssignments`), the same the reconciler writes SpiceDB from, so the two backends hold the same tree the same way; a union no single bound can express is refused by both.
+
+Both carry the version and `generatedAt`, both are canonical JSON, each is signed with the same envelope and key (`<file>.sig`), and the version, when none is given, is the content hash of both, so a change of assignments alone is a new version. The layout:
+
+```
+bundles/<version>/bundle.json
+bundles/<version>/bundle.json.sig
+bundles/<version>/assignments.json
+bundles/<version>/assignments.json.sig
+latest                                  {"version", "bundle", "signature"}
+```
+
+The versioned objects are written first and `latest` last. `latest` is unsigned and only its version is trusted; it does not name the assignments, which are where the layout puts a version's, so a broker that predates them (and decodes `latest` strictly) keeps reading the bundle. Brokers since ignore unknown fields of `latest`.
+
+Broker polls the version, verifies signature, swaps atomically, and **keeps the last good version on failure (never fails open).** When its static backend reads the published assignments, it fetches and verifies both artifacts of a version, requires both to be the version `latest` names, and puts the version in service only when both verified and parsed: the pair swaps together and the last good pair stays on any failure of either, a version published without assignments included. It is not ready until a first pair has verified. Signing: the signature envelope names the key by its public key (`keyId` = `sha256:` of the PKIX DER), whether the private key is a local one or a KMS key (`ECC_NIST_P256`, `kms:Sign` over the digest, its public key fetched once with `kms:GetPublicKey`), so a KMS signature verifies offline with the key's exported PEM (`aws kms get-public-key --key-id <key> --query PublicKey --output text | base64 -d | openssl pkey -pubin -inform DER`, or the Terraform output). Brokers verify with that PEM (`--bundle-verify-key`) and need no KMS access and make no AWS call to verify; `--bundle-kms-key` remains, fetching the public key once (`kms:GetPublicKey`) and checking the same way, and nothing calls `kms:Verify`. The broker trusts a set of public keys, any of which verifies (the one the envelope's `keyId` names), so the signing key rotates without a gap: add the new key's PEM beside the old one, sign with the new, then drop the old. Every cluster whose broker reads the same publication holds the same grants and the same assignments.
 
 ### 6.3 Authorization store contract
 
@@ -209,7 +226,7 @@ Rules:
 - Consistency tokens are opaque outside the adapter. SpiceDB's zedToken is one implementation; a static backend may use a file hash. Callers may ask for minimize-latency or at-least-as-fresh(token).
 - Any failure to answer is a deny. Backends never fail open.
 - Time-bounded and cluster-bounded assignments are part of the model, not of one backend's caveat feature. A backend without native conditions evaluates them in its adapter.
-- Backends: `static` (signed assignment file, for bootstrap, air-gapped or tiny installs) and `spicedb` (reference). OpenFGA or a Cedar-based store would be further adapters, not design changes. The broker's `--authz-backend` chooses one: `static` is `broker/internal/authz/static`, `spicedb` is `broker/internal/authz/spicedb`, the adapter over 6.4.
+- Backends: `static` (assignments held in memory, for bootstrap, air-gapped or small fleets) and `spicedb` (reference). The static backend's assignments come from one of two sources (`--assignments-source`): `published`, the signed assignments document of the version the bundle source serves (6.2), swapped with its bundle, so that every cluster reading one publication holds the same assignments without a database; or `file`, a document of the install's own read once (development, single clusters). Its consistency token is the SHA-256 of the document it holds, so every swap is a new token, and its Watch reports every swap as a change of every subject (6.7). OpenFGA or a Cedar-based store would be further adapters, not design changes. The broker's `--authz-backend` chooses one: `static` is `broker/internal/authz/static`, `spicedb` is `broker/internal/authz/spicedb`, the adapter over 6.4.
 
 ### 6.4 Reference backend: SpiceDB
 
@@ -273,6 +290,7 @@ Relationship writers (write access to the authz store is security-critical, what
 | Relationship | Source of truth | Writer |
 |---|---|---|
 | `grant#account`, `service#owner`, `service#member`, `grant#assignee_service`, `grant#assignee_workload`, `workload#suspended` | Git: the grant source tree of 6.2 (CODEOWNERS). **Never** workload-controlled annotations | `authz-reconciler` (`cracha-reconciler apply`) |
+| The static backend's published assignments (6.3) | The same tree | The grant pipeline of 6.2: `grantc compile`, `sign`, `publish`, with the signing key |
 | Temporary / break-glass | Approval flow | `access-approver`, with caveat/expiry |
 
 The reconciler's mapping, from the documents of 6.2 to relationships. A grant bounded in time alone carries `within_window{expires_at}`, in clusters alone `in_clusters{allowed}`, in both `bounded{expires_at, allowed}`, in neither no caveat:
@@ -351,7 +369,7 @@ Authentication:
 
 - Broker cache key: `(shape, sorted grant set, bundleVersion, encoded workload)`. A change in the grant set is a new key, so an added or removed assignment takes effect at the next fetch. In-memory only, singleflight on miss, refresh-ahead at ~70% of the usable lifetime (the TTL less the 20-minute floor: 28 minutes into a one-hour session), never return creds with <20 min left.
 - **Re-check the authz store on every issuance, including cache hits** (cheap at refresh frequency).
-- `Store.Watch` invalidates affected cache entries on assignment changes. Backends without Watch degrade to TTL-only invalidation, and the broker exposes which mode is active.
+- `Store.Watch` invalidates affected cache entries on assignment changes. Backends without Watch degrade to TTL-only invalidation, and the broker exposes which mode is active. The static backend's Watch is minimal: after each swap of its assignments, one change naming no subject, which drops every entry. That is enough because the cache already re-checks the store on every issuance, so a swap takes effect at the next fetch whatever the cache holds, and because the published version is the bundle version in the key, which every swap changes: the flush only drops at once the sessions of the previous version, which no request could reach any more, instead of leaving them to age out, and keeps them from being served in degraded mode.
 - Consistency: minimize latency by default; at-least-as-fresh when a caller (approver/revocation tool) supplies a consistency token.
 - Authz store unavailable: fail closed for new keys; serve cache hits only if the last successful check for that key is <10 min old.
 
@@ -532,6 +550,7 @@ sequenceDiagram
 | cracha-agent down | New pods wait at enrolment: the init container retries, or the CNI `ADD` fails and kubelet retries (in `cni` mode every new pod of the node, 7.2). Running pods' requests are refused until it returns; the SDKs retry and keep their cached session. On return it re-binds every enrolled pod (7.4). |
 | CRI socket unavailable | Recovery and `init` enrolment cannot resolve a network namespace: new `init`-mode pods wait, listeners not yet re-bound stay down. `cni` mode still enrols new pods, since the plugin hands the agent the namespace path. |
 | Bad/unsigned bundle | Keep last good bundle, alert. Never fail open. |
+| Bad, unsigned or missing assignments (static backend reading the publication) | The version is rejected whole: keep the last good bundle and assignments pair, alert; not ready until a first pair verifies. Never fail open. |
 
 ## 9. Threat model (summary)
 

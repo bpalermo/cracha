@@ -42,19 +42,23 @@ checkout (the broker, the agent, the webhook and the suite's own two,
 and agent of `e2e/spire.yaml`, with the agent's Broker API open to
 `cracha-agent` alone, and the entries of the three components and the test
 workloads, the webhook's with its Service name as a DNS SAN), installs the
-chart built from the checkout with `e2e/values.yaml` (the suite's
-assignments, the SPIRE socket paths, the kind node's CRI socket and netns
-directory, the STS endpoint), `e2e/values-local.yaml` (the images just
-loaded) and a values file it writes for the grant bundle it compiled from
-`e2e/grants`, signed with a throwaway key and published into a ConfigMap,
+chart built from the checkout with `e2e/values.yaml` (the published
+assignments, a short bundle poll, the SPIRE socket paths, the kind node's
+CRI socket and netns directory, the STS endpoint), `e2e/values-local.yaml`
+(the images just loaded) and a values file it writes for the version it
+compiled from `e2e/grants` (the bundle and the assignments), signed with a
+throwaway key and published into a ConfigMap, whose volume also lays out
+an optional second version a test republishes under,
 deploys the STS stand-in (`e2e/manifests/stsstub.yaml`, `e2e/stsstub`) and
 runs the tests against the ambient kubeconfig. Nothing is generated or
 handed to a workload: every certificate is an X.509-SVID from that SPIRE,
 the agent reaches the broker over SPIFFE mTLS, and the test workloads see
 only the loopback listener in their own network namespace, so there is no
 CA anywhere in the suite. `E2E_AUTHZ` picks the broker's authorization
-backend: `static` (the default) is the assignments document in
-`e2e/values.yaml`; `spicedb` also deploys SpiceDB from
+backend: `static` (the default) reads the assignments published with the
+bundle, and a test republishes a changed copy of the tree (grantc from the
+runfiles, the key from `E2E_BUNDLE_KEY`) and watches the running broker
+take it; `spicedb` also deploys SpiceDB from
 `e2e/manifests/spicedb.yaml` (memory datastore, plaintext gRPC, a preshared
 key the script makes), runs `cracha-reconciler` built from the checkout on
 the host through a `kubectl port-forward` to write the schema and the
@@ -233,7 +237,11 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   single identity-encoding library (design 4.3): nothing else formats a
   SourceIdentity or an authorization subject ID.
 - `common/grant` is the grant bundle model and compiler (design 6.2): loading,
-  validation, templates, lints, the compiled bundle, signing and publishing.
+  validation, templates, lints, the compiled bundle and assignments,
+  signing (one key or a `KeyRing` of several) and publishing. Who holds
+  what is `ResolveAssignments`, the one mapping from Services and
+  Assignments that both the published assignments document and the
+  reconciler's relationships come from.
   Its source tree holds three kinds: `Grant`, `Assignment` (a workload's own
   grants, optionally bounded, or its `suspended: true`) and `Service` (a
   team's workloads and the grants they share, each bounded like an
@@ -252,8 +260,11 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   ([docs/grants-repository.md](docs/grants-repository.md)). Never commit a
   grant tree or a caller of that workflow here.
 - The broker's authorization store is one of two backends, chosen by
-  `--authz-backend`: `static` (`broker/internal/authz/static`, the
-  assignments file `--assignments`) or `spicedb`
+  `--authz-backend`: `static` (`broker/internal/authz/static`, with
+  `--assignments-source file`, the default, the file `--assignments` read
+  once, or with `published` the assignments of the version the bundle
+  source serves, swapped with its bundle; its Watch reports every swap as
+  a change of every subject) or `spicedb`
   (`broker/internal/authz/spicedb`, the adapter over the reference model of
   design 6.4: the preshared key is read from `--spicedb-token-file`, never a
   flag value; every query carries the caveat context `now` and `cluster`;
@@ -282,10 +293,16 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   is configured. In production it is the compiled bundle `grantc` publishes
   (`--bundle-source local:<dir>` or `s3://bucket/prefix`,
   `broker/internal/bundle`): polled, its signature verified over the
-  published bytes with a public key PEM (`--bundle-verify-key`) or a KMS
-  key (`--bundle-kms-key`), swapped atomically when the version changes,
-  and kept at the last good version on any failure; `/readyz` reports not
-  ready until a bundle has verified. For development it is the
+  published bytes with public keys (`--bundle-verify-key`, repeatable, each
+  file one or more PEM keys, any of which verifies: rotation is adding the
+  new key's PEM beside the old one) or a KMS key's public key
+  (`--bundle-kms-key`, fetched once with `kms:GetPublicKey`), swapped
+  atomically when the version changes, and
+  kept at the last good version on any failure; `/readyz` reports not
+  ready until a bundle has verified. With `--assignments-source published`
+  every version's assignments are fetched and verified too, and the
+  version goes in service only with both: the pair swaps together, and is
+  kept together on any failure of either. For development it is the
   resolved-grants fixture (`--grants-fixture`,
   `broker/internal/grants/fixture.go`), which the chart's default
   `broker.grants` renders; `broker.bundle` switches an install to the
@@ -369,11 +386,24 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   `test/agent-cni.yaml` renders cni mode with non-default directories and
   `agent_test.go` checks the installer, the hook, the mounts and the Role.
 - `broker.authz.backend` picks the authorization store: `static` (the
-  default) renders the assignments ConfigMap and its mount; `spicedb` takes
+  default) renders, with `broker.assignments.source` `file` (the default),
+  the assignments ConfigMap and its mount, and with `published` neither
+  (the broker reads them from `broker.bundle.source`, which it needs;
+  `test/assignments-published.yaml` renders it, since the overrides render
+  SpiceDB); `spicedb` takes
   `broker.authz.spicedb` (endpoint, `tokenSecret` naming a Secret the
   operator keeps, whose key is mounted as a file and never put in the
   environment, an optional `ca` the chart puts in a ConfigMap, `insecure`
   for kind only, `timeout`).
+- Brokers verify the publication with the signing key's PEM and need no
+  KMS access: a KMS signature's `keyId` is its public key's identity, the
+  same a local verifier of the exported PEM computes (`aws kms
+  get-public-key`, or the Terraform output, gives it), and nothing calls
+  `kms:Verify`. Never commit a real key's ARN or PEM to this repository.
+- `broker.bundle.verifyKey` is one PEM key, a string of several or a list
+  of them, all in the one Secret file the broker reads, any of which
+  verifies: a signing key rotates by trusting the new key beside the old,
+  signing with the new, then dropping the old.
 - `test/overrides.yaml` must exercise every non-default knob: a new value
   goes there too. A value every install must give (`broker.cluster`,
   `webhook.defaultRegion`) is `required` in the templates and listed in

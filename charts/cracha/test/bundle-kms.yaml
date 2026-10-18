@@ -1,4 +1,5 @@
-# An S3 bundle source verified through KMS, on top of the required values.
+# An S3 bundle source verified with a KMS key's public key, on top of the
+# required values.
 broker:
   bundle:
     source: s3://grant-bundles/cracha/prod

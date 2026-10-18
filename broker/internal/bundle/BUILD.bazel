@@ -19,6 +19,7 @@ go_library(
 go_test(
     name = "bundle_test",
     srcs = [
+        "assignments_test.go",
         "bundle_test.go",
         "fetch_test.go",
     ],

@@ -1,6 +1,8 @@
 {{- $backend := include "cracha.authzBackend" . -}}
-{{- if and (eq $backend "static") (not .Values.broker.assignments.existingConfigMap) }}
-# The static authorization backend's assignments (broker.assignments).
+{{- $assignments := include "cracha.assignmentsSource" . -}}
+{{- if and (eq $assignments "file") (not .Values.broker.assignments.existingConfigMap) }}
+# The static authorization backend's assignments (broker.assignments), from
+# the document; with source published they come from the publication.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -60,5 +62,5 @@ metadata:
 type: Opaque
 stringData:
   public.pem: |
-    {{- .Values.broker.bundle.verifyKey | nindent 4 }}
+    {{- include "cracha.bundleVerifyKey" . | nindent 4 }}
 {{- end }}

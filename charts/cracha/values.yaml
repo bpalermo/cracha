@@ -106,7 +106,8 @@ broker:
 
   # The authorization backend (design 6.3): which workloads hold which
   # grants, and their service and team tags.
-  #   static   the assignments file in `assignments` below, held in memory.
+  #   static   the assignments of `assignments` below, held in memory: a
+  #            document of this install's, or the published ones.
   #   spicedb  the reference backend (design 6.4; broker/internal/authz/
   #            spicedb), reached over gRPC with the knobs under `spicedb`:
   #     endpoint     host:port of SpiceDB.
@@ -131,9 +132,21 @@ broker:
 
   # The static backend's assignments (broker/internal/authz/static), used
   # with `authz.backend` static: which workloads belong to which service,
-  # and the grants of each service. Either the document, which the chart
-  # puts in a ConfigMap, or the name of a ConfigMap you keep yourself; `key`
-  # is the file in it. The subjects are the identity encoding of design 4.3:
+  # and the grants of each service and workload. `source` says where they
+  # come from:
+  #   file       (the default) the document below, which the chart puts in a
+  #              ConfigMap, or the name of a ConfigMap you keep yourself;
+  #              `key` is the file in it. Read once: a new document restarts
+  #              the broker. For development and single-cluster installs.
+  #   published  the assignments `grantc compile` writes beside the bundle
+  #              from the Service and Assignment documents of the same
+  #              source tree, signed and published with it: every cluster
+  #              whose broker reads the same `bundle.source` holds the same
+  #              assignments, a new version takes effect at the next poll
+  #              without a restart, and a version is put in service only
+  #              when both its bundle and its assignments verify. Needs
+  #              `bundle.source`; the document and the ConfigMap are unused.
+  # The subjects are the identity encoding of design 4.3:
   # <trust domain label>/<namespace>/<service account>.
   #   document:
   #     services:
@@ -144,6 +157,7 @@ broker:
   #         grants:
   #           - name: payments-ledger-rw
   assignments:
+    source: file
     existingConfigMap: ""
     key: assignments.yaml
     document:
@@ -156,15 +170,24 @@ broker:
   # With `source` empty the broker reads the fixture in `grants` instead.
   #   source        local:<dir>, a directory in the pod with the layout
   #                 `grantc publish` writes (latest, bundles/<version>/
-  #                 bundle.json and .sig), mounted there from `volume`; or
-  #                 s3://bucket[/prefix], read with the broker's own AWS
-  #                 credentials (s3:GetObject on the prefix).
+  #                 bundle.json and .sig, and with `assignments.source`
+  #                 published assignments.json and .sig), mounted there from
+  #                 `volume`; or s3://bucket[/prefix], read with the
+  #                 broker's own AWS credentials (s3:GetObject on the
+  #                 prefix).
   #   verifyKey     the PEM public key of the signing key (the one
   #                 `grantc verify -pub` takes), which the chart keeps in a
-  #                 Secret; or
-  #   existingSecret  a Secret you keep, with the PEM under `public.pem`; or
-  #   kmsKey        the ARN of the KMS signing key, verified through
-  #                 kms:Verify with the broker's credentials.
+  #                 Secret; or several, as one string of PEM blocks or a
+  #                 list of them, any of which verifies (the one a signature
+  #                 names), to rotate the signing key: trust the new key
+  #                 beside the old, sign with the new, then drop the old; or
+  #   existingSecret  a Secret you keep, with the PEM, of one or more keys,
+  #                 under `public.pem`; or
+  #   kmsKey        the ARN or alias of the KMS signing key, whose public
+  #                 key the broker fetches once (kms:GetPublicKey, the only
+  #                 KMS permission it needs) and verifies with locally.
+  #                 Prefer verifyKey with the key's exported PEM
+  #                 (`aws kms get-public-key`): no AWS call at all.
   #                 Exactly one of the three.
   #   pollInterval  how often the broker looks for a new version.
   #   volume        for a local source, the Kubernetes volume source mounted
@@ -176,6 +199,8 @@ broker:
   #                       - {key: latest, path: latest}
   #                       - {key: bundle.json, path: bundles/<version>/bundle.json}
   #                       - {key: bundle.json.sig, path: bundles/<version>/bundle.json.sig}
+  #                       - {key: assignments.json, path: bundles/<version>/assignments.json}
+  #                       - {key: assignments.json.sig, path: bundles/<version>/assignments.json.sig}
   bundle:
     source: ""
     verifyKey: ""

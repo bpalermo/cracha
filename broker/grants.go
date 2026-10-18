@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
@@ -26,10 +28,13 @@ type grantSource struct {
 
 // newGrantSource opens the grant source the configuration names: the
 // signed, polled bundle (production) or the resolved-grants fixture
-// (development). The bundle's first load is attempted here and its result
-// logged; a failure is not fatal, since the broker stays not ready until a
-// bundle verifies, and polling continues in the background until ctx ends.
-func newGrantSource(ctx context.Context, cfg config, awsCfg aws.Config, log *slog.Logger) (grantSource, error) {
+// (development). With assignments, the static store reading the
+// published assignments, every version's assignments are verified and
+// swapped with its bundle, and readiness waits for both. The first load is
+// attempted here and its result logged; a failure is not fatal, since the
+// broker stays not ready until a version verifies, and polling continues
+// in the background until ctx ends.
+func newGrantSource(ctx context.Context, cfg config, awsCfg aws.Config, assignments bundle.AssignmentsSink, log *slog.Logger) (grantSource, error) {
 	if cfg.bundleSource == "" {
 		src, err := grants.LoadFixture(cfg.grantsFixture)
 		if err != nil {
@@ -46,33 +51,46 @@ func newGrantSource(ctx context.Context, cfg config, awsCfg aws.Config, log *slo
 	if cfg.bundle.IsS3() {
 		fetcher = bundle.NewS3(s3.NewFromConfig(awsCfg), cfg.bundle.Bucket, cfg.bundle.Prefix)
 	}
-	src := bundle.New(fetcher, verifier, bundle.Options{PollInterval: cfg.pollInterval, Log: log})
+	src := bundle.New(fetcher, verifier, bundle.Options{PollInterval: cfg.pollInterval, Log: log, Assignments: assignments})
 	if err := src.Reload(ctx); err != nil {
-		log.Warn("no grant bundle in service yet; not ready until one verifies", "source", cfg.bundleSource, "error", err)
+		log.Warn("no grant bundle in service yet; not ready until one verifies", "source", cfg.bundleSource,
+			"with_assignments", assignments != nil, "error", err)
 	} else {
-		log.Info("grant bundle in service", "source", cfg.bundleSource, "bundle_version", src.Version(), "poll_interval", cfg.pollInterval)
+		log.Info("grant bundle in service", "source", cfg.bundleSource, "bundle_version", src.Version(),
+			"with_assignments", assignments != nil, "poll_interval", cfg.pollInterval)
 	}
 	go src.Run(ctx)
 	return grantSource{Source: src, ready: src}, nil
 }
 
 // newVerifier makes the verifier the configuration names: the PEM public
-// key, or the KMS key through kms:Verify.
+// keys, any of which verifies (the one the signature names), or the KMS
+// key's public key, fetched once with kms:GetPublicKey and used the same
+// way: no kms:Verify.
 func newVerifier(cfg config, awsCfg aws.Config) (grant.Verifier, error) {
 	if cfg.bundleKMSKey != "" {
 		return grant.NewKMSVerifier(kms.NewFromConfig(awsCfg), cfg.bundleKMSKey), nil
 	}
-	pemData, err := os.ReadFile(cfg.bundleVerifyKey)
-	if err != nil {
-		return nil, fmt.Errorf("bundle verify key: %w", err)
+	return loadKeyRing(cfg.bundleVerifyKey.paths)
+}
+
+// loadKeyRing reads every public key of every file into one key ring.
+func loadKeyRing(paths []string) (*grant.KeyRing, error) {
+	var pubs []*ecdsa.PublicKey
+	for _, path := range paths {
+		pemData, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("bundle verify key: %w", err)
+		}
+		keys, err := grant.ParseECPublicKeys(pemData)
+		if err != nil {
+			return nil, fmt.Errorf("bundle verify key %s: %w", path, err)
+		}
+		pubs = append(pubs, keys...)
 	}
-	pub, err := grant.ParseECPublicKey(pemData)
+	ring, err := grant.NewKeyRing(pubs...)
 	if err != nil {
-		return nil, fmt.Errorf("bundle verify key %s: %w", cfg.bundleVerifyKey, err)
+		return nil, fmt.Errorf("bundle verify keys %s: %w", strings.Join(paths, ", "), err)
 	}
-	verifier, err := grant.NewLocalVerifier(pub)
-	if err != nil {
-		return nil, fmt.Errorf("bundle verify key %s: %w", cfg.bundleVerifyKey, err)
-	}
-	return verifier, nil
+	return ring, nil
 }

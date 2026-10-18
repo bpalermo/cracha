@@ -1,0 +1,65 @@
+{
+  "generatedAt": "2026-10-17T12:34:56Z",
+  "services": [
+    {
+      "grants": [
+        {
+          "name": "payments-ledger-rw"
+        },
+        {
+          "expiresAt": "2030-01-01T00:00:00Z",
+          "name": "payments-outbox-r"
+        }
+      ],
+      "members": [
+        "prod/payments/api",
+        "prod/payments/ledger"
+      ],
+      "name": "payments-api",
+      "team": "payments"
+    }
+  ],
+  "version": "abc123",
+  "workloads": [
+    {
+      "grants": [
+        {
+          "name": "billing-reports"
+        }
+      ],
+      "subject": "prod/billing/reports",
+      "suspended": false
+    },
+    {
+      "grants": [],
+      "subject": "prod/payments/batch",
+      "suspended": true
+    },
+    {
+      "grants": [
+        {
+          "name": "payments-ledger-rw"
+        },
+        {
+          "name": "payments-outbox-r"
+        }
+      ],
+      "subject": "prod/payments/ledger",
+      "suspended": false
+    },
+    {
+      "grants": [
+        {
+          "expiresAt": "2020-01-01T00:00:00Z",
+          "name": "billing-reports"
+        },
+        {
+          "expiresAt": "2020-01-01T00:00:00Z",
+          "name": "payments-ledger-rw"
+        }
+      ],
+      "subject": "prod/payments/legacy",
+      "suspended": false
+    }
+  ]
+}
