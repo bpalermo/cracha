@@ -1,0 +1,169 @@
+{
+  "kind": "Pod",
+  "apiVersion": "v1",
+  "metadata": {
+    "generateName": "web-",
+    "namespace": "apps",
+    "labels": {
+      "app": "web",
+      "cracha.dev/credentials": "true"
+    },
+    "annotations": {
+      "team": "payments"
+    }
+  },
+  "spec": {
+    "volumes": [
+      {
+        "name": "data",
+        "emptyDir": {}
+      },
+      {
+        "name": "cracha-enrol",
+        "projected": {
+          "sources": [
+            {
+              "serviceAccountToken": {
+                "audience": "cracha-agent",
+                "expirationSeconds": 600,
+                "path": "token"
+              }
+            }
+          ],
+          "defaultMode": 292
+        }
+      }
+    ],
+    "initContainers": [
+      {
+        "name": "cracha-enrol",
+        "image": "registry.example.com/cracha/agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "args": [
+          "enrol"
+        ],
+        "env": [
+          {
+            "name": "NODE_IP",
+            "valueFrom": {
+              "fieldRef": {
+                "fieldPath": "status.hostIP"
+              }
+            }
+          },
+          {
+            "name": "CRACHA_ENROL_PORT",
+            "value": "8781"
+          },
+          {
+            "name": "CRACHA_ENROL_TIMEOUT",
+            "value": "30s"
+          },
+          {
+            "name": "CRACHA_ENROL_TOKEN_FILE",
+            "value": "/var/run/secrets/cracha.dev/enrol/token"
+          }
+        ],
+        "resources": {
+          "limits": {
+            "cpu": "10m",
+            "memory": "16Mi"
+          },
+          "requests": {
+            "cpu": "10m",
+            "memory": "16Mi"
+          }
+        },
+        "volumeMounts": [
+          {
+            "name": "cracha-enrol",
+            "readOnly": true,
+            "mountPath": "/var/run/secrets/cracha.dev/enrol"
+          }
+        ],
+        "terminationMessagePolicy": "FallbackToLogsOnError",
+        "securityContext": {
+          "capabilities": {
+            "drop": [
+              "ALL"
+            ]
+          },
+          "runAsUser": 65532,
+          "runAsGroup": 65532,
+          "runAsNonRoot": true,
+          "readOnlyRootFilesystem": true,
+          "allowPrivilegeEscalation": false,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        }
+      },
+      {
+        "name": "migrate",
+        "image": "example/migrate",
+        "env": [
+          {
+            "name": "DATABASE_URL",
+            "value": "postgres://ledger"
+          },
+          {
+            "name": "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "value": "http://127.0.0.1:8780/v1/credentials"
+          },
+          {
+            "name": "AWS_REGION",
+            "value": "eu-west-1"
+          }
+        ],
+        "resources": {}
+      }
+    ],
+    "containers": [
+      {
+        "name": "app",
+        "image": "example/app",
+        "env": [
+          {
+            "name": "FOO",
+            "value": "bar"
+          },
+          {
+            "name": "AWS_REGION",
+            "value": "us-east-1"
+          },
+          {
+            "name": "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "value": "http://127.0.0.1:8780/v1/credentials"
+          }
+        ],
+        "resources": {},
+        "volumeMounts": [
+          {
+            "name": "data",
+            "mountPath": "/data"
+          }
+        ]
+      },
+      {
+        "name": "sidecar",
+        "image": "example/sidecar",
+        "env": [
+          {
+            "name": "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "value": "http://127.0.0.1:8780/v1/credentials"
+          },
+          {
+            "name": "AWS_REGION",
+            "value": "eu-west-1"
+          }
+        ],
+        "resources": {}
+      }
+    ],
+    "serviceAccountName": "enabled",
+    "securityContext": {
+      "runAsUser": 1000,
+      "fsGroup": 1000
+    }
+  },
+  "status": {}
+}

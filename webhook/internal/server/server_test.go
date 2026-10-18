@@ -10,7 +10,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
@@ -18,9 +17,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,9 +40,9 @@ func (a *echoAdmitter) Admit(_ context.Context, req *admissionv1.AdmissionReques
 	return &admissionv1.AdmissionResponse{Allowed: true, Warnings: []string{"seen " + req.Name}}
 }
 
-// selfSigned writes a fresh self-signed certificate for 127.0.0.1 with the
-// given serial to dir, and returns its paths and the certificate.
-func selfSigned(t *testing.T, dir string, serial int64) (certFile, keyFile string, cert *x509.Certificate) {
+// selfSigned returns a fresh self-signed certificate for 127.0.0.1 with the
+// given serial, as a TLS certificate and parsed.
+func selfSigned(t *testing.T, serial int64) (tls.Certificate, *x509.Certificate) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -63,29 +61,18 @@ func selfSigned(t *testing.T, dir string, serial int64) (certFile, keyFile strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	cert, err = x509.ParseCertificate(der)
+	cert, err := x509.ParseCertificate(der)
 	if err != nil {
 		t.Fatal(err)
 	}
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	certFile = filepath.Join(dir, "tls.crt")
-	keyFile = filepath.Join(dir, "tls.key")
-	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return certFile, keyFile, cert
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: cert}, cert
 }
 
 func newServer(t *testing.T, cfg Config, admitter Admitter) *Server {
 	t.Helper()
-	if cfg.CertFile == "" {
-		cfg.CertFile, cfg.KeyFile, _ = selfSigned(t, t.TempDir(), 1)
+	if cfg.TLS == nil {
+		cert, _ := selfSigned(t, 1)
+		cfg.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
 	}
 	if cfg.Listen == "" {
 		cfg.Listen = "127.0.0.1:0"
@@ -226,18 +213,16 @@ func TestHealthAndReadiness(t *testing.T) {
 }
 
 func TestNewRejectsBadConfig(t *testing.T) {
-	dir := t.TempDir()
-	certFile, keyFile, _ := selfSigned(t, dir, 1)
+	cert, _ := selfSigned(t, 1)
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
 	for _, tc := range []struct {
 		name     string
 		cfg      Config
 		admitter Admitter
 	}{
-		{"no admitter", Config{Listen: ":0", CertFile: certFile, KeyFile: keyFile}, nil},
-		{"no listen", Config{CertFile: certFile, KeyFile: keyFile}, &echoAdmitter{}},
-		{"no key", Config{Listen: ":0", CertFile: certFile}, &echoAdmitter{}},
-		{"missing files", Config{Listen: ":0", CertFile: filepath.Join(dir, "nope.crt"), KeyFile: keyFile}, &echoAdmitter{}},
-		{"not a certificate", Config{Listen: ":0", CertFile: keyFile, KeyFile: keyFile}, &echoAdmitter{}},
+		{"no admitter", Config{Listen: ":0", TLS: tlsConfig}, nil},
+		{"no listen", Config{TLS: tlsConfig}, &echoAdmitter{}},
+		{"no TLS", Config{Listen: ":0"}, &echoAdmitter{}},
 	} {
 		if _, err := New(tc.cfg, tc.admitter); err == nil {
 			t.Errorf("%s: New succeeded", tc.name)
@@ -245,12 +230,37 @@ func TestNewRejectsBadConfig(t *testing.T) {
 	}
 }
 
-// TestServeTLS serves for real: TLS is on, the certificate is reloaded when
-// the files change, and cancelling the context shuts the server down.
+// TestMinTLSVersion: a configuration that allows older TLS is raised to
+// 1.2, and the caller's own is left alone.
+func TestMinTLSVersion(t *testing.T) {
+	cert, _ := selfSigned(t, 1)
+	given := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS10}
+	s := newServer(t, Config{TLS: given}, &echoAdmitter{})
+	if s.tls.MinVersion != tls.VersionTLS12 {
+		t.Errorf("MinVersion %x, want TLS 1.2", s.tls.MinVersion)
+	}
+	if given.MinVersion != tls.VersionTLS10 {
+		t.Error("the caller's configuration was modified")
+	}
+	given.MinVersion = tls.VersionTLS13
+	if s = newServer(t, Config{TLS: given}, &echoAdmitter{}); s.tls.MinVersion != tls.VersionTLS13 {
+		t.Errorf("MinVersion %x, want the caller's TLS 1.3", s.tls.MinVersion)
+	}
+}
+
+// TestServeTLS serves for real: TLS is on, the certificate the
+// configuration's GetCertificate returns is the one served (which is how
+// the SVID source rotates it), and cancelling the context shuts the server
+// down.
 func TestServeTLS(t *testing.T) {
-	dir := t.TempDir()
-	certFile, keyFile, first := selfSigned(t, dir, 1)
-	s := newServer(t, Config{CertFile: certFile, KeyFile: keyFile, ShutdownTimeout: 5 * time.Second}, &echoAdmitter{})
+	firstCert, first := selfSigned(t, 1)
+	secondCert, second := selfSigned(t, 2)
+	var current atomic.Pointer[tls.Certificate]
+	current.Store(&firstCert)
+	s := newServer(t, Config{
+		TLS:             &tls.Config{GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return current.Load(), nil }},
+		ShutdownTimeout: 5 * time.Second,
+	}, &echoAdmitter{})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -287,18 +297,11 @@ func TestServeTLS(t *testing.T) {
 		}
 	}
 
-	// Renew: the new certificate is served to the next handshake. The mtime
-	// is pushed forward so a same-second rewrite is still seen as a change.
-	_, _, second := selfSigned(t, dir, 2)
-	future := time.Now().Add(time.Hour)
-	for _, f := range []string{certFile, keyFile} {
-		if err := os.Chtimes(f, future, future); err != nil {
-			t.Fatal(err)
-		}
-	}
+	// Rotate: the next handshake gets the new certificate.
+	current.Store(&secondCert)
 	resp, err = client(second).Get(url + "/healthz")
 	if err != nil {
-		t.Fatalf("GET after renewal: %v", err)
+		t.Fatalf("GET after rotation: %v", err)
 	}
 	resp.Body.Close()
 	if _, err := client(first).Get(url + "/healthz"); err == nil {

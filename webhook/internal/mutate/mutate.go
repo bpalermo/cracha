@@ -6,10 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
-	"path"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -18,13 +18,15 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// Annotations read and written by the webhook.
+// Labels and annotations read and written by the webhook.
 const (
 	// AnnotationEnabled on a ServiceAccount, with the value "true", opts its
 	// pods in.
 	AnnotationEnabled = "cracha.dev/enabled"
-	// AnnotationInjected marks a pod the webhook has wired up.
-	AnnotationInjected = "cracha.dev/injected"
+	// LabelCredentials on a pod, with the value "true", is the enrolment
+	// mark the agent checks before it binds a listener (design 7.2), and the
+	// webhook's idempotency key: a pod that carries it is left unchanged.
+	LabelCredentials = "cracha.dev/credentials"
 	// AnnotationStrippedEnv records, as a JSON list of StrippedEnv, the
 	// variables the strip policy removed from a pod.
 	AnnotationStrippedEnv = "cracha.dev/stripped-env"
@@ -33,23 +35,55 @@ const (
 	AnnotationRegion = "cracha.dev/region"
 )
 
-// The volume and its mount (design 7.1 and 7.2).
+// The loopback endpoint (design 7.1): the agent's listener inside the pod's
+// network namespace, serving the broker's credentials path (design 6.5).
 const (
-	VolumeName = "cracha"
-	Driver     = "csi.cracha.dev"
-	MountPath  = "/var/run/cracha"
-	TokenPath  = MountPath + "/token"
+	LoopbackHost    = "127.0.0.1"
+	CredentialsPath = "/v1/credentials"
 )
 
-// The broker's credentials endpoint (design 6.5), appended to a broker URL
-// that does not already end in it.
-const CredentialsPath = "/v1/credentials"
-
-// The variables the webhook sets.
+// The variables the webhook sets in every container.
 const (
 	EnvCredentialsURI = "AWS_CONTAINER_CREDENTIALS_FULL_URI"
-	EnvTokenFile      = "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"
 	EnvRegion         = "AWS_REGION"
+)
+
+// Enrolment in the init mode (design 7.2): the init container, its token
+// volume and the variables it reads.
+const (
+	// EnrolContainerName is the init container the webhook injects first in
+	// the list; a pod that carries one of this name without the label is
+	// refused.
+	EnrolContainerName = "cracha-enrol"
+	// EnrolVolumeName is the projected token volume, mounted into that
+	// container only.
+	EnrolVolumeName = "cracha-enrol"
+	// EnrolTokenAudience is the audience of the projected token, which the
+	// agent's TokenReview checks.
+	EnrolTokenAudience = "cracha-agent"
+	// EnrolTokenExpirationSeconds is the shortest lifetime the API allows
+	// for a projected token.
+	EnrolTokenExpirationSeconds = 600
+	// EnrolTokenDir is where the volume is mounted in the init container and
+	// EnrolTokenPath the token in it: the path the agent's `enrol` reads,
+	// also handed to it as CRACHA_ENROL_TOKEN_FILE.
+	EnrolTokenDir  = "/var/run/secrets/cracha.dev/enrol"
+	EnrolTokenFile = "token"
+	EnrolTokenPath = EnrolTokenDir + "/" + EnrolTokenFile
+	// EnrolArg is the agent image's subcommand the init container runs; the
+	// image's entrypoint is the agent binary.
+	EnrolArg = "enrol"
+
+	// The init container's environment: the node's address from the
+	// downward API, the agent's enrolment port, how long to retry, and the
+	// token's path.
+	EnvNodeIP         = "NODE_IP"
+	EnvEnrolPort      = "CRACHA_ENROL_PORT"
+	EnvEnrolTimeout   = "CRACHA_ENROL_TIMEOUT"
+	EnvEnrolTokenFile = "CRACHA_ENROL_TOKEN_FILE"
+
+	// enrolUID is distroless's nonroot user, which the agent image runs as.
+	enrolUID int64 = 65532
 )
 
 // ConflictPolicy says what happens to a pod that sets a conflicting variable.
@@ -86,46 +120,93 @@ func (p *ConflictPolicy) Set(s string) error {
 	return nil
 }
 
+// EnrolMode is how a pod's listener gets bound (design 7.2), which decides
+// what the webhook injects beyond the variables and the label.
+type EnrolMode int
+
+const (
+	// EnrolInit injects the cracha-enrol init container and its token.
+	EnrolInit EnrolMode = iota
+	// EnrolCNI injects nothing more: the CNI plugin enrols the pod.
+	EnrolCNI
+)
+
+// String implements flag.Value.
+func (m EnrolMode) String() string {
+	switch m {
+	case EnrolInit:
+		return "init"
+	case EnrolCNI:
+		return "cni"
+	}
+	return fmt.Sprintf("EnrolMode(%d)", int(m))
+}
+
+// Set implements flag.Value.
+func (m *EnrolMode) Set(s string) error {
+	switch s {
+	case "init":
+		*m = EnrolInit
+	case "cni":
+		*m = EnrolCNI
+	default:
+		return fmt.Errorf("unknown enrolment mode %q: want init or cni", s)
+	}
+	return nil
+}
+
 // Config is what the mutator needs to know about its deployment.
 type Config struct {
-	// BrokerURL is the value of AWS_CONTAINER_CREDENTIALS_FULL_URI. Build it
-	// with BrokerURL to get the scheme and path checked.
-	BrokerURL string
+	// AgentPort is the port of the agent's loopback listener in every pod
+	// (agent.port), the one AWS_CONTAINER_CREDENTIALS_FULL_URI names.
+	AgentPort int
 	// DefaultRegion is the value of AWS_REGION unless a Regions hook or the
 	// container itself says otherwise.
 	DefaultRegion string
 	// ConflictingEnv is the policy for variables the pod set itself.
 	ConflictingEnv ConflictPolicy
+	// Enrol is the enrolment mode (agent.enrol).
+	Enrol EnrolMode
+	// AgentImage is the agent image the init container runs, by digest
+	// (agent.image); required in the init mode.
+	AgentImage string
+	// EnrolPort is the port of the agent's enrolment endpoint on the node's
+	// address (agent.enrolPort); required in the init mode.
+	EnrolPort int
+	// EnrolTimeout is how long the init container retries enrolment before
+	// it fails (agent.enrolTimeout); required in the init mode.
+	EnrolTimeout time.Duration
 }
 
-// BrokerURL validates a broker URL for AWS_CONTAINER_CREDENTIALS_FULL_URI
-// and appends CredentialsPath unless the path already ends with it. The SDK
-// only accepts https for a non-loopback host, so https is required.
-func BrokerURL(raw string) (string, error) {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "", fmt.Errorf("broker URL: %w", err)
-	}
-	if u.Scheme != "https" {
-		return "", fmt.Errorf("broker URL %q: scheme must be https", raw)
-	}
-	if u.Host == "" {
-		return "", fmt.Errorf("broker URL %q: missing host", raw)
-	}
-	if u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
-		return "", fmt.Errorf("broker URL %q: must carry no user, query or fragment", raw)
-	}
-	p := strings.TrimSuffix(u.Path, "/")
-	if p != "" {
-		p = path.Clean(p)
-	}
-	if !strings.HasSuffix(p, CredentialsPath) {
-		p += CredentialsPath
-	}
-	u.Path = p
-	u.RawPath = ""
-	return u.String(), nil
+// CredentialsURI is the value of AWS_CONTAINER_CREDENTIALS_FULL_URI.
+func (c Config) CredentialsURI() string {
+	return "http://" + LoopbackHost + ":" + strconv.Itoa(c.AgentPort) + CredentialsPath
 }
+
+// validate reports the first thing missing or out of range.
+func (c Config) validate() error {
+	if !validPort(c.AgentPort) {
+		return fmt.Errorf("agent port %d is not a TCP port", c.AgentPort)
+	}
+	if c.DefaultRegion == "" {
+		return errors.New("default region must be set")
+	}
+	if c.Enrol != EnrolInit {
+		return nil
+	}
+	if c.AgentImage == "" {
+		return errors.New("the init enrolment mode needs the agent image")
+	}
+	if !validPort(c.EnrolPort) {
+		return fmt.Errorf("enrolment port %d is not a TCP port", c.EnrolPort)
+	}
+	if c.EnrolTimeout <= 0 {
+		return fmt.Errorf("enrolment timeout %s must be positive", c.EnrolTimeout)
+	}
+	return nil
+}
+
+func validPort(p int) bool { return p > 0 && p <= 65535 }
 
 // ServiceAccounts looks ServiceAccounts up. The returned object is shared
 // with the caller's cache and must not be modified.
@@ -180,16 +261,11 @@ func WithRegions(r Regions) Option {
 	return func(m *Mutator) { m.regions = r }
 }
 
-// New returns a Mutator. The broker URL is validated as BrokerURL does, and
-// the default region must be set: the webhook has no node to take it from.
+// New returns a Mutator. The agent port and the default region must be set,
+// and in the init mode the agent image, the enrolment port and the timeout.
 func New(cfg Config, sas ServiceAccounts, opts ...Option) (*Mutator, error) {
-	u, err := BrokerURL(cfg.BrokerURL)
-	if err != nil {
+	if err := cfg.validate(); err != nil {
 		return nil, err
-	}
-	cfg.BrokerURL = u
-	if cfg.DefaultRegion == "" {
-		return nil, errors.New("default region must be set")
 	}
 	if sas == nil {
 		return nil, errors.New("service account lookup must be set")
@@ -201,8 +277,7 @@ func New(cfg Config, sas ServiceAccounts, opts ...Option) (*Mutator, error) {
 	return m, nil
 }
 
-// Config returns the configuration in effect, with the broker URL as it is
-// injected.
+// Config returns the configuration in effect.
 func (m *Mutator) Config() Config { return m.cfg }
 
 // Operation is one RFC 6902 JSON Patch operation.
@@ -256,6 +331,10 @@ func (m *Mutator) Admit(ctx context.Context, req *admissionv1.AdmissionRequest) 
 		return deny
 	}
 	if sa.Annotations[AnnotationEnabled] != "true" {
+		return allowed(req.UID)
+	}
+	if pod.Labels[LabelCredentials] == "true" {
+		// Already wired: the label is the idempotency key.
 		return allowed(req.UID)
 	}
 	region, deny := m.region(ctx, req.UID, namespace)

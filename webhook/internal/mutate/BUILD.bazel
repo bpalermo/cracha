@@ -13,6 +13,7 @@ go_library(
         "@io_k8s_api//admission/v1:admission",
         "@io_k8s_api//core/v1:core",
         "@io_k8s_apimachinery//pkg/api/errors",
+        "@io_k8s_apimachinery//pkg/api/resource",
         "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
         "@io_k8s_apimachinery//pkg/types",
     ],
@@ -21,6 +22,7 @@ go_library(
 go_test(
     name = "mutate_test",
     srcs = ["mutate_test.go"],
+    data = glob(["testdata/**"]),
     embed = [":mutate"],
     deps = [
         "@com_github_google_go_cmp//cmp",
