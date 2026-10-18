@@ -335,6 +335,17 @@ agent:
   # Keep it under the SDKs' request timeouts.
   fetchDeadline: 3s
 
+  # Prewarm (design 7.2): when a pod's listener is bound (at enrolment, in
+  # either mode, and when the agent re-binds it on start), the agent runs
+  # the pod's first request in the background: it fetches the pod's
+  # JWT-SVID, retrying for up to 30 s while the issuer learns of the new
+  # pod, and calls the broker once, discarding the answer. The broker then
+  # holds the pod's session in its cache (design 6.7) and the app's first
+  # request is a cache hit instead of an STS call; enrolment never waits
+  # for it, and a failure is only logged. The agent keeps no credentials
+  # either way. false leaves the first request to do it all.
+  prewarm: true
+
   # The broker (design 7.3): its URL, empty for the broker Service of this
   # release, https://<name>-broker.<namespace>.svc:<broker.port>; the
   # SPIFFE ID it must present, verified instead of any DNS name or CA: a
@@ -448,6 +459,21 @@ webhook:
   # What to do with AWS credential variables a pod sets itself: "reject" the
   # pod, or "strip" them and record what was removed in an annotation.
   conflictingEnv: reject
+
+  # The SDK's patience with the credential endpoint (design 7.7), injected
+  # into every wired container that does not set its own as
+  # AWS_METADATA_SERVICE_TIMEOUT (whole seconds, per attempt) and
+  # AWS_METADATA_SERVICE_NUM_ATTEMPTS. Of the first-party SDKs only PHP
+  # reads them for the container provider (as a timeout and a retry
+  # count); the others read them for IMDS only, or not at all, and keep
+  # their own defaults, which is what agent.prewarm is for. Five seconds
+  # outlasts agent.fetchDeadline (3s), so a pod the issuer does not know
+  # yet gets the agent's 503 rather than a timeout, and three attempts
+  # outlast the fetch deadline and agent.brokerTimeout (10s) together.
+  # 0 leaves the variable out.
+  sdkTimeouts:
+    timeoutSeconds: 5
+    attempts: 3
 
   # How long a ServiceAccount lookup is remembered; 0 looks up every pod.
   saCacheTTL: 30s

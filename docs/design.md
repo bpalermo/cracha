@@ -399,7 +399,7 @@ Its role:
 - **Context check, not attestation.** In `init` mode it verifies the pod's bound ServiceAccount token with a TokenReview; in `cni` mode the container runtime names the pod. Workload attestation is the issuer's: the fetch names the pod by namespace, name and UID, and the issuer resolves, attests and answers only for pods its own agent sees on that node.
 
 What it is not:
-- Not a credential store. It holds a pod's JWT-SVID in memory for at most the token's lifetime, keeps no AWS credentials beyond the response in flight, and writes nothing to disk. Caching credentials is the broker's job (6.7).
+- Not a credential store. It holds a pod's JWT-SVID in memory for at most the token's lifetime, keeps no AWS credentials beyond the response in flight, and writes nothing to disk. Caching credentials is the broker's job (6.7); the agent's prewarm (7.2) warms the broker's cache and discards the answer it gets.
 - Not unprivileged. Entering a pod's network namespace is a privileged operation: the agent is a node component with host networking and the CRI socket (7.8), and its compromise is the node's, as the CSI plugin's was before it.
 - Not a proxy for anything else. It relays `GET /v1/credentials` and `GET /v1/grants` (6.5) and nothing more; a pod cannot reach the broker at all.
 
@@ -433,24 +433,27 @@ Enrolment binds the listener in a new pod's network namespace before its app con
 - The plugin is on the sandbox path of every pod of the node, enrolled or not, because it cannot tell them apart without the agent: while the agent is down, every new pod on the node waits. `init` mode holds only enrolled pods. That is the trade: `cni` touches no pod spec, `init` touches no node configuration.
 - Retirement. A plugin left chained after its agent is gone for good fails every sandbox of the node, so the agent retires it itself: the agent container's `preStop` hook in `cni` mode runs `cracha-agent cni-retire` (`agent/internal/cni/retire`), which reads the agent's own DaemonSet (RBAC: `get` on that one DaemonSet by name, in both modes, since the hook runs in the pod that is going under the chart as it is after the switch) and runs the installer's uninstall, removing the entry and the binary, when the agent is not coming back in `cni` mode: the DaemonSet is gone or being deleted (the chart uninstalled), its pod template's annotation `cracha.dev/enrol`, which the chart sets to `agent.enrol`, no longer says `cni` (the mode switched), or the pod's identity is no longer accepted for the whole of the hook's budget (the release's ServiceAccount deleted, which an uninstall does moments after the DaemonSet; without it the agent could enrol nothing). A restart, a rollout with the mode unchanged or a drain leaves the plugin in place, as does anything the hook cannot decide on (a Forbidden, an apiserver that does not answer, a template without the annotation): it never retires on doubt, since that would break every new pod of a node whose agent is about to return. The hook runs while the agent still serves the socket, before the container is signalled, and `terminationGracePeriodSeconds` covers its budget. A pod killed without the hook (a node crash) leaves the plugin; `cracha-agent cni-install --uninstall` run once on the node, or the chart installed again in `cni` mode, puts that right.
 
-Both modes fail closed: a pod created while the agent is down waits for it rather than starting without credentials. In both modes the agent also watches the pods of its node (the same watch recovery uses, 7.4) and closes the listener of a pod that is gone, so `init` mode needs no deletion hook; `DEL` only makes it prompt. Enrolment never touches the issuer: the pod's entry reaches the node's issuer agent while the containers start, and the first request fetches the token (7.3).
+Both modes fail closed: a pod created while the agent is down waits for it rather than starting without credentials. In both modes the agent also watches the pods of its node (the same watch recovery uses, 7.4) and closes the listener of a pod that is gone, so `init` mode needs no deletion hook; `DEL` only makes it prompt. Enrolment never waits for the issuer: the pod's entry reaches the node's issuer agent while the containers start.
+
+Prewarm (`agent.prewarm`, on by default). A pod's first credential request is the slow one: the agent's first Broker API fetch of the pod's JWT-SVID and, on a broker whose cache does not hold the workload, an STS `AssumeRole` (1.2 s at the broker on a real cluster, against about 1.5 ms for a cache hit), and the SDKs give the container provider little time (7.7). So whenever the agent binds a listener, at enrolment in either mode and when recovery re-binds one (7.4), it starts in the background exactly what that first request would do: it fetches the pod's JWT-SVID into the in-memory token cache of 7.3, retrying `NotFound` and `Unavailable` for up to 30 s (`--prewarm-deadline`) while the issuer learns of the new pod, and calls the broker's `GET /v1/credentials` once with it. The answer is read and thrown away; what remains is the session in the broker's cache (6.7), so the app's first request is a cache hit. The agent still holds no credentials: the prewarm warms the token cache it already has and the broker's cache, nothing of its own. Enrolment does not wait for it (the init container's acknowledgement and the CNI `ADD` return as soon as the listener is bound), a failure is a log line (`prewarm failed`) and nothing else, and the app's own request then takes the whole path as before. An app request that arrives while the prewarm is fetching the token joins that fetch (the per-pod single flight of 7.3) for at most its own fetch deadline, and one that reaches the broker while the prewarm's call is issuing joins the broker's single flight on the miss (6.7): one STS call either way. Each prewarm is logged like a request, with the broker's status, `Cracha-Cache` and the latency; it stops when the pod's listener closes.
 
 ### 7.3 Credential request
 
 1. A request arrives on a listener; the registry (7.1) names the pod: namespace, name, UID. Only `GET /v1/credentials` and `GET /v1/grants` go further.
-2. The agent needs the pod's JWT-SVID (`aud=cracha-broker`). It fetches it through the issuer adapter (SPIRE: Broker API `FetchJWTSVID` with a Kubernetes object reference of namespace, name and UID). The issuer refuses pods it cannot resolve and attest on this node. The first fetch for a new pod may precede its entry on the node's issuer agent: `NotFound` and `Unavailable` are retried with backoff within the request's budget (`agent.fetchDeadline`, a few seconds, under the SDKs' request timeouts), past which the agent answers 503 with `Cracha-Reason: issuer_not_ready` or `issuer_unavailable` and the SDK retries; a pod the issuer refuses for good (its access policy, or a reference it cannot resolve as asked) is 503 `issuer_refused`, which retrying does not change. The token is kept in memory, keyed by the pod, reused for the pod's later requests until it is within a minute of expiry, then fetched again, and dropped with the pod. It is never written anywhere and is held nowhere but the agent and, per request, the broker.
+2. The agent needs the pod's JWT-SVID (`aud=cracha-broker`). Usually the prewarm (7.2) has it in memory already. Otherwise it fetches it through the issuer adapter (SPIRE: Broker API `FetchJWTSVID` with a Kubernetes object reference of namespace, name and UID). The issuer refuses pods it cannot resolve and attest on this node. The first fetch for a new pod may precede its entry on the node's issuer agent: `NotFound` and `Unavailable` are retried with backoff within the request's budget (`agent.fetchDeadline`, a few seconds, under the SDKs' request timeouts), past which the agent answers 503 with `Cracha-Reason: issuer_not_ready` or `issuer_unavailable` and the SDK retries; a pod the issuer refuses for good (its access policy, or a reference it cannot resolve as asked) is 503 `issuer_refused`, which retrying does not change. One fetch per pod runs at a time, shared by the pod's concurrent requests and by its prewarm; a request waits for a fetch already in flight no longer than `agent.fetchDeadline` before it answers 503 `issuer_not_ready` itself. The token is kept in memory, keyed by the pod, reused for the pod's later requests until it is within a minute of expiry, then fetched again, and dropped with the pod. It is never written anywhere and is held nowhere but the agent and, per request, the broker.
 3. The agent calls `GET <agent.brokerUrl>/v1/credentials` (or `/v1/grants`) over SPIFFE mTLS: its client certificate is its own X.509-SVID from the Workload API, the broker is verified by SPIFFE ID (`agent.brokerSpiffeID`, by default `spiffe://<td>/ns/<namespace>/sa/cracha-broker` of the release's trust domain), so no DNS SAN and no CA bundle exist on either side; `Authorization` carries the pod's JWT-SVID. One connection pool serves every pod.
-4. The broker's answer is relayed unchanged: status, body, `Cracha-*` headers. A broker that is unreachable or does not answer in time is 503 with `Cracha-Reason: broker_unavailable`. The agent never synthesises credentials and never caches a response: every SDK refresh is a broker call, and the broker's cache (6.7) decides whether STS is called.
+4. The broker's answer is relayed unchanged: status, body, `Cracha-*` headers. A broker that is unreachable or does not answer in time is 503 with `Cracha-Reason: broker_unavailable`. The agent never synthesises credentials and never caches a response: every SDK refresh is a broker call, and the broker's cache (6.7) decides whether STS is called. The prewarm's broker call (7.2) is the same call with its answer discarded, so prewarm changes where the first issuance happens, not what the agent keeps.
 5. Each request is logged with the pod, the token's SPIFFE ID, the broker's status, `Cracha-Cache` and the latency. Requests are bounded per pod so one pod cannot starve the others: past the bound a pod's request is 429 with `Cracha-Reason: pod_busy`.
 
 ### 7.4 Recovery
 
-On every start the agent lists the enrolled pods of its node (label `cracha.dev/credentials`, field selector `spec.nodeName`), resolves each running pod's network namespace through the CRI socket exactly as `init` enrolment does, and binds its listener again. A listener that cannot be re-bound (no sandbox, a namespace path that is gone, a refused bind) is logged and retried on the next pass; until then the pod's requests are refused and its SDK keeps its cached session and retries. Pods created while the agent was down are waiting at enrolment (7.2) and enrol as soon as it listens. The restart is hitless for a pod whose SDK retries a refused connection, which every SDK's container-credentials provider does. Nothing is persisted: the registry of 7.1 is rebuilt from the API and the runtime, the agent's restart does not restart pods, and it leaves nothing on disk.
+On every start the agent lists the enrolled pods of its node (label `cracha.dev/credentials`, field selector `spec.nodeName`), resolves each running pod's network namespace through the CRI socket exactly as `init` enrolment does, and binds its listener again, which prewarms it (7.2) like any new bind. A listener that cannot be re-bound (no sandbox, a namespace path that is gone, a refused bind) is logged and retried on the next pass; until then the pod's requests are refused and its SDK keeps its cached session and retries. Pods created while the agent was down are waiting at enrolment (7.2) and enrol as soon as it listens. The restart is hitless for a pod whose SDK retries a refused connection, which every SDK's container-credentials provider does. Nothing is persisted: the registry of 7.1 is rebuilt from the API and the runtime, the agent's restart does not restart pods, and it leaves nothing on disk.
 
 ### 7.5 Webhook (`cracha-webhook`)
 
 A mutating admission webhook on Pod CREATE. For pods whose ServiceAccount is annotated `cracha.dev/enabled: "true"` (looked up through the API, remembered briefly), inject into every container and init container:
 - `AWS_CONTAINER_CREDENTIALS_FULL_URI=http://127.0.0.1:<agent.port>/v1/credentials`
+- `AWS_METADATA_SERVICE_TIMEOUT` and `AWS_METADATA_SERVICE_NUM_ATTEMPTS` (`webhook.sdkTimeouts`, 5 and 3 by default; 0 leaves one out), unless the container sets its own: the per-attempt timeout, in whole seconds, and the attempts of the SDK's fetch from the endpoint, for the SDK that reads them for the container provider (7.7 says which). Five seconds outlasts `agent.fetchDeadline` (3 s), so a pod the issuer does not know yet gets the agent's 503 rather than a timeout; three attempts outlast the agent's longest single answer, the fetch deadline and `agent.brokerTimeout` (10 s) together; and an attempt that timed out is not wasted, since the broker's STS call runs detached from the request and the retry finds its result in the cache (6.7). Whole seconds because botocore parses both variables as integers at start-up for its IMDS provider, and a fraction would fail its credential resolution.
 - `AWS_REGION` from the cluster default, unless the container sets its own. The pod is not scheduled at admission, so the node's topology region is not available; the Namespace annotation `cracha.dev/region` overrides the default for the namespace's pods. The webhook reads it from a watch on the Namespaces (it needs `get`, `list` and `watch` on them, cluster-wide), never from the API on the admission path: a namespace the watch has not seen yet, or an empty annotation, means the default, and an annotation that is not shaped like an AWS region refuses the pod as invalid rather than injecting it.
 
 and onto the pod:
@@ -484,23 +487,25 @@ sequenceDiagram
         N->>N: TokenReview → pod UID, label check, CRI PodSandboxStatus → netns path
         N->>N: bind 127.0.0.1:port inside the pod's netns
         N-->>P: 200
+        Note over N,B: prewarm in the background (7.2): FetchJWTSVID, GET /v1/credentials, answer discarded
         P->>P: connect to 127.0.0.1:port succeeds, init container exits
     else agent.enrol = cni
         K->>N: CNI ADD via cracha-cni over the Unix socket: netns path, pod reference
         N->>N: label check, bind 127.0.0.1:port inside the netns path
         N-->>K: ok (an error fails the sandbox, kubelet retries)
+        Note over N,B: prewarm in the background (7.2)
     end
     K->>P: start app containers (listener present)
 
     Note over P,B: first credential request
     P->>N: GET http://127.0.0.1:port/v1/credentials
     N->>N: listener → pod (ns, name, UID)
-    N->>I: FetchJWTSVID(pod reference, aud=cracha-broker), retried on NotFound
+    N->>I: FetchJWTSVID(pod reference, aud=cracha-broker), retried on NotFound (unless the prewarm has it)
     I-->>N: JWT-SVID (kept in memory)
     N->>B: GET /v1/credentials over SPIFFE mTLS<br/>Authorization: JWT-SVID
     B->>B: client SVID is the agent's, verify signature, aud, exp, sub
     B->>B: authz ListGrants, compose session policy, envelope check
-    alt cache hit for (shape, grant set, bundle, workload)
+    alt cache hit for (shape, grant set, bundle, workload): the prewarm's issuance
         B-->>N: credentials + Cracha-* headers
     else miss or refresh due
         B->>B: sts:AssumeRole with SourceIdentity, tags, session policy
@@ -528,6 +533,22 @@ sequenceDiagram
 
 - An AWS SDK with the container-credentials provider, which accepts a plain-HTTP `AWS_CONTAINER_CREDENTIALS_FULL_URI` on a loopback host. Every first-party SDK and the CLI have it: it is the ECS provider, older than the HTTPS and token-file extensions added for EKS Pod Identity.
 - Nothing to trust, nothing to mount, nothing to read: no CA, no volume, no token file, no sidecar, no exec, no shell, no config file.
+- Patience on the first fetch. The SDKs give the container provider a short timeout, and one cold issuance (the pod's first JWT-SVID fetch and an STS call, 7.3) can outlast it; that is what the prewarm (7.2) is for. The two variables the webhook injects (7.5) tune it only in the SDK that reads them for the container provider. From each SDK's source (default branches, October 2026):
+
+| SDK | Container provider default | Reads `AWS_METADATA_SERVICE_TIMEOUT` / `_NUM_ATTEMPTS` for it |
+|---|---|---|
+| PHP (`EcsCredentialProvider`) | 1 s per attempt, 3 retries (connection errors only) | Yes, the environment only (not the shared config): the timeout as float seconds, the attempts as a retry count, so 3 means 4 attempts |
+| Python (botocore, boto3) and the CLI v2 | 2 s per attempt, 3 attempts, 1 s apart (`ContainerMetadataFetcher`) | No: `ContainerProvider()` takes none of them, they go to IMDS only; both are parsed as integers at start-up |
+| JavaScript v3 (`fromHttp`, then `fromContainerMetadata`) | 1 s per attempt, 4 attempts, then the fallback's 1 | No |
+| JavaScript v2 (`RemoteCredentials`) | 1 s, 4 attempts | No |
+| Go v2 (`endpointcreds`) | No per-attempt timeout (30 s dial), 3 attempts with backoff | No; only the caller's context or `endpointcreds.Options` (an `HTTPClient`, a `Retryer`) |
+| Java v2 (`ContainerCredentialsProvider`) | 1 s connect and read, 6 attempts | No: Java's `aws.ec2MetadataServiceTimeout` is IMDS only |
+| Rust (`EcsCredentialsProvider`) | 2 s connect, 5 s read, 3 attempts | No; the builder's `connect_timeout` and `read_timeout` |
+| .NET (`GenericContainerCredentials`) | The HTTP client's default (100 s), 5 retries | No |
+| Ruby (`ECSCredentials` in the default chain) | 1 s open and read, no retry | No; the client options `instance_profile_credentials_timeout` and `_retries` |
+| C++ (`GeneralHTTPCredentialsProvider`) | 1 s connect and request, 2 attempts | No: read into the IMDS configuration only |
+
+A workload on an SDK that ignores the variables and needs more room sets it in the client: an SDK option, or a shorter dependency on credentials at start. Crachá's own answer is that the first request is a broker cache hit.
 - One credential source per process. A workload that needs more than one shape at once is an open question (10).
 
 ### 7.8 cracha-agent hardening
@@ -543,10 +564,10 @@ sequenceDiagram
 
 | Failure | Behavior |
 |---|---|
-| Broker down | Running pods keep their SDK-cached session until it expires (≤1h); a refresh gets 503 `Cracha-Reason: broker_unavailable` from the agent and the SDK retries. New pods enrol and start, and fail their first credential fetch until the broker returns. |
+| Broker down | Running pods keep their SDK-cached session until it expires (≤1h); a refresh gets 503 `Cracha-Reason: broker_unavailable` from the agent and the SDK retries. New pods enrol and start, their prewarm fails (logged, nothing else), and they fail their first credential fetch until the broker returns. |
 | STS throttle/outage | Broker serves cache, retries with jitter, alerts on cache age. |
 | Authz store down | Fail closed for new keys; bounded-staleness cache hits (<10 min since last check). |
-| Identity issuer agent down | The Broker API is unavailable: the agent answers 503 `issuer_unavailable` once the pod's in-memory token has expired, and pods run on their SDK-cached session until it expires. New pods enrol (enrolment does not touch the issuer) and fail their first fetch until it returns. |
+| Identity issuer agent down | The Broker API is unavailable: the agent answers 503 `issuer_unavailable` once the pod's in-memory token has expired, and pods run on their SDK-cached session until it expires. New pods enrol (enrolment does not wait for the issuer; their prewarm retries for up to 30 s and then gives up with a log line) and fail their first fetch until it returns. |
 | cracha-agent down | New pods wait at enrolment: the init container retries, or the CNI `ADD` fails and kubelet retries (in `cni` mode every new pod of the node, 7.2). Running pods' requests are refused until it returns; the SDKs retry and keep their cached session. On return it re-binds every enrolled pod (7.4). |
 | CRI socket unavailable | Recovery and `init` enrolment cannot resolve a network namespace: new `init`-mode pods wait, listeners not yet re-bound stay down. `cni` mode still enrols new pods, since the plugin hands the agent the namespace path. |
 | Bad/unsigned bundle | Keep last good bundle, alert. Never fail open. |

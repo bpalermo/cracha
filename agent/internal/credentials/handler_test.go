@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -340,5 +341,215 @@ func TestPerPodBound(t *testing.T) {
 	// The slots are free again.
 	if rec := do(h, pod, http.MethodGet, CredentialsPath); rec.Code != http.StatusOK {
 		t.Errorf("after release: %d", rec.Code)
+	}
+}
+
+// logBuffer is a logger whose lines a test reads back.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *logBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *logBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+func (l *logBuffer) logger() *slog.Logger { return slog.New(slog.NewTextHandler(l, nil)) }
+
+func waitDone(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	if done == nil {
+		t.Fatal("no prewarm was started")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the prewarm did not finish")
+	}
+}
+
+// A prewarm takes the first request's path once: one fetch, one broker call
+// for the credentials, with the pod's token. The app's request then reuses
+// the token and still calls the broker: the prewarm's answer was not kept.
+func TestPrewarmWarmsTheTokenAndTheBrokerButKeepsNoCredentials(t *testing.T) {
+	exp := time.Now().Add(time.Hour)
+	requests := issuer.NewFake(issuer.Result{Err: errors.New("the request issuer was used")})
+	prewarm := issuer.NewFake(issuer.Result{Token: token(exp), Expiry: exp})
+	broker := &fakeBroker{status: http.StatusOK, header: http.Header{"Cracha-Cache": {"miss"}}, body: `{"AccessKeyId":"FIRST"}`}
+	var logs logBuffer
+	h := New(requests, broker, Config{PrewarmIssuer: prewarm, Logger: logs.logger()})
+	defer h.Close()
+
+	waitDone(t, h.startPrewarm(pod))
+	if n := len(prewarm.Calls()); n != 1 {
+		t.Fatalf("the prewarm fetched %d times, want once", n)
+	}
+	if broker.count() != 1 || broker.calls[0] != (call{CredentialsPath, token(exp)}) {
+		t.Fatalf("broker calls = %+v, want one for the credentials", broker.calls)
+	}
+	if !strings.Contains(logs.String(), "msg=prewarm") || !strings.Contains(logs.String(), "cache=miss") {
+		t.Errorf("the prewarm was not logged with the broker's cache outcome: %s", logs.String())
+	}
+
+	broker.mu.Lock()
+	broker.header, broker.body = http.Header{"Cracha-Cache": {"hit"}}, `{"AccessKeyId":"SECOND"}`
+	broker.mu.Unlock()
+	rec := do(h, pod, http.MethodGet, CredentialsPath)
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"AccessKeyId":"SECOND"}` || rec.Header().Get("Cracha-Cache") != "hit" {
+		t.Fatalf("the app's request got %d %q %q: not the broker's answer of now", rec.Code, rec.Body.String(), rec.Header().Get("Cracha-Cache"))
+	}
+	if broker.count() != 2 {
+		t.Fatalf("the app's request did not reach the broker (%d calls): the prewarm's answer was cached", broker.count())
+	}
+	if len(requests.Calls()) != 0 || len(prewarm.Calls()) != 1 {
+		t.Errorf("the app's request fetched again: request issuer %d, prewarm issuer %d", len(requests.Calls()), len(prewarm.Calls()))
+	}
+}
+
+// An app request arriving while the prewarm's fetch is in flight joins it.
+func TestARequestDuringAPrewarmJoinsItsFetch(t *testing.T) {
+	exp := time.Now().Add(time.Hour)
+	requests := issuer.NewFake(issuer.Result{Err: errors.New("the request issuer was used")})
+	prewarm := &blockingIssuer{inner: issuer.NewFake(issuer.Result{Token: token(exp), Expiry: exp}), release: make(chan struct{})}
+	broker := &fakeBroker{status: http.StatusOK, body: "{}"}
+	h := New(requests, broker, Config{PrewarmIssuer: prewarm, Logger: slog.New(slog.DiscardHandler)})
+	defer h.Close()
+
+	done := h.startPrewarm(pod)
+	deadline := time.Now().Add(2 * time.Second)
+	for prewarm.waiting.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	got := make(chan int, 1)
+	go func() { got <- do(h, pod, http.MethodGet, CredentialsPath).Code }()
+	time.Sleep(50 * time.Millisecond) // let the request reach the fetch
+	close(prewarm.release)
+	if code := <-got; code != http.StatusOK {
+		t.Fatalf("the joined request ended %d", code)
+	}
+	waitDone(t, done)
+	if n := len(prewarm.inner.Calls()); n != 1 || len(requests.Calls()) != 0 {
+		t.Fatalf("fetches: prewarm %d, request %d; want the request to join the prewarm's one", n, len(requests.Calls()))
+	}
+	if broker.count() != 2 {
+		t.Errorf("broker calls = %d, want the prewarm's and the request's", broker.count())
+	}
+}
+
+// A request does not wait for a prewarm's longer fetch beyond its own
+// deadline: it answers 503 issuer_not_ready, as its own fetch would have.
+func TestARequestWaitsForAPrewarmNoLongerThanItsDeadline(t *testing.T) {
+	exp := time.Now().Add(time.Hour)
+	prewarm := &blockingIssuer{inner: issuer.NewFake(issuer.Result{Token: token(exp), Expiry: exp}), release: make(chan struct{})}
+	h := New(issuer.NewFake(), &fakeBroker{status: http.StatusOK}, Config{
+		PrewarmIssuer: prewarm, FetchDeadline: 50 * time.Millisecond, Logger: slog.New(slog.DiscardHandler),
+	})
+	defer h.Close()
+	done := h.startPrewarm(pod)
+	deadline := time.Now().Add(2 * time.Second)
+	for prewarm.waiting.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	start := time.Now()
+	rec := do(h, pod, http.MethodGet, CredentialsPath)
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get(HeaderReason) != ReasonIssuerNotReady {
+		t.Fatalf("got %d %q, want 503 %s", rec.Code, rec.Header().Get(HeaderReason), ReasonIssuerNotReady)
+	}
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Errorf("the request waited %s", waited)
+	}
+	close(prewarm.release)
+	waitDone(t, done)
+}
+
+// A failed prewarm is a log line and nothing else: nothing is cached, and
+// the app's request takes the whole path itself.
+func TestPrewarmFailureIsSilent(t *testing.T) {
+	exp := time.Now().Add(time.Hour)
+	for name, tc := range map[string]struct {
+		prewarm     *issuer.Fake
+		broker      *fakeBroker
+		brokerCalls int // after the app's request
+		fetches     int // by the request issuer
+	}{
+		"issuer": {
+			prewarm: issuer.NewFake(issuer.Result{Err: issuer.NewError(issuer.NotFoundYet, errors.New("no entry"))}),
+			broker:  &fakeBroker{status: http.StatusOK}, brokerCalls: 1, fetches: 1,
+		},
+		"broker unreachable": {
+			prewarm: issuer.NewFake(issuer.Result{Token: token(exp), Expiry: exp}),
+			broker:  &fakeBroker{err: errors.New("dial tcp: refused")}, brokerCalls: 2, fetches: 0,
+		},
+		"broker refuses": {
+			prewarm: issuer.NewFake(issuer.Result{Token: token(exp), Expiry: exp}),
+			broker:  &fakeBroker{status: http.StatusForbidden, body: `{"reason":"no_grant"}`}, brokerCalls: 2, fetches: 0,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			requests := issuer.NewFake(issuer.Result{Token: token(exp), Expiry: exp})
+			var logs logBuffer
+			h := New(requests, tc.broker, Config{PrewarmIssuer: tc.prewarm, Logger: logs.logger()})
+			defer h.Close()
+			waitDone(t, h.startPrewarm(pod))
+			if !strings.Contains(logs.String(), "prewarm failed") {
+				t.Errorf("the failure was not logged: %s", logs.String())
+			}
+			rec := do(h, pod, http.MethodGet, CredentialsPath)
+			if rec.Code != tc.broker.status && tc.broker.err == nil {
+				t.Errorf("the app's request got %d, want the broker's %d", rec.Code, tc.broker.status)
+			}
+			if tc.broker.count() != tc.brokerCalls || len(requests.Calls()) != tc.fetches {
+				t.Errorf("after the app's request: broker %d calls (want %d), request fetches %d (want %d)",
+					tc.broker.count(), tc.brokerCalls, len(requests.Calls()), tc.fetches)
+			}
+		})
+	}
+}
+
+// Forget stops a prewarm, and a fetch that finishes afterwards leaves no
+// token behind for the pod that is gone.
+func TestForgetStopsAPrewarm(t *testing.T) {
+	exp := time.Now().Add(time.Hour)
+	prewarm := &blockingIssuer{inner: issuer.NewFake(issuer.Result{Token: token(exp), Expiry: exp}), release: make(chan struct{})}
+	requests := issuer.NewFake(issuer.Result{Token: token(exp), Expiry: exp})
+	broker := &fakeBroker{status: http.StatusOK}
+	h := New(requests, broker, Config{PrewarmIssuer: prewarm, Logger: slog.New(slog.DiscardHandler)})
+	defer h.Close()
+	done := h.startPrewarm(pod)
+	deadline := time.Now().Add(2 * time.Second)
+	for prewarm.waiting.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	h.Forget(pod)
+	close(prewarm.release)
+	waitDone(t, done)
+	if broker.count() != 0 {
+		t.Error("a forgotten pod's prewarm called the broker")
+	}
+	do(h, pod, http.MethodGet, CredentialsPath)
+	if len(requests.Calls()) != 1 {
+		t.Error("the forgotten pod's prewarmed token was kept")
+	}
+}
+
+func TestPrewarmOff(t *testing.T) {
+	iss := issuer.NewFake()
+	broker := &fakeBroker{}
+	h := New(iss, broker, Config{})
+	defer h.Close()
+	if done := h.startPrewarm(pod); done != nil {
+		t.Fatal("a prewarm started without a prewarm issuer")
+	}
+	h.Prewarm(pod)
+	if len(iss.Calls()) != 0 || broker.count() != 0 {
+		t.Error("prewarm off reached the issuer or the broker")
 	}
 }

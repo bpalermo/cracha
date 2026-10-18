@@ -120,6 +120,7 @@ spec:
             - --broker-spiffe-id={{ include "cracha.agentBrokerSpiffeID" . }}
             - --broker-timeout={{ .Values.agent.brokerTimeout }}
             - --fetch-deadline={{ .Values.agent.fetchDeadline }}
+            - --prewarm={{ .Values.agent.prewarm }}
             - --healthz=:{{ int .Values.agent.healthzPort }}
             - --log-level={{ include "cracha.logLevel" .Values.agent.logLevel }}
           env:

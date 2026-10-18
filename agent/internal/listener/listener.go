@@ -62,6 +62,7 @@ type Registry struct {
 	binder  Binder
 	log     *slog.Logger
 	onClose func(Pod)
+	onBind  func(Pod)
 
 	mu     sync.Mutex
 	byUID  map[string]*entry
@@ -91,6 +92,14 @@ func WithLogger(log *slog.Logger) Option {
 // what else the agent holds for the pod (its token) goes with the listener.
 func WithCloseHook(fn func(Pod)) Option {
 	return func(r *Registry) { r.onClose = fn }
+}
+
+// WithBindHook calls fn whenever a pod's listener is newly bound (not when
+// Bind finds it bound already), with the pod: the agent prewarms the pod's
+// first request from it. fn is called with the registry locked and must
+// not block.
+func WithBindHook(fn func(Pod)) Option {
+	return func(r *Registry) { r.onBind = fn }
 }
 
 // New returns an empty registry binding with binder.
@@ -144,6 +153,9 @@ func (r *Registry) Bind(pod Pod, netnsPath string) error {
 	r.byUID[pod.UID] = e
 	go r.accept(e)
 	r.log.Info("listener bound", "pod", pod.String(), "netns", netnsPath, "addr", lis.Addr().String())
+	if r.onBind != nil {
+		r.onBind(pod)
+	}
 	return nil
 }
 

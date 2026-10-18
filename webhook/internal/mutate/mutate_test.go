@@ -47,6 +47,9 @@ func config(mode EnrolMode, policy ConflictPolicy) Config {
 		EnrolTimeout:   enrolTimeout,
 		EnrolCPU:       resource.MustParse(DefaultEnrolCPU),
 		EnrolMemory:    resource.MustParse(DefaultEnrolMemory),
+
+		SDKTimeoutSeconds: DefaultSDKTimeoutSeconds,
+		SDKAttempts:       DefaultSDKAttempts,
 	}
 }
 
@@ -104,6 +107,8 @@ func injectedEnv() []corev1.EnvVar {
 	return []corev1.EnvVar{
 		env(EnvCredentialsURI, credentialsURI),
 		env(EnvRegion, region),
+		env(EnvSDKTimeout, "5"),
+		env(EnvSDKAttempts, "3"),
 	}
 }
 
@@ -329,7 +334,23 @@ func TestAdmit(t *testing.T) {
 			name: "the pod's own AWS_REGION wins",
 			pod:  pod("enabled", container("app", env(EnvRegion, "us-east-1"))),
 			want: want{pod: enrolled(EnrolInit, pod("enabled",
-				container("app", env(EnvRegion, "us-east-1"), env(EnvCredentialsURI, credentialsURI))))},
+				container("app", env(EnvRegion, "us-east-1"), env(EnvCredentialsURI, credentialsURI),
+					env(EnvSDKTimeout, "5"), env(EnvSDKAttempts, "3"))))},
+		},
+		{
+			name: "the pod's own SDK timeouts win, literal or from valueFrom",
+			pod:  pod("enabled", container("app", env(EnvSDKTimeout, "20"), secretEnv(EnvSDKAttempts))),
+			want: want{pod: enrolled(EnrolInit, pod("enabled",
+				container("app", env(EnvSDKTimeout, "20"), secretEnv(EnvSDKAttempts),
+					env(EnvCredentialsURI, credentialsURI), env(EnvRegion, region))))},
+		},
+		{
+			name: "SDK timeouts of zero are left out",
+			mode: EnrolCNI,
+			cfg:  func(c *Config) { c.SDKTimeoutSeconds, c.SDKAttempts = 0, 0 },
+			pod:  pod("enabled", plainApp),
+			want: want{pod: enrolled(EnrolCNI, pod("enabled",
+				container("app", env("FOO", "bar"), env(EnvCredentialsURI, credentialsURI), env(EnvRegion, region))))},
 		},
 		{
 			name:    "the region hook overrides the default",
@@ -337,7 +358,11 @@ func TestAdmit(t *testing.T) {
 			regions: regionsFunc(func(context.Context, string) (string, error) { return "sa-east-1", nil }),
 			want: want{pod: func() *corev1.Pod {
 				c := injected(plainApp)
-				c.Env[len(c.Env)-1].Value = "sa-east-1"
+				for i := range c.Env {
+					if c.Env[i].Name == EnvRegion {
+						c.Env[i].Value = "sa-east-1"
+					}
+				}
 				return enrolled(EnrolInit, pod("enabled", c))
 			}()},
 		},
@@ -554,7 +579,9 @@ type admitCase struct {
 	request func(*admissionv1.AdmissionRequest)
 	client  func(*fake.Clientset)
 	regions Regions
-	want    want
+	// cfg can change the configuration.
+	cfg  func(*Config)
+	want want
 }
 
 // mutator builds the Mutator under test, over a fake client the case may
@@ -569,7 +596,11 @@ func (tc admitCase) mutator(t *testing.T) *Mutator {
 	if tc.regions != nil {
 		opts = append(opts, WithRegions(tc.regions))
 	}
-	m, err := New(config(tc.mode, tc.policy), clientLookup{client}, opts...)
+	cfg := config(tc.mode, tc.policy)
+	if tc.cfg != nil {
+		tc.cfg(&cfg)
+	}
+	m, err := New(cfg, clientLookup{client}, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -873,6 +904,8 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		"init negative cpu":      func(c *Config) { c.EnrolCPU = resource.MustParse("-100m") },
 		"init without memory":    func(c *Config) { c.EnrolMemory = resource.Quantity{} },
 		"cni without agent port": func(c *Config) { c.Enrol = EnrolCNI; c.AgentPort = 0 },
+		"negative SDK timeout":   func(c *Config) { c.SDKTimeoutSeconds = -1 },
+		"negative SDK attempts":  func(c *Config) { c.SDKAttempts = -1 },
 	} {
 		cfg := good
 		change(&cfg)

@@ -50,6 +50,33 @@ const (
 const (
 	EnvCredentialsURI = "AWS_CONTAINER_CREDENTIALS_FULL_URI"
 	EnvRegion         = "AWS_REGION"
+	// EnvSDKTimeout and EnvSDKAttempts are the per-attempt timeout (whole
+	// seconds) and the attempts of the SDK's credential fetch from the
+	// container endpoint, for the SDKs that read them for it: of the
+	// first-party SDKs only PHP does (which counts the attempts as
+	// retries); botocore, the CLI, JS, Go, Java, Rust, .NET, Ruby and C++
+	// read them for IMDS only, or not at all (design 7.7 has the table).
+	// botocore parses both as integers at start-up, which is why the
+	// timeout is whole seconds. Like AWS_REGION, a container that sets one
+	// keeps it.
+	EnvSDKTimeout  = "AWS_METADATA_SERVICE_TIMEOUT"
+	EnvSDKAttempts = "AWS_METADATA_SERVICE_NUM_ATTEMPTS"
+)
+
+// The defaults of Config.SDKTimeoutSeconds and Config.SDKAttempts, the
+// chart's webhook.sdkTimeouts. The SDK's own default (PHP: one second) is
+// shorter than one cold issuance can take: the agent may spend up to
+// agent.fetchDeadline (3 s) on the pod's JWT-SVID, and the broker an STS
+// call (1.2 s measured cold on a real cluster). Five seconds per attempt
+// outlasts the fetch deadline, so a pod the issuer does not know yet gets
+// the agent's 503 rather than a timeout, and three (PHP: three retries)
+// outlast the agent's longest single answer, the fetch deadline and
+// agent.brokerTimeout (10 s) together. A timed-out attempt is not wasted:
+// the broker's STS call runs detached from the request (design 6.7), so
+// the retry finds the session in the cache.
+const (
+	DefaultSDKTimeoutSeconds = 5
+	DefaultSDKAttempts       = 3
 )
 
 // Enrolment in the init mode (design 7.2): the init container, its token
@@ -201,6 +228,10 @@ type Config struct {
 	// in the init mode. See DefaultEnrolCPU.
 	EnrolCPU    resource.Quantity
 	EnrolMemory resource.Quantity
+	// SDKTimeoutSeconds and SDKAttempts are the values of EnvSDKTimeout and
+	// EnvSDKAttempts (webhook.sdkTimeouts); zero leaves the variable out.
+	SDKTimeoutSeconds int
+	SDKAttempts       int
 }
 
 // QuantityValue is a flag.Value that parses a resource quantity such as
@@ -237,6 +268,9 @@ func (c Config) validate() error {
 	}
 	if c.DefaultRegion == "" {
 		return errors.New("default region must be set")
+	}
+	if c.SDKTimeoutSeconds < 0 || c.SDKAttempts < 0 {
+		return fmt.Errorf("the SDK timeout (%d s) and attempts (%d) must not be negative", c.SDKTimeoutSeconds, c.SDKAttempts)
 	}
 	if c.Enrol != EnrolInit {
 		return nil

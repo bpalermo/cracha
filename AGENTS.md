@@ -404,6 +404,16 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   of them, all in the one Secret file the broker reads, any of which
   verifies: a signing key rotates by trusting the new key beside the old,
   signing with the new, then dropping the old.
+- `agent.prewarm` (default on) has the agent run a pod's first credential
+  request in the background whenever it binds the pod's listener (design
+  7.2), so the app's first request is a broker cache hit; the agent still
+  keeps no credentials. `webhook.sdkTimeouts` sets the
+  `AWS_METADATA_SERVICE_TIMEOUT` and `_NUM_ATTEMPTS` the webhook injects
+  unless a container sets its own (design 7.5); of the first-party SDKs
+  only PHP reads them for the container provider (the table in design
+  7.7), so prewarm, not the variables, is what keeps the others inside
+  their timeouts. The timeout is whole seconds: botocore parses it as an
+  integer.
 - `test/overrides.yaml` must exercise every non-default knob: a new value
   goes there too. A value every install must give (`broker.cluster`,
   `webhook.defaultRegion`) is `required` in the templates and listed in

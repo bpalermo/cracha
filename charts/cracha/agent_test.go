@@ -120,7 +120,7 @@ func TestAgentArgs(t *testing.T) {
 		a := args("defaults")
 		has(t, a, "--port=9797", "--enrol=init", "--enrol-listen=:9798", "--cri-socket=/run/containerd/containerd.sock",
 			"--broker-spiffe-id=/ns/default/sa/cracha-broker", "--broker-url=https://cracha-broker.default.svc:8443",
-			"--fetch-deadline=3s", "--broker-timeout=10s", "--healthz=:9799", "--log-level=info",
+			"--fetch-deadline=3s", "--prewarm=true", "--broker-timeout=10s", "--healthz=:9799", "--log-level=info",
 			"--issuer-broker-socket=/run/spire/broker/broker.sock", "--workload-api=unix:///spiffe-workload-api/spire-agent.sock")
 		lacks(t, a, "--cni-socket")
 	})
@@ -128,7 +128,7 @@ func TestAgentArgs(t *testing.T) {
 		a := args("overrides")
 		has(t, a, "--port=17171", "--enrol=init", "--enrol-listen=:17172", "--cri-socket=/var/run/crio/crio.sock",
 			"--broker-spiffe-id=spiffe://prod.example.org/ns/cracha/sa/broker", "--broker-url=https://credentials.example.org:9443",
-			"--fetch-deadline=1500ms", "--broker-timeout=5s", "--healthz=:17173", "--log-level=warn",
+			"--fetch-deadline=1500ms", "--prewarm=false", "--broker-timeout=5s", "--healthz=:17173", "--log-level=warn",
 			"--issuer-broker-socket=/run/spire/broker/api.sock", "--workload-api=unix:///spiffe-workload-api/api.sock")
 	})
 	t.Run("cni", func(t *testing.T) {

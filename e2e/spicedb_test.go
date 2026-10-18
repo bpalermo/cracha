@@ -103,6 +103,8 @@ type brokerLine struct {
 	Client  string    `json:"client"`
 	Path    string    `json:"path"`
 	Status  int       `json:"status"`
+	// Duration is how long the broker took over a request.
+	Duration time.Duration `json:"duration"`
 	// What a bundle load reports (broker/internal/bundle).
 	NewVersion string `json:"new_version"`
 	Services   int    `json:"services"`

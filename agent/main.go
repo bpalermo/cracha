@@ -119,6 +119,7 @@ func run(ctx context.Context, cfg config, log *slog.Logger) error {
 	defer c.close()
 	log.Info("starting", "version", version.Version, "node", cfg.node, "port", cfg.port, "enrol", cfg.enrol,
 		"broker_url", c.broker.URL(), "broker_spiffe_id", cfg.brokerSPIFFEID, "fetch_deadline", cfg.fetchDeadline,
+		"prewarm", cfg.prewarm, "prewarm_deadline", cfg.prewarmDeadline,
 		"broker_socket", cfg.brokerSocket, "workload_api", cfg.workloadAPI, "cri_socket", cfg.criSocket)
 
 	g, gctx := errgroup.WithContext(ctx)

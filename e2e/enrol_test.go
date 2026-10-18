@@ -30,6 +30,8 @@ const (
 	msgListenerClosed = "listener closed"
 	msgPodsListed     = "recovery: the node's enrolled pods are listed"
 	msgRequest        = "request"
+	msgPrewarm        = "prewarm"
+	msgPrewarmFailed  = "prewarm failed; the pod's first request will take the whole path"
 	msgEnrolRetrying  = "enrolment attempt failed; retrying"
 
 	// holdLabel is the node label the agent's DaemonSet is pointed at to
@@ -61,6 +63,9 @@ type agentLine struct {
 	Path     string    `json:"path"`
 	Netns    string    `json:"netns"`
 	Error    string    `json:"error"`
+	// What a request and a prewarm report of the broker's answer.
+	Cache   string `json:"cache"`
+	Latency string `json:"latency"`
 }
 
 // podRef is how the agent names a pod in its log (listener.Pod.String).

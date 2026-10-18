@@ -158,6 +158,47 @@ func TestBindIsIdempotentAndRebindsOnANewNamespace(t *testing.T) {
 	}
 }
 
+// The bind hook (the agent's prewarm) runs once per listener bound: not for
+// an idempotent bind, again for a rebind into a new namespace, never for a
+// failed bind.
+func TestBindHookRunsOncePerBind(t *testing.T) {
+	b := &loopback{}
+	var bound []Pod
+	r := New(b, WithBindHook(func(p Pod) { bound = append(bound, p) }))
+	defer r.CloseAll()
+
+	for range 3 {
+		if err := r.Bind(podA, "/run/netns/one"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(bound) != 1 || bound[0] != podA {
+		t.Fatalf("three binds in one namespace ran the hook for %v, want podA once", bound)
+	}
+	if err := r.Bind(podA, "/run/netns/two"); err != nil {
+		t.Fatal(err)
+	}
+	if len(bound) != 2 {
+		t.Fatalf("a rebind ran the hook %d times in all, want 2", len(bound))
+	}
+	r.Close(podA.UID)
+	if err := r.Bind(podA, "/run/netns/two"); err != nil {
+		t.Fatal(err)
+	}
+	if len(bound) != 3 {
+		t.Fatalf("a bind after a close ran the hook %d times in all, want 3", len(bound))
+	}
+
+	failing := New(&loopback{fail: errors.New("EPERM")}, WithBindHook(func(p Pod) { bound = append(bound, p) }))
+	defer failing.CloseAll()
+	if err := failing.Bind(podA, "/run/netns/a"); err == nil {
+		t.Fatal("the failing binder bound")
+	}
+	if len(bound) != 3 {
+		t.Error("a failed bind ran the hook")
+	}
+}
+
 func TestBindRefusesBadInput(t *testing.T) {
 	r := New(&loopback{})
 	defer r.CloseAll()
