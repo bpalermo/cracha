@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/bazelbuild/rules_go/go/runfiles"
@@ -113,6 +115,104 @@ func stringList(v any) []string {
 			return nil
 		}
 		out = append(out, s)
+	}
+	return out
+}
+
+// The broker serves SPIFFE mTLS with its own X.509-SVID (design 6.5): no
+// certificate from the chart, no TLS flag, the probes on the plaintext
+// health port, and the agent's identity given or left to be derived from
+// the namespace the downward API hands the broker.
+func TestBrokerServesSPIFFEMTLS(t *testing.T) {
+	tests := map[string]struct {
+		name       string // the release's resource prefix
+		healthPort int
+		agentID    string // "" when left to the broker to derive
+	}{
+		"defaults":  {"cracha", 8081, ""},
+		"overrides": {"custom", 9081, "spiffe://prod.example.org/ns/cracha-system/sa/custom-agent"},
+	}
+	for rendering, tt := range tests {
+		t.Run(rendering, func(t *testing.T) {
+			docs := rendered(t, rendering)
+			dep := object(t, docs, "Deployment", tt.name+"-broker")
+			container := path(dep, "spec", "template", "spec", "containers", 0)
+			args := stringList(path(container, "args"))
+			if args == nil {
+				t.Fatalf("args = %v", path(container, "args"))
+			}
+			var agentArg string
+			for _, arg := range args {
+				switch {
+				case strings.HasPrefix(arg, "--tls-"), arg == "--insecure-plaintext":
+					t.Errorf("the broker takes %s", arg)
+				case strings.HasPrefix(arg, "--agent-spiffe-id="):
+					agentArg = strings.TrimPrefix(arg, "--agent-spiffe-id=")
+				}
+			}
+			if agentArg != tt.agentID {
+				t.Errorf("--agent-spiffe-id %q, want %q", agentArg, tt.agentID)
+			}
+			if !slices.Contains(args, fmt.Sprintf("--health-listen=:%d", tt.healthPort)) {
+				t.Errorf("args %q lack the health listener on %d", args, tt.healthPort)
+			}
+			if got := path(container, "env", 0, "valueFrom", "fieldRef", "fieldPath"); got != "metadata.namespace" || path(container, "env", 0, "name") != "CRACHA_NAMESPACE" {
+				t.Errorf("the first env is %v, want CRACHA_NAMESPACE from the downward API", path(container, "env", 0))
+			}
+			for _, probe := range []string{"readinessProbe", "livenessProbe"} {
+				if port := path(container, probe, "httpGet", "port"); port != "health" {
+					t.Errorf("%s on port %v, want health", probe, port)
+				}
+				if scheme := path(container, probe, "httpGet", "scheme"); scheme != nil {
+					t.Errorf("%s has scheme %v, want plain HTTP", probe, scheme)
+				}
+			}
+			for _, port := range stringListOf(path(container, "ports"), "name") {
+				if port == "health" {
+					return
+				}
+			}
+			t.Errorf("no health container port in %v", path(container, "ports"))
+		})
+	}
+}
+
+// The broker has no certificate from the chart, in any TLS mode: no mount,
+// no Secret, no cert-manager Certificate; the webhook's are not asserted
+// here.
+func TestBrokerHasNoChartCertificate(t *testing.T) {
+	for rendering, name := range map[string]string{"defaults": "cracha", "overrides": "custom"} {
+		t.Run(rendering, func(t *testing.T) {
+			docs := rendered(t, rendering)
+			dep := object(t, docs, "Deployment", name+"-broker")
+			spec := path(dep, "spec", "template", "spec")
+			for _, volume := range stringListOf(path(spec, "volumes"), "name") {
+				if volume == "tls" {
+					t.Error("the broker mounts a tls volume")
+				}
+			}
+			for _, mount := range stringListOf(path(spec, "containers", 0, "volumeMounts"), "mountPath") {
+				if strings.HasPrefix(mount, "/etc/cracha/tls") {
+					t.Errorf("the broker mounts %s", mount)
+				}
+			}
+			for _, d := range docs {
+				if (d.kind() == "Secret" || d.kind() == "Certificate") && d.name() == name+"-broker-tls" || d.kind() == "Certificate" && d.name() == name+"-broker" {
+					t.Errorf("the chart renders a %s %s for the broker", d.kind(), d.name())
+				}
+			}
+		})
+	}
+}
+
+// stringListOf returns the string field key of every map in the list v.
+func stringListOf(v any, key string) []string {
+	l, _ := v.([]any)
+	var out []string
+	for _, e := range l {
+		if s, ok := path(e, key).(string); ok {
+			out = append(out, s)
+		}
 	}
 	return out
 }

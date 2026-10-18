@@ -2,19 +2,21 @@
 {{- fail (printf "tls.mode must be generated, existing or cert-manager, not %q" .Values.tls.mode) }}
 {{- end }}
 {{- $root := . -}}
-{{- $components := list "broker" "webhook" -}}
+{{- /*
+The webhook is the only component with a certificate from the chart: the
+broker serves SPIFFE mTLS with its own X.509-SVID (design 6.5).
+*/ -}}
+{{- $components := list "webhook" -}}
 {{- if eq .Values.tls.mode "generated" }}
 {{- /*
-A private authority and a certificate per component, FOR DEVELOPMENT AND KIND
-ONLY (see values.yaml: workload images must trust the broker's certificate,
-design 6.5, and nothing trusts this authority but this chart). Whatever is
-already in the cluster is kept: lookup finds the Secrets of an earlier
-install, so an upgrade does not replace certificates that running pods are
-using, until one comes within tls.generated.renewBeforeDays of expiring: then
-the upgrade issues a new one, and the components pick it up on their next
-restart. Deleting a Secret also makes the next upgrade issue a new one. The
-authority itself is never renewed here. The webhook configuration is
-rendered below, from the same authority, so the two cannot disagree.
+A private authority and the webhook's certificate. Whatever is already in the
+cluster is kept: lookup finds the Secrets of an earlier install, so an
+upgrade does not replace a certificate that running pods are using, until it
+comes within tls.generated.renewBeforeDays of expiring: then the upgrade
+issues a new one, and the webhook picks it up on its next restart. Deleting a
+Secret also makes the next upgrade issue a new one. The authority itself is
+never renewed here. The webhook configuration is rendered below, from the
+same authority, so the two cannot disagree.
 */ -}}
 {{- $now := now | unixEpoch -}}
 {{- $validity := mul (int .Values.tls.generated.validityDays) 86400 -}}
@@ -27,8 +29,7 @@ rendered below, from the same authority, so the two cannot disagree.
 {{- else }}
 {{- $ca = genCA (printf "%s certificate authority" (include "cracha.name" .)) 3650 -}}
 {{- end }}
-# The authority, which the end-to-end suite hands to its workloads: tls.crt
-# is the PEM to trust.
+# The authority that signed the webhook's certificate.
 apiVersion: v1
 kind: Secret
 metadata:

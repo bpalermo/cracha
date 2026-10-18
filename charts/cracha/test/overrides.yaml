@@ -6,7 +6,6 @@ imagePullSecrets:
 tls:
   mode: existing
   existingSecrets:
-    broker: broker-certs
     webhook: webhook-certs
   caBundle: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCg==
 broker:
@@ -17,6 +16,8 @@ broker:
     pullPolicy: Always
   replicas: 1
   port: 9443
+  healthPort: 9081
+  agentSpiffeID: spiffe://prod.example.org/ns/cracha-system/sa/custom-agent
   cluster: prod-eu
   trustDomainLabels:
     prod.example.org: prod

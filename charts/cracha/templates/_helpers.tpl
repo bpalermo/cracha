@@ -70,7 +70,11 @@ https://{{ include "cracha.serviceHost" (dict "root" . "component" "broker") }}:
 {{- end -}}
 {{- end -}}
 
-{{/* The Secret holding a component's certificate. Call with (dict "root" . "component" "broker"). */}}
+{{/*
+The Secret holding the webhook's certificate. Call with
+(dict "root" . "component" "webhook"); the webhook is the only component with
+a certificate from the chart, the broker serves its X.509-SVID.
+*/}}
 {{- define "cracha.tlsSecret" -}}
 {{- if eq .root.Values.tls.mode "existing" -}}
 {{ required (printf "tls.existingSecrets.%s is required with tls.mode existing" .component) (index .root.Values.tls.existingSecrets .component) }}
@@ -79,13 +83,13 @@ https://{{ include "cracha.serviceHost" (dict "root" . "component" "broker") }}:
 {{- end -}}
 {{- end -}}
 
-{{/* The TLS arguments of a component's container; the Secret is mounted at /etc/cracha/tls. */}}
+{{/* The TLS arguments of the webhook's container; the Secret is mounted at /etc/cracha/tls. */}}
 {{- define "cracha.tlsArgs" -}}
 - --tls-cert=/etc/cracha/tls/tls.crt
 - --tls-key=/etc/cracha/tls/tls.key
 {{- end -}}
 
-{{/* The volume mount and volume of a component's certificate. Same arguments as cracha.tlsSecret. */}}
+{{/* The volume mount and volume of the webhook's certificate. Same arguments as cracha.tlsSecret. */}}
 {{- define "cracha.tlsVolumeMount" -}}
 - name: tls
   mountPath: /etc/cracha/tls
