@@ -294,8 +294,14 @@ spec:
       hostPID: true
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      # Non-root, as the SPIRE chart runs it: the sockets it creates are
+      # mode 0770 and owned by 1000:1000, which is what cracha-agent has to
+      # reach through agent.brokerAPI.group (e2e/values.yaml). run.sh makes
+      # the two socket directories on the node 1000's before this starts.
       securityContext:
-        runAsUser: 0
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
       containers:
         - name: spire-agent
           # SPIRE 1.15.4, pinned by digest; see the server.
@@ -316,10 +322,15 @@ spec:
               mountPath: /run/spire/broker
             - name: token
               mountPath: /var/run/secrets/tokens
+            - name: data
+              mountPath: /run/spire/data
       volumes:
         - name: config
           configMap:
             name: spire-agent
+        # data_dir, writable by the non-root agent.
+        - name: data
+          emptyDir: {}
         # Where the Workload API socket is shared with the pods of the node:
         # the broker verifies JWT-SVIDs against the bundle it serves, and
         # cracha-agent gets its own identity from it.

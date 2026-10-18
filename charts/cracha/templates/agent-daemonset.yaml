@@ -61,6 +61,12 @@ spec:
       securityContext:
         seccompProfile:
           type: RuntimeDefault
+        {{- with .Values.agent.brokerAPI.group }}
+        # The Broker API socket's group (agent.brokerAPI.group): the
+        # agent's only way to open it without CAP_DAC_OVERRIDE.
+        supplementalGroups:
+          - {{ int . }}
+        {{- end }}
       {{- if eq $enrol "cni" }}
       initContainers:
         # cni mode (design 7.2): before the agent serves, the plugin is put

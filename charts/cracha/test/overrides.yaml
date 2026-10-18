@@ -122,6 +122,7 @@ agent:
   brokerAPI:
     hostPath: /run/spiffe/broker
     socket: api.sock
+    group: 1000
   healthzPort: 17173
   logLevel: warn
   priorityClassName: ""
