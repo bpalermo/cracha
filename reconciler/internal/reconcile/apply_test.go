@@ -109,20 +109,21 @@ func TestApply(t *testing.T) {
 	if got, want := lines(held(c)), lines(desired); got != want {
 		t.Errorf("SpiceDB holds\n%swant:\n%s", got, want)
 	}
-	// Three reads of the owned types before and three after, the latter at
-	// least as fresh as the write.
-	if len(c.Reads) != 6 {
-		t.Fatalf("reads = %d, want 6", len(c.Reads))
+	// One read per owned type before and one after, the latter at least
+	// as fresh as the write.
+	n := len(OwnedTypes)
+	if len(c.Reads) != 2*n {
+		t.Fatalf("reads = %d, want %d", len(c.Reads), 2*n)
 	}
 	var types []string
 	for _, read := range c.Reads {
 		types = append(types, read.GetRelationshipFilter().GetResourceType())
 	}
-	if strings.Join(types, ",") != "grant,service,workload,grant,service,workload" {
+	if want := "grant,service,workload,s3_bucket,dynamodb_table"; strings.Join(types, ",") != want+","+want {
 		t.Errorf("read types = %v", types)
 	}
-	if !c.Reads[0].GetConsistency().GetFullyConsistent() || c.Reads[5].GetConsistency().GetAtLeastAsFresh().GetToken() != res.Token {
-		t.Errorf("consistency: first %v, last %v", c.Reads[0].GetConsistency(), c.Reads[5].GetConsistency())
+	if !c.Reads[0].GetConsistency().GetFullyConsistent() || c.Reads[2*n-1].GetConsistency().GetAtLeastAsFresh().GetToken() != res.Token {
+		t.Errorf("consistency: first %v, last %v", c.Reads[0].GetConsistency(), c.Reads[2*n-1].GetConsistency())
 	}
 
 	// A second apply is a no-op: no write, no confirmation read.
@@ -130,7 +131,7 @@ func TestApply(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.Diff.Empty() || res.Written != 0 || res.Batches != 0 || res.Token != "" || len(c.Writes) != 3 || len(c.Reads) != 9 {
+	if !res.Diff.Empty() || res.Written != 0 || res.Batches != 0 || res.Token != "" || len(c.Writes) != 3 || len(c.Reads) != 3*n {
 		t.Errorf("second apply: result = %+v, writes = %d, reads = %d", res, len(c.Writes), len(c.Reads))
 	}
 }
@@ -141,7 +142,7 @@ func TestApplyDryRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Diff.Touch) != 1 || len(res.Diff.Delete) != 1 || res.Written != 0 || len(c.Writes) != 0 || len(c.Reads) != 3 {
+	if len(res.Diff.Touch) != 1 || len(res.Diff.Delete) != 1 || res.Written != 0 || len(c.Writes) != 0 || len(c.Reads) != len(OwnedTypes) {
 		t.Errorf("dry run: result = %+v, writes = %d, reads = %d", res, len(c.Writes), len(c.Reads))
 	}
 	if got := held(c); len(got) != 1 || !got[0].Equal(stale) {

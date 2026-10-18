@@ -7,12 +7,12 @@
 //	cracha-reconciler apply  -source DIR -endpoint host:port -token-file FILE [-ca pem] [-insecure] [-dry-run]
 //
 // apply refuses a tree the loader or the lints reject, reads every
-// relationship of the resource types it owns (grant, service, workload),
-// logs the difference and writes it in batches, then reads back to confirm;
-// a second run is a no-op. -dry-run logs the difference and writes
-// nothing. The exit status is 0 on success, 1 when the tree is rejected or
-// SpiceDB still differs after the write, and 2 on a usage or operational
-// error.
+// relationship of the resource types it owns (grant, service, workload,
+// s3_bucket and dynamodb_table), logs the difference and writes it in
+// batches, then reads back to confirm; a second run is a no-op. -dry-run
+// logs the difference and writes nothing. The exit status is 0 on
+// success, 1 when the tree is rejected or SpiceDB still differs after the
+// write, and 2 on a usage or operational error.
 package main
 
 import (

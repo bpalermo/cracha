@@ -17,6 +17,7 @@ go_test(
     srcs = [
         "compose_test.go",
         "fixture_test.go",
+        "lookup_test.go",
     ],
     embed = [":grants"],
 )

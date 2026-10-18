@@ -12,6 +12,7 @@ go_library(
     visibility = ["//reconciler:__subpackages__"],
     deps = [
         "//common/grant",
+        "//common/idenc",
         "//common/spicedb",
         "@com_github_authzed_authzed_go//proto/authzed/api/v1:api",
         "@org_golang_google_protobuf//types/known/structpb",

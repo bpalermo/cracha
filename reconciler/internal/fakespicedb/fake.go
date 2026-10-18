@@ -57,8 +57,8 @@ func New(rels ...*v1.Relationship) *Client {
 
 // key is the relationship's identity, without its caveat.
 func key(r *v1.Relationship) string {
-	return fmt.Sprintf("%s:%s#%s@%s:%s", r.GetResource().GetObjectType(), r.GetResource().GetObjectId(), r.GetRelation(),
-		r.GetSubject().GetObject().GetObjectType(), r.GetSubject().GetObject().GetObjectId())
+	return fmt.Sprintf("%s:%s#%s@%s:%s#%s", r.GetResource().GetObjectType(), r.GetResource().GetObjectId(), r.GetRelation(),
+		r.GetSubject().GetObject().GetObjectType(), r.GetSubject().GetObject().GetObjectId(), r.GetSubject().GetOptionalRelation())
 }
 
 // Relationships returns what the client holds, sorted by identity.

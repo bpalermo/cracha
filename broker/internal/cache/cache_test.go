@@ -518,11 +518,23 @@ func TestKey(t *testing.T) {
 		func(r *issuer.Resolution) { r.SourceIdentity = "w.prod.payments.outbox" },
 		func(r *issuer.Resolution) { r.Composed.Shape = "t" },
 		func(r *issuer.Resolution) { r.Composed.Grants = []string{"x"} },
+		func(r *issuer.Resolution) { r.Composed.Resources = map[string][]string{"x": {"data-a"}} },
 	} {
 		c := a
 		change(&c)
 		if keyOf(c) == keyOf(a) {
 			t.Errorf("change left the key %q", keyOf(c))
 		}
+	}
+	// The resource set: its order does not matter, its content does.
+	r1, r2, r3 := a, a, a
+	r1.Composed.Resources = map[string][]string{"x": {"data-a", "data-b"}, "y": {"data-c"}}
+	r2.Composed.Resources = map[string][]string{"y": {"data-c"}, "x": {"data-b", "data-a"}}
+	r3.Composed.Resources = map[string][]string{"x": {"data-a"}, "y": {"data-b", "data-c"}}
+	if keyOf(r1) != keyOf(r2) {
+		t.Error("resource order changed the key")
+	}
+	if keyOf(r1) == keyOf(r3) {
+		t.Error("a different resource set kept the key")
 	}
 }

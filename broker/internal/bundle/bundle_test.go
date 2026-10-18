@@ -353,3 +353,36 @@ func TestConvertRejectsDuplicates(t *testing.T) {
 		t.Error("convert accepted a negative duration")
 	}
 }
+
+func TestConvertLookupGrant(t *testing.T) {
+	lookup := &grant.BundleLookup{
+		Param: "bucket", Kind: "s3_bucket", Permission: "read", MaxResources: 3,
+		Template: grant.BundleTemplate{
+			Name: "t", Params: map[string]grant.ParamSpec{"bucket": {Type: grant.ParamString}},
+			Policy: []byte(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::${bucket}/*"}]}`),
+		},
+		Params: map[string]grant.Param{},
+	}
+	b := &grant.Bundle{Version: "v1", Grants: []grant.BundleGrant{{Name: "a", Account: "111122223333", Lookup: lookup}}}
+	snap, err := convert(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := snap.grants["a"].Lookup
+	if l == nil || l.Kind != "s3_bucket" || l.Permission != "read" || l.MaxResources != 3 {
+		t.Fatalf("lookup = %+v", l)
+	}
+	policy, err := l.Render([]string{"data-a", "data-b"})
+	if err != nil || !strings.Contains(policy, "arn:aws:s3:::data-a/*") || !strings.Contains(policy, "arn:aws:s3:::data-b/*") {
+		t.Errorf("rendered %s, %v", policy, err)
+	}
+	for name, bad := range map[string]grant.BundleGrant{
+		"a rendered policy": {Name: "a", SessionPolicy: "{}", Lookup: lookup},
+		"an unknown kind":   {Name: "a", Lookup: &grant.BundleLookup{Kind: "sqs_queue", Permission: "read", MaxResources: 1}},
+		"no maximum":        {Name: "a", Lookup: &grant.BundleLookup{Kind: "s3_bucket", Permission: "read"}},
+	} {
+		if _, err := convert(&grant.Bundle{Version: "v1", Grants: []grant.BundleGrant{bad}}); err == nil {
+			t.Errorf("a lookup grant with %s converted", name)
+		}
+	}
+}

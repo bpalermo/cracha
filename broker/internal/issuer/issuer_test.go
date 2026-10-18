@@ -259,3 +259,79 @@ func TestLongIdentityIsHashedEverywhere(t *testing.T) {
 		t.Errorf("subject %q", store.subject.ID)
 	}
 }
+
+// lookupStore is a fakeStore that also answers LookupResources.
+type lookupStore struct {
+	fakeStore
+	resources authz.Resources
+	err       error
+	asked     []string
+}
+
+func (l *lookupStore) LookupResources(_ context.Context, s authz.Subject, kind, permission string, _ authz.Consistency) (authz.Resources, error) {
+	l.asked = append(l.asked, s.ID+" "+kind+"#"+permission)
+	return l.resources, l.err
+}
+
+func bucketGrant() grants.ResolvedGrant {
+	g := grant("buckets")
+	g.SessionPolicy = ""
+	g.Envelope = []string{"arn:aws:s3:::data-*"}
+	g.Lookup = &grants.Lookup{Kind: "s3_bucket", Permission: "read", MaxResources: 5, Render: func(rs []string) (string, error) {
+		return `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::` + strings.Join(rs, ",") + `/*"}]}`, nil
+	}}
+	return g
+}
+
+func TestResolveLookup(t *testing.T) {
+	var logs bytes.Buffer
+	store := &lookupStore{
+		fakeStore: fakeStore{decision: authz.Decision{Grants: []string{"buckets", "ledger"}, Token: "tok-1"}},
+		resources: authz.Resources{Names: []string{"data-a"}, Trace: []string{"s3_bucket data-a reader via workload: active"}},
+	}
+	d := newDirect(t, &store.fakeStore, &fakeSTS{creds: sts.Credentials{Expiration: time.Now().Add(time.Hour)}}, slog.New(slog.NewJSONHandler(&logs, nil)))
+	d.Store = store
+	d.Grants = grants.NewStatic("bundle-7", grant("ledger"), bucketGrant())
+	iss, err := d.Issue(context.Background(), ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"prod/payments/ledger s3_bucket#read"}; !reflect.DeepEqual(store.asked, want) {
+		t.Errorf("asked %v, want %v", store.asked, want)
+	}
+	if !reflect.DeepEqual(iss.Composed.Resources, map[string][]string{"buckets": {"data-a"}}) || !strings.Contains(iss.Composed.Policy, "arn:aws:s3:::data-a/*") {
+		t.Errorf("composed %+v", iss.Composed)
+	}
+	if !strings.Contains(strings.Join(iss.Decision.Trace, "\n"), "s3_bucket data-a reader") {
+		t.Errorf("trace %v, want the store's lookup trace", iss.Decision.Trace)
+	}
+	if !strings.Contains(logs.String(), `"resources":{"buckets":["data-a"]}`) {
+		t.Errorf("the decision log does not name the resources: %s", logs.String())
+	}
+
+	// Nothing related: the lookup grant is left out, the trace says so.
+	store.resources = authz.Resources{}
+	r, err := d.Resolve(context.Background(), ledger)
+	if err != nil || !reflect.DeepEqual(r.Composed.Grants, []string{"ledger"}) || !strings.Contains(strings.Join(r.Decision.Trace, "\n"), "grant buckets: no resource related; left out") {
+		t.Errorf("resolve without resources: %+v, %v", r.Composed, err)
+	}
+	if r.SessionTags[TagGrant] != "ledger" {
+		t.Errorf("grant tag %q, want the composed grants only", r.SessionTags[TagGrant])
+	}
+
+	// The store failing to look up is a store failure.
+	store.err = errors.New("down")
+	if _, err := d.Resolve(context.Background(), ledger); !errors.Is(err, ErrStore) {
+		t.Errorf("a failed lookup: %v, want ErrStore", err)
+	}
+	store.err = authz.ErrSubjectSuspended
+	var deny *grants.DenyError
+	if _, err := d.Resolve(context.Background(), ledger); !errors.As(err, &deny) || deny.Reason != grants.ReasonSubjectSuspended {
+		t.Errorf("a suspension found by the lookup: %v", err)
+	}
+	// A store without lookups denies a lookup grant.
+	d.Store = &store.fakeStore
+	if _, err := d.Resolve(context.Background(), ledger); !errors.Is(err, ErrStore) {
+		t.Errorf("a store without lookups: %v, want ErrStore", err)
+	}
+}

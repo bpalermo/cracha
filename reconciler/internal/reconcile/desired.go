@@ -1,9 +1,11 @@
 package reconcile
 
 import (
+	"fmt"
 	"slices"
 
 	"github.com/bpalermo/cracha/common/grant"
+	"github.com/bpalermo/cracha/common/idenc"
 	"github.com/bpalermo/cracha/common/spicedb"
 )
 
@@ -17,7 +19,10 @@ import (
 //	Assignment   grant:<g>#assignee_workload@workload:<subject>  per grant, caveated by its bounds
 //	             workload:<subject>#suspended@team:<team>    when suspended; the team of
 //	                                                          the subject's service, or "none"
+//	Access       <kind>:<resource ID>#<relation>@workload:<subject>     caveated by its bounds
+//	             <kind>:<resource ID>#<relation>@service:<s>#member     for a service's members
 //
+// A resource's ID is its name as common/idenc's Resource encodes it.
 // A bound in time alone is the within_window caveat, in clusters alone
 // in_clusters, both bounded, neither no caveat. Who holds what is
 // grant.ResolveAssignments, the mapping the published assignments document
@@ -45,6 +50,15 @@ func Desired(src *grant.Source) ([]Relationship, error) {
 	}
 	for _, w := range workloads {
 		b.addWorkload(w, teams)
+	}
+	access, err := grant.ResolveAccess(src)
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range access {
+		if err := b.addAccess(a); err != nil {
+			return nil, err
+		}
 	}
 	out := make([]Relationship, 0, len(b.rels))
 	for _, r := range b.rels {
@@ -92,6 +106,22 @@ func (b *builder) addWorkload(w grant.AssignedWorkload, teams map[string]string)
 		}
 		b.add(plain(spicedb.TypeWorkload, w.Subject, spicedb.RelationSuspended, spicedb.TypeTeam, team))
 	}
+}
+
+// addAccess adds one relation of a workload, or of a service's members, to
+// a resource.
+func (b *builder) addAccess(a grant.AssignedAccess) error {
+	id, err := idenc.Resource(a.Resource.Name)
+	if err != nil {
+		return fmt.Errorf("access to %s: %w", a.Resource, err)
+	}
+	r := plain(a.Resource.Kind, id, a.Relation, spicedb.TypeWorkload, a.Subject)
+	if a.Service != "" {
+		r.SubjectType, r.SubjectID, r.SubjectRelation = spicedb.TypeService, a.Service, spicedb.RelationMember
+	}
+	caveat(&r, grant.BoundedGrant{ExpiresAt: a.ExpiresAt, Clusters: a.Clusters})
+	b.add(r)
+	return nil
 }
 
 // caveat sets the relationship's caveat from a grant's normalized bounds.

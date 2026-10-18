@@ -18,6 +18,12 @@ const (
 	ReasonSubjectSuspended  Reason = "subject_suspended"
 	ReasonEnvelopeViolation Reason = "envelope_violation"
 	ReasonPolicyTooLarge    Reason = "policy_too_large"
+	// ReasonResourceOutsideEnvelope: a resource the store related the
+	// workload to rendered outside a lookup grant's envelope (Level 3).
+	ReasonResourceOutsideEnvelope Reason = "resource_outside_envelope"
+	// ReasonNoResources: every grant the workload holds is a lookup grant
+	// and the store relates it to no resource of any.
+	ReasonNoResources Reason = "no_resources"
 )
 
 // DenyError is a denial with one of the reasons above. Detail is for the
@@ -66,7 +72,17 @@ type Composed struct {
 	SessionTags map[string]string
 	// DurationSeconds is the shortest duration among the grants, capped.
 	DurationSeconds int32
+	// Resources are, per lookup grant composed, the resources its policy
+	// was rendered with, sorted.
+	Resources map[string][]string
+	// Dropped are the lookup grants held but left out, for want of any
+	// resource.
+	Dropped []string
 }
+
+// Finder answers which resources of a kind the workload holds a
+// permission on: the authorization store's LookupResources, for Compose.
+type Finder func(kind, permission string) ([]string, error)
 
 // Compose resolves the named grants and composes them (sections 6.2 and
 // 6.5): one shape or "ambiguous"; no grants or a grant missing from the
@@ -79,11 +95,21 @@ type Composed struct {
 // "ambiguous". A denial is a *DenyError; any other error means the source's
 // content is unusable, which is also a deny.
 //
+// A lookup grant (Level 3) is rendered first, with the resources find
+// returns for its kind and permission (one call per kind and permission):
+// more than its compiled maximum is "policy_too_large", and a rendered
+// resource outside its envelope is "resource_outside_envelope", whatever
+// the other grants. A lookup grant for which the store finds no resource is
+// left out of the composition, and reported in Dropped, so that the
+// workload keeps the rest of its grants; when that leaves nothing, the
+// denial is "no_resources". An error of find is returned as it is, for the
+// caller to tell a store that cannot answer from a deny.
+//
 // The grants are folded in name order, and the first fault found is the
 // one reported: for each grant, its shape and account, then its statements,
 // then its session tags; after all grants, the policy size, the managed
 // policy count and the duration.
-func Compose(src Source, names []string) (Composed, error) {
+func Compose(src Source, names []string, find Finder) (Composed, error) {
 	names = sortedUnique(names)
 	if len(names) == 0 {
 		return Composed{}, &DenyError{ReasonNoGrant, "no grants assigned"}
@@ -92,16 +118,142 @@ func Compose(src Source, names []string) (Composed, error) {
 	if err != nil {
 		return Composed{}, err
 	}
+	filled, err := fillLookups(resolved, find)
+	if err != nil {
+		return Composed{}, err
+	}
+	if len(filled.grants) == 0 {
+		return Composed{}, &DenyError{ReasonNoResources, fmt.Sprintf("lookup grants %s: no resource is related to the workload", strings.Join(filled.dropped, ", "))}
+	}
+	resolved, names = filled.grants, grantNames(filled.grants)
 	c, err := newComposition(resolved[0], names)
 	if err != nil {
 		return Composed{}, err
 	}
+	c.out.Resources, c.out.Dropped = filled.resources, filled.dropped
 	for _, g := range resolved {
 		if err := c.add(g); err != nil {
 			return Composed{}, err
 		}
 	}
 	return c.finish()
+}
+
+// filledGrants are a workload's grants with their lookups rendered.
+type filledGrants struct {
+	grants    []ResolvedGrant
+	resources map[string][]string
+	dropped   []string
+}
+
+// fillLookups renders every lookup grant with the resources find gives
+// its kind and permission, leaving out those it finds none for.
+func fillLookups(gs []ResolvedGrant, find Finder) (filledGrants, error) {
+	out := filledGrants{grants: make([]ResolvedGrant, 0, len(gs))}
+	found := map[string][]string{}
+	for _, g := range gs {
+		if g.Lookup == nil {
+			out.grants = append(out.grants, g)
+			continue
+		}
+		resources, err := findOnce(found, find, g)
+		if err != nil {
+			return filledGrants{}, err
+		}
+		if len(resources) == 0 {
+			out.dropped = append(out.dropped, g.Name)
+			continue
+		}
+		filled, err := fillLookup(g, resources)
+		if err != nil {
+			return filledGrants{}, err
+		}
+		if out.resources == nil {
+			out.resources = map[string][]string{}
+		}
+		out.resources[g.Name] = resources
+		out.grants = append(out.grants, filled)
+	}
+	return out, nil
+}
+
+// findOnce asks find for a lookup grant's resources, once per kind and
+// permission: found holds the answers so far.
+func findOnce(found map[string][]string, find Finder, g ResolvedGrant) ([]string, error) {
+	key := g.Lookup.Kind + "#" + g.Lookup.Permission
+	if resources, ok := found[key]; ok {
+		return resources, nil
+	}
+	if find == nil {
+		return nil, fmt.Errorf("grant %q needs a resource lookup and there is no store to ask", g.Name)
+	}
+	resources, err := find(g.Lookup.Kind, g.Lookup.Permission)
+	if err != nil {
+		return nil, err
+	}
+	resources = sortedUnique(resources)
+	found[key] = resources
+	return resources, nil
+}
+
+// fillLookup renders one lookup grant for its resources and checks every
+// resource of the result against its envelope.
+func fillLookup(g ResolvedGrant, resources []string) (ResolvedGrant, error) {
+	l := g.Lookup
+	if len(resources) > l.MaxResources {
+		return ResolvedGrant{}, &DenyError{ReasonPolicyTooLarge, fmt.Sprintf("grant %q: %d %s resources, over its compiled maximum of %d", g.Name, len(resources), l.Kind, l.MaxResources)}
+	}
+	if l.Render == nil {
+		return ResolvedGrant{}, fmt.Errorf("grant %q: a lookup without a renderer", g.Name)
+	}
+	policy, err := l.Render(resources)
+	if err != nil {
+		return ResolvedGrant{}, fmt.Errorf("grant %q: rendering for %s: %w", g.Name, strings.Join(resources, ", "), err)
+	}
+	g.SessionPolicy, g.Lookup = policy, nil
+	stmts, err := policyStatements(g)
+	if err != nil {
+		return ResolvedGrant{}, err
+	}
+	for i, raw := range stmts {
+		if err := lookupStatementInEnvelope(g, i, raw, resources); err != nil {
+			return ResolvedGrant{}, err
+		}
+	}
+	return g, nil
+}
+
+// lookupStatementInEnvelope is "resource_outside_envelope" when a
+// Resource of statement i of a rendered lookup grant matches no pattern of
+// its envelope. What no envelope can bound at all is left to
+// normalizeStatement, which reports it as for any grant.
+func lookupStatementInEnvelope(g ResolvedGrant, i int, raw json.RawMessage, resources []string) error {
+	var stmt map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &stmt); err != nil {
+		return fmt.Errorf("grant %q: statement %d: %w", g.Name, i, err)
+	}
+	resRaw, ok := stmt["Resource"]
+	if !ok {
+		return nil
+	}
+	rendered, err := stringOrList(resRaw)
+	if err != nil {
+		return fmt.Errorf("grant %q: statement %d: Resource: %w", g.Name, i, err)
+	}
+	for _, r := range rendered {
+		if !inEnvelope(r, g.Envelope) {
+			return &DenyError{ReasonResourceOutsideEnvelope, fmt.Sprintf("grant %q rendered for %s: statement %d: resource %q matches no envelope pattern %q", g.Name, strings.Join(resources, ", "), i, r, g.Envelope)}
+		}
+	}
+	return nil
+}
+
+func grantNames(gs []ResolvedGrant) []string {
+	out := make([]string, len(gs))
+	for i, g := range gs {
+		out[i] = g.Name
+	}
+	return out
 }
 
 // resolveGrants looks every name up in the source, in order; a name the

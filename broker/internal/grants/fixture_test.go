@@ -78,7 +78,7 @@ func TestLoadFixture(t *testing.T) {
 	}
 
 	// The fixture composes through the same path as everything else.
-	c, err := Compose(src, []string{"payments-ledger-rw", "payments-outbox-r"})
+	c, err := Compose(src, []string{"payments-ledger-rw", "payments-outbox-r"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
