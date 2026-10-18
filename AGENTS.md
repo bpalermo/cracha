@@ -132,7 +132,12 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 
 - No `cmd/`. Each binary lives in a root-level directory with its `main.go`:
   `broker/`, `csi/`, `webhook/`, `grantc/`, `reconciler/`.
-- Code private to a binary goes under its `internal/`.
+- Code private to a binary goes under its `internal/`. The webhook's
+  `internal/mutate` is the admission decision, pure over two interfaces:
+  ServiceAccount lookups (`internal/sacache`, a Get remembered for a TTL)
+  and the per-namespace `AWS_REGION` override (`internal/nsregion`, the
+  `cracha.dev/region` Namespace annotation served from an informer; the
+  chart's ClusterRole lists and watches namespaces for it).
 - Code shared between binaries goes under `common/`. `common/idenc` is the
   single identity-encoding library (design 4.3): nothing else formats a
   SourceIdentity or an authorization subject ID.
@@ -201,7 +206,10 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   `bazel build //charts/cracha:cracha` packages it as
   `bazel-bin/charts/cracha/cracha.tgz`; `bazel test //charts/cracha/...`
   runs the lint, template (defaults, every override, cert-manager) and pin
-  tests.
+  tests, and the Go assertions over the rendered objects (`render_test.go`
+  decodes the `helm_template` renderings of `BUILD.bazel`; an assertion
+  on what a template renders goes there, since `helm_template_test` only
+  renders).
 - The chart's version and image pins are stamped at package time: the
   version from `STABLE_CHART_VERSION`, each image's repository and digest
   from its `image_push` target (`{@//csi:image_push.digest}` in

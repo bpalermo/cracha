@@ -144,11 +144,16 @@ func eventually(ctx context.Context, check func() error) error {
 // createPod creates a pod in the test namespace, labelled for cleanup, and
 // returns it as the apiserver persisted it: with the webhook's patch applied.
 func createPod(ctx context.Context, pod *corev1.Pod) (*corev1.Pod, error) {
+	return createPodIn(ctx, testNamespace, pod)
+}
+
+// createPodIn is createPod in another namespace, one the test owns.
+func createPodIn(ctx context.Context, namespace string, pod *corev1.Pod) (*corev1.Pod, error) {
 	if pod.Labels == nil {
 		pod.Labels = map[string]string{}
 	}
 	pod.Labels[suiteLabel] = "true"
-	return client.CoreV1().Pods(testNamespace).Create(ctx, pod, metav1.CreateOptions{})
+	return client.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
 }
 
 func mustCreatePod(ctx context.Context, t *testing.T, pod *corev1.Pod) *corev1.Pod {
