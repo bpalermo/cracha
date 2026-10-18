@@ -72,6 +72,8 @@ func main() {
 	flag.Var(mutate.QuantityValue{Q: &opts.mutate.EnrolCPU}, "enrol-cpu", "CPU of the cracha-enrol init container, its request and its limit alike; under about 100m the container is CFS-throttled and holds the pod in Init for tens of seconds")
 	flag.Var(mutate.QuantityValue{Q: &opts.mutate.EnrolMemory}, "enrol-memory", "memory of the cracha-enrol init container, its request and its limit alike")
 	flag.StringVar(&opts.mutate.DefaultRegion, "default-region", "", "AWS_REGION for pods that do not set their own (required)")
+	flag.IntVar(&opts.mutate.SDKTimeoutSeconds, "sdk-timeout-seconds", mutate.DefaultSDKTimeoutSeconds, "AWS_METADATA_SERVICE_TIMEOUT, in whole seconds, for containers that do not set their own: the per-attempt timeout of the SDKs that read it for the container credentials provider; 0 leaves it out")
+	flag.IntVar(&opts.mutate.SDKAttempts, "sdk-attempts", mutate.DefaultSDKAttempts, "AWS_METADATA_SERVICE_NUM_ATTEMPTS for containers that do not set their own; 0 leaves it out")
 	flag.Var(&opts.mutate.ConflictingEnv, "conflicting-env", "what to do with AWS credential variables a pod sets itself: reject or strip")
 	flag.DurationVar(&opts.saCacheTTL, "sa-cache-ttl", 30*time.Second, "how long a ServiceAccount lookup is remembered; 0 disables the cache")
 	flag.StringVar(&opts.kubeconfig, "kubeconfig", "", "kubeconfig to reach the apiserver with; the default is the in-cluster configuration")

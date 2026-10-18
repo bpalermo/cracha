@@ -14,6 +14,13 @@
 //     included because they may call AWS as well, and the listener is there
 //     before any of them starts (design 7.2).
 //   - AWS_REGION.
+//   - AWS_METADATA_SERVICE_TIMEOUT and AWS_METADATA_SERVICE_NUM_ATTEMPTS
+//     (Config.SDKTimeoutSeconds, Config.SDKAttempts; zero leaves one out),
+//     the per-attempt timeout and the attempts of the credential fetch for
+//     the SDKs that read them for the container provider (design 7.7: of
+//     the first-party SDKs, PHP), so that one cold issuance does not
+//     outlast the SDK's patience. A container that sets either keeps its
+//     own, as with AWS_REGION.
 //
 // and the pod gets the label "cracha.dev/credentials: true", the enrolment
 // mark the agent checks before it binds anything (design 7.2).

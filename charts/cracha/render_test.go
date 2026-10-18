@@ -315,7 +315,7 @@ func webhookArgs(t *testing.T, rendering, name string) []string {
 // The webhook is told what the agent values say (design 7.5): the loopback
 // port, the enrolment mode and, in the init mode only, the agent image by
 // digest with the enrolment port, timeout and the init container's
-// resources; its serving identity comes from the Workload API, not from a
+// resources, and the SDK timeouts it injects; its serving identity comes from the Workload API, not from a
 // Secret.
 func TestWebhookDeployment(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
@@ -331,6 +331,8 @@ func TestWebhookDeployment(t *testing.T) {
 			"--enrol-cpu=100m",
 			"--enrol-memory=32Mi",
 			"--default-region=us-east-1",
+			"--sdk-timeout-seconds=5",
+			"--sdk-attempts=3",
 		} {
 			if !slices.Contains(args, want) {
 				t.Errorf("args %q lack %q", args, want)
@@ -365,6 +367,8 @@ func TestWebhookDeployment(t *testing.T) {
 			"--enrol-cpu=200m",
 			"--enrol-memory=64Mi",
 			"--conflicting-env=strip",
+			"--sdk-timeout-seconds=8",
+			"--sdk-attempts=0",
 		} {
 			if !slices.Contains(args, want) {
 				t.Errorf("args %q lack %q", args, want)

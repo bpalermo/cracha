@@ -70,10 +70,28 @@ func (p *planner) planPod(pod *corev1.Pod) {
 
 // managedEnv is what every container ends up with.
 func (p *planner) managedEnv() []corev1.EnvVar {
-	return []corev1.EnvVar{
+	env := []corev1.EnvVar{
 		{Name: EnvCredentialsURI, Value: p.cfg.CredentialsURI()},
 		{Name: EnvRegion, Value: p.region},
 	}
+	if p.cfg.SDKTimeoutSeconds > 0 {
+		env = append(env, corev1.EnvVar{Name: EnvSDKTimeout, Value: strconv.Itoa(p.cfg.SDKTimeoutSeconds)})
+	}
+	if p.cfg.SDKAttempts > 0 {
+		env = append(env, corev1.EnvVar{Name: EnvSDKAttempts, Value: strconv.Itoa(p.cfg.SDKAttempts)})
+	}
+	return env
+}
+
+// workloadOwned reports whether a variable the webhook injects is the
+// container's to choose: its region and its SDK's timeouts are, so a value
+// it sets is kept; only the credentials endpoint is Crachá's.
+func workloadOwned(name string) bool {
+	switch name {
+	case EnvRegion, EnvSDKTimeout, EnvSDKAttempts:
+		return true
+	}
+	return false
 }
 
 func (p *planner) planEnv(c *corev1.Container, base string) {
@@ -91,8 +109,9 @@ func (p *planner) planEnv(c *corev1.Container, base string) {
 		switch {
 		case ours && e.ValueFrom == nil && e.Value == want:
 			present[e.Name] = true
-		case e.Name == EnvRegion:
-			// The workload chose its region; only the credentials are ours.
+		case workloadOwned(e.Name):
+			// The workload chose its region or its SDK's timeouts; only
+			// the credentials are ours.
 			present[e.Name] = true
 		case Conflicts(e.Name):
 			if p.cfg.ConflictingEnv == Strip {

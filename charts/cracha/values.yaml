@@ -460,6 +460,21 @@ webhook:
   # pod, or "strip" them and record what was removed in an annotation.
   conflictingEnv: reject
 
+  # The SDK's patience with the credential endpoint (design 7.7), injected
+  # into every wired container that does not set its own as
+  # AWS_METADATA_SERVICE_TIMEOUT (whole seconds, per attempt) and
+  # AWS_METADATA_SERVICE_NUM_ATTEMPTS. Of the first-party SDKs only PHP
+  # reads them for the container provider (as a timeout and a retry
+  # count); the others read them for IMDS only, or not at all, and keep
+  # their own defaults, which is what agent.prewarm is for. Five seconds
+  # outlasts agent.fetchDeadline (3s), so a pod the issuer does not know
+  # yet gets the agent's 503 rather than a timeout, and three attempts
+  # outlast the fetch deadline and agent.brokerTimeout (10s) together.
+  # 0 leaves the variable out.
+  sdkTimeouts:
+    timeoutSeconds: 5
+    attempts: 3
+
   # How long a ServiceAccount lookup is remembered; 0 looks up every pod.
   saCacheTTL: 30s
 

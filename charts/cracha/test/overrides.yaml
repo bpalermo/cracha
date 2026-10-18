@@ -169,6 +169,9 @@ webhook:
     socket: socket
   defaultRegion: eu-west-1
   conflictingEnv: strip
+  sdkTimeouts:
+    timeoutSeconds: 8
+    attempts: 0
   saCacheTTL: 0s
   timeoutSeconds: 5
   drain: 2s

@@ -116,6 +116,14 @@
           {
             "name": "AWS_REGION",
             "value": "eu-west-1"
+          },
+          {
+            "name": "AWS_METADATA_SERVICE_TIMEOUT",
+            "value": "5"
+          },
+          {
+            "name": "AWS_METADATA_SERVICE_NUM_ATTEMPTS",
+            "value": "3"
           }
         ],
         "resources": {}
@@ -137,6 +145,14 @@
           {
             "name": "AWS_CONTAINER_CREDENTIALS_FULL_URI",
             "value": "http://127.0.0.1:8780/v1/credentials"
+          },
+          {
+            "name": "AWS_METADATA_SERVICE_TIMEOUT",
+            "value": "5"
+          },
+          {
+            "name": "AWS_METADATA_SERVICE_NUM_ATTEMPTS",
+            "value": "3"
           }
         ],
         "resources": {},
@@ -158,6 +174,14 @@
           {
             "name": "AWS_REGION",
             "value": "eu-west-1"
+          },
+          {
+            "name": "AWS_METADATA_SERVICE_TIMEOUT",
+            "value": "5"
+          },
+          {
+            "name": "AWS_METADATA_SERVICE_NUM_ATTEMPTS",
+            "value": "3"
           }
         ],
         "resources": {}

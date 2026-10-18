@@ -77,6 +77,8 @@ spec:
             {{- end }}
             - --default-region={{ required "webhook.defaultRegion is required: AWS_REGION for the pods that do not set their own" .Values.webhook.defaultRegion }}
             - --conflicting-env={{ .Values.webhook.conflictingEnv }}
+            - --sdk-timeout-seconds={{ int .Values.webhook.sdkTimeouts.timeoutSeconds }}
+            - --sdk-attempts={{ int .Values.webhook.sdkTimeouts.attempts }}
             - --sa-cache-ttl={{ .Values.webhook.saCacheTTL }}
             - --drain={{ .Values.webhook.drain }}
             - --shutdown-timeout={{ .Values.webhook.shutdownTimeout }}
