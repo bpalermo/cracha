@@ -87,8 +87,9 @@ helm_template_test(
 )
 
 # Every non-default knob: tls.mode existing with its Secrets and CA bundle,
-# existing ConfigMaps, every image overridden, trust-domain labels, the env
-# and envFrom, the scheduling knobs of each component.
+# the SpiceDB backend, existing ConfigMaps, every image overridden,
+# trust-domain labels, the env and envFrom, the scheduling knobs of each
+# component.
 helm_template_test(
     name = "cracha_overrides_template_test",
     size = "small",
@@ -104,7 +105,10 @@ helm_lint_test(
 )
 
 # The bundle source's other two verification keys: KMS, and a Secret the
-# install keeps (test/overrides.yaml renders the inline key).
+# install keeps (test/overrides.yaml renders the inline key); the SpiceDB
+# backend over plaintext (overrides renders it with a CA); the static backend
+# with an assignments ConfigMap the install keeps (the defaults render the
+# chart's own).
 [
     helm_template_test(
         name = "cracha_%s_template_test" % name,
@@ -115,6 +119,8 @@ helm_lint_test(
     for name in [
         "bundle-kms",
         "bundle-secret",
+        "spicedb-insecure",
+        "static-configmap",
     ]
 ]
 

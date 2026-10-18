@@ -192,3 +192,26 @@ or "" for S3 or no source. A local source needs broker.bundle.volume.
 {{- fail (printf "broker.bundle.source must be local:<dir> or s3://bucket[/prefix], not %q" $source) -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+The authorization backend of broker.authz, checked: "static" or "spicedb".
+The SpiceDB knobs need the spicedb backend, which needs an endpoint and the
+Secret holding its preshared key, and takes at most one of a CA and insecure.
+*/}}
+{{- define "cracha.authzBackend" -}}
+{{- $a := .Values.broker.authz -}}
+{{- $s := $a.spicedb -}}
+{{- if not (has $a.backend (list "static" "spicedb")) -}}
+{{- fail (printf "broker.authz.backend must be static or spicedb, not %q" $a.backend) -}}
+{{- end -}}
+{{- if eq $a.backend "static" -}}
+{{- if or $s.endpoint $s.tokenSecret.name $s.ca $s.insecure -}}
+{{- fail "broker.authz.spicedb needs broker.authz.backend spicedb" -}}
+{{- end -}}
+{{- else -}}
+{{- if not $s.endpoint }}{{ fail "broker.authz.spicedb.endpoint is required with broker.authz.backend spicedb" }}{{ end -}}
+{{- if not $s.tokenSecret.name }}{{ fail "broker.authz.spicedb.tokenSecret.name is required with broker.authz.backend spicedb: the Secret holding the preshared key" }}{{ end -}}
+{{- if and $s.insecure $s.ca }}{{ fail "broker.authz.spicedb.insecure excludes broker.authz.spicedb.ca" }}{{ end -}}
+{{- end -}}
+{{ $a.backend }}
+{{- end -}}

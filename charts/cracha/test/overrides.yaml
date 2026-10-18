@@ -35,9 +35,21 @@ broker:
         driver: csi.spiffe.io
         readOnly: true
     socket: socket
-  assignments:
-    existingConfigMap: my-assignments
-    key: my-assignments.yaml
+  # The SpiceDB backend, verified with its own CA; test/spicedb-insecure.yaml
+  # renders the plaintext knob and test/static-configmap.yaml the static
+  # backend with a ConfigMap the install keeps.
+  authz:
+    backend: spicedb
+    spicedb:
+      endpoint: spicedb.spicedb.svc:50051
+      tokenSecret:
+        name: spicedb-key
+        key: preshared-key
+      ca: |
+        -----BEGIN CERTIFICATE-----
+        MIIBszCCAVmgAwIBAgIUAAAAAAAAAAAAAAAAAAAAAAAAAAAwCgYIKoZIzj0EAwIw
+        -----END CERTIFICATE-----
+      timeout: 2s
   grants:
     existingConfigMap: my-grants
     key: my-grants.yaml

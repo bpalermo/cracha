@@ -1,0 +1,40 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "spicedb",
+    srcs = [
+        "client.go",
+        "spicedb.go",
+    ],
+    importpath = "github.com/bpalermo/cracha/broker/internal/authz/spicedb",
+    visibility = ["//broker:__subpackages__"],
+    deps = [
+        "//broker/internal/authz",
+        "@com_github_authzed_authzed_go//proto/authzed/api/v1:api",
+        "@com_github_authzed_authzed_go//v1:authzed-go",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//credentials",
+        "@org_golang_google_grpc//credentials/insecure",
+        "@org_golang_google_protobuf//types/known/structpb",
+    ],
+)
+
+go_test(
+    name = "spicedb_test",
+    srcs = [
+        "fake_test.go",
+        "parity_test.go",
+        "spicedb_test.go",
+    ],
+    embed = [":spicedb"],
+    deps = [
+        "//broker/internal/authz",
+        "//broker/internal/authz/static",
+        "@com_github_authzed_authzed_go//proto/authzed/api/v1:api",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//metadata",
+        "@org_golang_google_grpc//status",
+        "@org_golang_google_protobuf//types/known/structpb",
+    ],
+)

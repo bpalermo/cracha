@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bpalermo/cracha/broker/internal/authz/spicedb"
 	"github.com/bpalermo/cracha/broker/internal/bundle"
 	"github.com/bpalermo/cracha/broker/internal/cache"
 	"github.com/bpalermo/cracha/broker/internal/grants"
@@ -26,11 +27,21 @@ type config struct {
 	workloadAPISocket string
 	cluster           string
 	trustDomainLabels string
-	assignments       string
 	grantsFixture     string
 	awsRegion         string
 	logLevel          string
 	showVersion       bool
+
+	// The authorization backend (design 6.3): static, the assignments file
+	// (broker/internal/authz/static), or spicedb, the reference backend
+	// (broker/internal/authz/spicedb).
+	authzBackend     string
+	assignments      string
+	spicedbEndpoint  string
+	spicedbTokenFile string
+	spicedbCA        string
+	spicedbInsecure  bool
+	spicedbTimeout   time.Duration
 
 	// The compiled grant bundle (broker/internal/bundle), the production
 	// source of grants; --grants-fixture is the development one, and
@@ -136,7 +147,6 @@ func (c *config) bindFlags(fs *flag.FlagSet, env envDefaults) {
 	fs.StringVar(&c.workloadAPISocket, "workload-api-socket", env.str("workload-api-socket", "unix:///run/spire/sockets/agent.sock"), "SPIFFE Workload API address, for the trust bundles")
 	fs.StringVar(&c.cluster, "cluster", env.str("cluster", ""), "name of the cluster this broker serves (required)")
 	fs.StringVar(&c.trustDomainLabels, "trust-domain-labels", env.str("trust-domain-labels", ""), "trust domain short labels, <trust-domain>=<label>,...; unmapped domains get td.<name>")
-	fs.StringVar(&c.assignments, "assignments", env.str("assignments", ""), "path to the static authorization backend's assignments file (required)")
 	fs.StringVar(&c.grantsFixture, "grants-fixture", env.str("grants-fixture", ""), "path to a resolved-grants fixture file, for development; excludes --bundle-source")
 	fs.StringVar(&c.bundleSource, "bundle-source", env.str("bundle-source", ""), "where the compiled grant bundle is published: local:<dir> or s3://bucket[/prefix]; excludes --grants-fixture")
 	fs.StringVar(&c.bundleVerifyKey, "bundle-verify-key", env.str("bundle-verify-key", ""), "path to the PEM public key the bundle's signature is verified with")
@@ -145,7 +155,73 @@ func (c *config) bindFlags(fs *flag.FlagSet, env envDefaults) {
 	fs.StringVar(&c.awsRegion, "aws-region", env.str("aws-region", ""), "AWS region for STS; the SDK's default chain when empty")
 	fs.StringVar(&c.logLevel, "log-level", env.str("log-level", "info"), "log level: debug, info, warn or error")
 	fs.BoolVar(&c.showVersion, "version", false, "print the version and exit")
+	c.bindAuthzFlags(fs, env)
 	c.bindCacheFlags(fs, env)
+}
+
+// bindAuthzFlags declares the authorization backend's flags (design 6.3).
+func (c *config) bindAuthzFlags(fs *flag.FlagSet, env envDefaults) {
+	fs.StringVar(&c.authzBackend, "authz-backend", env.str("authz-backend", backendStatic), "authorization backend: static (an assignments file) or spicedb")
+	fs.StringVar(&c.assignments, "assignments", env.str("assignments", ""), "path to the static backend's assignments file (required with --authz-backend static)")
+	fs.StringVar(&c.spicedbEndpoint, "spicedb-endpoint", env.str("spicedb-endpoint", ""), "SpiceDB gRPC address, host:port (required with --authz-backend spicedb)")
+	fs.StringVar(&c.spicedbTokenFile, "spicedb-token-file", env.str("spicedb-token-file", ""), "path to the file holding SpiceDB's preshared key (required with --authz-backend spicedb)")
+	fs.StringVar(&c.spicedbCA, "spicedb-ca", env.str("spicedb-ca", ""), "path to the PEM bundle SpiceDB's certificate is verified with; the system roots when empty")
+	fs.BoolVar(&c.spicedbInsecure, "spicedb-insecure", env.boolean("spicedb-insecure", false), "speak plaintext gRPC to SpiceDB, the key in the clear; for kind only, excludes --spicedb-ca")
+	fs.DurationVar(&c.spicedbTimeout, "spicedb-timeout", env.duration("spicedb-timeout", spicedb.DefaultTimeout), "how long one SpiceDB call may take")
+}
+
+// The authorization backends.
+const (
+	backendStatic  = "static"
+	backendSpiceDB = "spicedb"
+)
+
+// authzProblems is what is wrong with the authorization backend flags: the
+// static backend needs its assignments file and none of the SpiceDB flags;
+// the SpiceDB backend needs an endpoint and a token file, no assignments
+// file, at most one of a CA and insecure, and a positive timeout.
+func (c *config) authzProblems() []string {
+	var problems []string
+	switch c.authzBackend {
+	case backendStatic:
+		problems = c.staticProblems()
+	case backendSpiceDB:
+		problems = c.spicedbProblems()
+	default:
+		problems = append(problems, fmt.Sprintf("--authz-backend %q is not static or spicedb", c.authzBackend))
+	}
+	if c.spicedbTimeout <= 0 {
+		problems = append(problems, fmt.Sprintf("--spicedb-timeout %v is not positive", c.spicedbTimeout))
+	}
+	return problems
+}
+
+func (c *config) staticProblems() []string {
+	var problems []string
+	if c.assignments == "" {
+		problems = append(problems, "--assignments is required with --authz-backend static")
+	}
+	if c.spicedbEndpoint != "" || c.spicedbTokenFile != "" || c.spicedbCA != "" || c.spicedbInsecure {
+		problems = append(problems, "the --spicedb-* flags need --authz-backend spicedb")
+	}
+	return problems
+}
+
+func (c *config) spicedbProblems() []string {
+	var problems []string
+	if c.assignments != "" {
+		problems = append(problems, "--assignments needs --authz-backend static")
+	}
+	if c.spicedbEndpoint == "" {
+		problems = append(problems, "--spicedb-endpoint is required with --authz-backend spicedb")
+	}
+	if c.spicedbTokenFile == "" {
+		problems = append(problems, "--spicedb-token-file is required with --authz-backend spicedb")
+	}
+	if c.spicedbInsecure && c.spicedbCA != "" {
+		problems = append(problems, "--spicedb-insecure excludes --spicedb-ca")
+	}
+	return problems
 }
 
 // bindCacheFlags declares the credential cache's flags (design 6.7).
@@ -180,18 +256,13 @@ func (c *config) cacheProblems() []string {
 // "; ".
 func (c *config) validate() error {
 	var problems []string
-	required := []struct{ value, flag string }{
-		{c.cluster, "--cluster"},
-		{c.assignments, "--assignments"},
-	}
-	for _, r := range required {
-		if r.value == "" {
-			problems = append(problems, r.flag+" is required")
-		}
+	if c.cluster == "" {
+		problems = append(problems, "--cluster is required")
 	}
 	if p := c.tlsProblem(); p != "" {
 		problems = append(problems, p)
 	}
+	problems = append(problems, c.authzProblems()...)
 	problems = append(problems, c.grantsProblems()...)
 	labels, err := idenc.ParseLabels(c.trustDomainLabels)
 	if err != nil {
