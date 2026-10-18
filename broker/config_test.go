@@ -233,14 +233,14 @@ func TestParseConfigBundleRejects(t *testing.T) {
 func TestParseConfigAuthz(t *testing.T) {
 	c, err := parseConfig([]string{
 		"--cluster", "prod-a", "--grants-fixture", "g.yaml", "--namespace", "n",
-		"--authz-backend", "spicedb", "--spicedb-endpoint", "spicedb:50051", "--spicedb-token-file", "/etc/cracha/spicedb/token",
-		"--spicedb-ca", "/etc/cracha/spicedb/ca.pem", "--spicedb-timeout", "2s",
+		"--authz-backend", "spicedb", "--spicedb-endpoint", "spicedb:50051",
+		"--spicedb-server-spiffe-id", "spiffe://prod.example.org/ns/authz/sa/spicedb", "--spicedb-timeout", "2s",
 	}, envOf(nil), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.authzBackend != "spicedb" || c.spicedbEndpoint != "spicedb:50051" || c.spicedbTokenFile != "/etc/cracha/spicedb/token" ||
-		c.spicedbCA != "/etc/cracha/spicedb/ca.pem" || c.spicedbInsecure || c.spicedbTimeout != 2*time.Second {
+	if c.authzBackend != "spicedb" || c.spicedbEndpoint != "spicedb:50051" ||
+		c.spicedbServer.String() != "spiffe://prod.example.org/ns/authz/sa/spicedb" || c.spicedbTimeout != 2*time.Second {
 		t.Errorf("config %+v", c)
 	}
 	env := envOf(map[string]string{
@@ -249,15 +249,14 @@ func TestParseConfigAuthz(t *testing.T) {
 		"CRACHA_NAMESPACE":          "cracha-system",
 		"CRACHA_AUTHZ_BACKEND":      "spicedb",
 		"CRACHA_SPICEDB_ENDPOINT":   "spicedb.spicedb.svc:50051",
-		"CRACHA_SPICEDB_TOKEN_FILE": "/run/secrets/spicedb",
-		"CRACHA_SPICEDB_INSECURE":   "true",
+		"CRACHA_SPICEDB_SERVER_SPIFFE_ID": "/ns/authz/sa/spicedb",
 	})
 	c, err = parseConfig(nil, env, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.authzBackend != "spicedb" || c.spicedbEndpoint != "spicedb.spicedb.svc:50051" || c.spicedbTokenFile != "/run/secrets/spicedb" ||
-		!c.spicedbInsecure || c.spicedbTimeout != 5*time.Second {
+	if c.authzBackend != "spicedb" || c.spicedbEndpoint != "spicedb.spicedb.svc:50051" || c.spicedbServerID != "/ns/authz/sa/spicedb" ||
+		!c.spicedbServer.IsZero() || c.spicedbTimeout != 5*time.Second {
 		t.Errorf("env did not set the spicedb flags: %+v", c)
 	}
 	c, err = parseConfig([]string{"--cluster", "c", "--grants-fixture", "g", "--namespace", "n", "--assignments", "a"}, envOf(nil), io.Discard)
@@ -272,7 +271,7 @@ func TestParseConfigAuthz(t *testing.T) {
 func TestParseConfigAuthzRejects(t *testing.T) {
 	base := []string{"--cluster", "c", "--grants-fixture", "g", "--namespace", "n"}
 	with := func(args ...string) []string { return append(append([]string{}, base...), args...) }
-	spicedb := []string{"--authz-backend", "spicedb", "--spicedb-endpoint", "e", "--spicedb-token-file", "t"}
+	spicedb := []string{"--authz-backend", "spicedb", "--spicedb-endpoint", "e"}
 	tests := map[string]struct {
 		args []string
 		want string
@@ -280,17 +279,17 @@ func TestParseConfigAuthzRejects(t *testing.T) {
 		"unknown backend":            {with("--authz-backend", "ldap", "--assignments", "a"), "not static or spicedb"},
 		"static without assignments": {with(), "--assignments is required"},
 		"static with endpoint":       {with("--assignments", "a", "--spicedb-endpoint", "e"), "need --authz-backend spicedb"},
-		"static with token file":     {with("--assignments", "a", "--spicedb-token-file", "t"), "need --authz-backend spicedb"},
-		"static with ca":             {with("--assignments", "a", "--spicedb-ca", "ca"), "need --authz-backend spicedb"},
-		"static with insecure":       {with("--assignments", "a", "--spicedb-insecure"), "need --authz-backend spicedb"},
-		"spicedb without endpoint":   {with("--authz-backend", "spicedb", "--spicedb-token-file", "t"), "--spicedb-endpoint is required"},
-		"spicedb without token file": {with("--authz-backend", "spicedb", "--spicedb-endpoint", "e"), "--spicedb-token-file is required"},
+		"static with server id":      {with("--assignments", "a", "--spicedb-server-spiffe-id", "/ns/a/sa/b"), "need --authz-backend spicedb"},
+		"spicedb without endpoint":   {with("--authz-backend", "spicedb"), "--spicedb-endpoint is required"},
+		"spicedb without namespace":  {[]string{"--cluster", "c", "--grants-fixture", "g", "--agent-spiffe-id", "spiffe://td/a", "--authz-backend", "spicedb", "--spicedb-endpoint", "e"}, "derive the SpiceDB gateway's SPIFFE ID"},
+		"bad server id":              {with(append(spicedb, "--spicedb-server-spiffe-id", "https://x/y")...), "--spicedb-server-spiffe-id"},
+		"bad server path":            {with(append(spicedb, "--spicedb-server-spiffe-id", "/ns/../sa")...), "--spicedb-server-spiffe-id"},
+		"server is a trust domain":   {with(append(spicedb, "--spicedb-server-spiffe-id", "spiffe://td")...), "names a trust domain"},
 		"spicedb with assignments":   {with(append(spicedb, "--assignments", "a")...), "--assignments needs --authz-backend static"},
 		"spicedb with published":     {with(append(spicedb, "--assignments-source", "published")...), "--assignments-source published needs --authz-backend static"},
 		"unknown source":             {with("--assignments-source", "git", "--assignments", "a"), `--assignments-source "git" is not file or published`},
 		"published and a file":       {with("--assignments-source", "published", "--assignments", "a"), "are exclusive"},
 		"published without a bundle": {with("--assignments-source", "published"), "needs --bundle-source"},
-		"insecure with ca":           {with(append(spicedb, "--spicedb-insecure", "--spicedb-ca", "ca")...), "excludes --spicedb-ca"},
 		"zero timeout":               {with(append(spicedb, "--spicedb-timeout", "0s")...), "not positive"},
 	}
 	for name, tc := range tests {

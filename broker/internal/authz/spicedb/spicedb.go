@@ -303,7 +303,7 @@ func resourceName(resp *v1.LookupResourcesResponse) (string, error) {
 }
 
 // tagsOf sets the service and team tags: the one service the subject is a
-// member of, and that service's owner. A subject in several services gets
+// member of, and that service's team (service#team). A subject in several services gets
 // neither tag.
 func (s *Store) tagsOf(ctx context.Context, subject authz.Subject, consistency *v1.Consistency, d *authz.Decision) error {
 	rels, _, err := s.readRelationships(ctx, consistency, &v1.RelationshipFilter{
@@ -333,14 +333,14 @@ func (s *Store) tagsOf(ctx context.Context, subject authz.Subject, consistency *
 	owners, _, err := s.readRelationships(ctx, consistency, &v1.RelationshipFilter{
 		ResourceType:       schema.TypeService,
 		OptionalResourceId: service,
-		OptionalRelation:   schema.RelationOwner,
+		OptionalRelation:   schema.RelationTeam,
 	})
 	if err != nil {
-		return fmt.Errorf("spicedb: owner of service %s: %w", service, err)
+		return fmt.Errorf("spicedb: team of service %s: %w", service, err)
 	}
 	teams := subjectIDs(owners)
 	if len(teams) != 1 {
-		d.Trace = append(d.Trace, fmt.Sprintf("service %s has %d owners; no team tag", service, len(teams)))
+		d.Trace = append(d.Trace, fmt.Sprintf("service %s has %d teams; no team tag", service, len(teams)))
 		return nil
 	}
 	d.Tags["team"] = teams[0]
@@ -432,17 +432,31 @@ func changeOf(rel *v1.Relationship, token authz.Token) (authz.Change, bool) {
 			Grant:   resource.GetObjectId(),
 			Token:   token,
 		}, true
+	case !accessRelation(resource.GetObjectType(), relation):
+		// The write path's relations (owner, approver, sensitive) and its
+		// pending requests: nothing the broker reads.
+		return authz.Change{}, false
 	case slices.Contains(schema.ResourceTypes, resource.GetObjectType()) && rel.GetSubject().GetObject().GetObjectType() == schema.TypeWorkload:
 		// A workload's relation to a resource: its sessions, whatever
 		// their grants, since any lookup grant of the kind may change.
 		return authz.Change{Subject: authz.Subject{ID: rel.GetSubject().GetObject().GetObjectId()}, Token: token}, true
 	case slices.Contains(schema.ResourceTypes, resource.GetObjectType()),
 		resource.GetObjectType() == schema.TypeGrant && relation == schema.RelationAssigneeService,
-		resource.GetObjectType() == schema.TypeService && (relation == schema.RelationMember || relation == schema.RelationOwner),
+		resource.GetObjectType() == schema.TypeService && (relation == schema.RelationMember || relation == schema.RelationTeam),
 		resource.GetObjectType() == schema.TypeWorkload && relation == schema.RelationSuspended:
 		return authz.Change{Token: token}, true
 	}
 	return authz.Change{}, false
+}
+
+// accessRelation is false for a relation of a resource type the broker
+// does not read: anything of a resource type (Level 3) but reader and
+// writer. Every other relationship is left to changeOf.
+func accessRelation(objectType, relation string) bool {
+	if !slices.Contains(schema.ResourceTypes, objectType) {
+		return true
+	}
+	return relation == schema.RelationReader || relation == schema.RelationWriter
 }
 
 // consistencyOf maps the contract's consistency to SpiceDB's. A token that

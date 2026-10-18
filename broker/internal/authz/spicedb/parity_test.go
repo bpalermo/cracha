@@ -84,7 +84,7 @@ func relationships() []rel {
 		bothBucket,
 		parseRel("s3_bucket:data-raw#writer@workload:prod/payments/suspended"),
 		parseRel("dynamodb_table:Ledger_5fIndex_2ev2#writer@workload:prod/payments/lonely"),
-		parseRel("service:payments-api#owner@team:payments"),
+		parseRel("service:payments-api#team@team:payments"),
 		parseRel("service:payments-api#member@workload:prod/payments/ledger"),
 		parseRel("service:payments-api#member@workload:prod/payments/worker"),
 		parseRel("grant:payments-ledger-rw#assignee_service@service:payments-api"),

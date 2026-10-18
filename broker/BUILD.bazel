@@ -28,12 +28,15 @@ go_library(
         "//broker/internal/sts",
         "//common/grant",
         "//common/idenc",
+        "//common/spicedb/conn",
         "//common/version",
         "@com_github_aws_aws_sdk_go_v2//aws",
         "@com_github_aws_aws_sdk_go_v2_config//:config",
         "@com_github_aws_aws_sdk_go_v2_service_kms//:kms",
         "@com_github_aws_aws_sdk_go_v2_service_s3//:s3",
+        "@com_github_spiffe_go_spiffe_v2//bundle/x509bundle",
         "@com_github_spiffe_go_spiffe_v2//spiffeid",
+        "@com_github_spiffe_go_spiffe_v2//svid/x509svid",
         "@com_github_spiffe_go_spiffe_v2//workloadapi",
     ],
 )
@@ -67,5 +70,9 @@ go_test(
     deps = [
         "//broker/internal/authz",
         "//common/grant",
+        "//common/spiffetest",
+        "@com_github_spiffe_go_spiffe_v2//bundle/x509bundle",
+        "@com_github_spiffe_go_spiffe_v2//spiffeid",
+        "@com_github_spiffe_go_spiffe_v2//svid/x509svid",
     ],
 )

@@ -4,43 +4,70 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
 
 	"github.com/bpalermo/cracha/common/spicedb"
-	"github.com/bpalermo/cracha/reconciler/internal/fakespicedb"
+	"github.com/bpalermo/cracha/common/spiffetest"
 )
 
-// fakeDial hands every command the same fake, recording the flags it was
-// given.
-func fakeDial(c *fakespicedb.Client) (dialer, *connFlags) {
+const (
+	gatewayID    = "spiffe://cracha.test/ns/cracha-system/sa/cracha-spicedb"
+	reconcilerID = "spiffe://cracha.test/ns/cracha-system/sa/cracha-reconciler"
+)
+
+// fakeSchema is SpiceDB's SchemaService: it holds what was written, and
+// answers ReadSchema with readBack when set.
+type fakeSchema struct {
+	v1.SchemaServiceClient
+	written  []string
+	readBack *string
+	err      error
+}
+
+func (f *fakeSchema) WriteSchema(_ context.Context, in *v1.WriteSchemaRequest, _ ...grpc.CallOption) (*v1.WriteSchemaResponse, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	f.written = append(f.written, in.GetSchema())
+	return &v1.WriteSchemaResponse{}, nil
+}
+
+func (f *fakeSchema) ReadSchema(context.Context, *v1.ReadSchemaRequest, ...grpc.CallOption) (*v1.ReadSchemaResponse, error) {
+	if f.readBack != nil {
+		return &v1.ReadSchemaResponse{SchemaText: *f.readBack}, nil
+	}
+	return &v1.ReadSchemaResponse{SchemaText: f.written[len(f.written)-1]}, nil
+}
+
+// fakeDial hands the command the fake, recording the flags it was given.
+func fakeDial(f *fakeSchema) (dialer, *connFlags) {
 	var got connFlags
-	return func(_ context.Context, f *connFlags) (*clients, error) {
-		got = *f
-		return &clients{permissions: c, schema: c, close: func() error { return nil }}, nil
+	return func(_ context.Context, cf *connFlags) (*session, error) {
+		got = *cf
+		return &session{schema: f, close: func() error { return nil }}, nil
 	}, &got
 }
 
 // noDial fails the test when a command connects.
 func noDial(t *testing.T) dialer {
-	return func(context.Context, *connFlags) (*clients, error) {
+	return func(context.Context, *connFlags) (*session, error) {
 		t.Error("the command connected to SpiceDB")
 		return nil, errors.New("no connection")
 	}
 }
 
-func writeToken(t *testing.T) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(path, []byte("secret\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
+var fileFlags = []string{"-endpoint", "gw:50051", "-server-spiffe-id", gatewayID, "-svid", "s.pem", "-svid-key", "k.pem", "-bundle", "b.pem"}
 
 func TestRunUsage(t *testing.T) {
 	tests := []struct {
@@ -53,11 +80,14 @@ func TestRunUsage(t *testing.T) {
 		{"unknown", []string{"nope"}, 2, `unknown command "nope"`},
 		{"help", []string{"help"}, 0, "usage:"},
 		{"version", []string{"--version"}, 0, "cracha-reconciler "},
-		{"schema help", []string{"schema", "-h"}, 0, "-token-file"},
+		{"schema help", []string{"schema", "-h"}, 0, "-server-spiffe-id"},
 		{"schema argument", []string{"schema", "x"}, 2, "takes no arguments"},
-		{"schema no flags", []string{"schema"}, 2, "-endpoint and -token-file are required"},
-		{"apply no source", []string{"apply", "-endpoint", "e", "-token-file", "t"}, 2, "-source is required"},
-		{"apply no endpoint", []string{"apply", "-source", "testdata/good"}, 2, "-endpoint and -token-file are required"},
+		{"schema no flags", []string{"schema"}, 2, "-endpoint and -server-spiffe-id are required"},
+		{"schema bad id", []string{"schema", "-endpoint", "e", "-server-spiffe-id", "https://x"}, 2, "-server-spiffe-id"},
+		{"schema no svid", []string{"schema", "-endpoint", "e", "-server-spiffe-id", gatewayID}, 2, "give -workload-api, or -svid"},
+		{"schema partial files", []string{"schema", "-endpoint", "e", "-server-spiffe-id", gatewayID, "-svid", "s"}, 2, "give -workload-api, or -svid"},
+		{"schema both sources", append([]string{"schema", "-workload-api", "unix:///x"}, fileFlags...), 2, "-workload-api excludes"},
+		{"apply", []string{"apply", "-source", "grants"}, 2, "apply was removed"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -72,6 +102,17 @@ func TestRunUsage(t *testing.T) {
 	}
 }
 
+// apply names the access service, the one writer of relationships.
+func TestApplyRefuses(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"apply"}, &stdout, &stderr, noDial(t)); code != 2 {
+		t.Fatalf("exit %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "cracha-access") || !strings.Contains(stderr.String(), "schema only") {
+		t.Errorf("stderr = %q", stderr.String())
+	}
+}
+
 func TestSchemaDryRunPrints(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"schema", "-dry-run"}, &stdout, &stderr, noDial(t)); code != 0 {
@@ -83,151 +124,131 @@ func TestSchemaDryRunPrints(t *testing.T) {
 }
 
 func TestSchemaWrites(t *testing.T) {
-	c := fakespicedb.New()
-	dial, flags := fakeDial(c)
+	f := &fakeSchema{}
+	dial, flags := fakeDial(f)
 	var stdout, stderr bytes.Buffer
-	args := []string{"schema", "-endpoint", "localhost:50051", "-token-file", "t", "-ca", "ca.pem", "-insecure"}
-	if code := run(args, &stdout, &stderr, dial); code != 0 {
+	if code := run(append([]string{"schema"}, fileFlags...), &stdout, &stderr, dial); code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr.String())
 	}
-	if c.SchemaWrites != 1 || c.Schema != spicedb.Schema {
-		t.Errorf("schema writes = %d", c.SchemaWrites)
+	if len(f.written) != 1 || f.written[0] != spicedb.Schema {
+		t.Errorf("schema writes = %d", len(f.written))
 	}
-	if flags.endpoint != "localhost:50051" || flags.tokenFile != "t" || flags.ca != "ca.pem" || !flags.insecure {
+	if flags.endpoint != "gw:50051" || flags.server != gatewayID || flags.svid != "s.pem" || flags.svidKey != "k.pem" || flags.bundle != "b.pem" {
 		t.Errorf("flags = %+v", *flags)
 	}
-	if !strings.Contains(stdout.String(), "wrote the schema to localhost:50051") {
+	if !strings.Contains(stdout.String(), "wrote the schema to gw:50051") {
 		t.Errorf("stdout = %q", stdout.String())
 	}
 }
 
-func TestApplyRejectedTree(t *testing.T) {
-	for _, source := range []string{"testdata/rejected", "testdata/missing"} {
-		var stdout, stderr bytes.Buffer
-		args := []string{"apply", "-source", source, "-endpoint", "e", "-token-file", "t"}
-		if code := run(args, &stdout, &stderr, noDial(t)); code != 1 {
-			t.Errorf("%s: exit %d, want 1; stderr: %s", source, code, stderr.String())
-		}
-		if !strings.Contains(stderr.String(), "source tree rejected") {
-			t.Errorf("%s: stderr = %q", source, stderr.String())
-		}
-	}
-}
-
-func TestApply(t *testing.T) {
-	c := fakespicedb.New()
-	dial, _ := fakeDial(c)
-	args := []string{"apply", "-source", "testdata/good", "-endpoint", "e", "-token-file", "t"}
-
+// SpiceDB formats the schema it reads back its own way: what counts is
+// that it declares every definition and caveat written.
+func TestSchemaReadBack(t *testing.T) {
+	formatted := strings.ReplaceAll(spicedb.Schema, "  ", "\t")
+	f := &fakeSchema{readBack: &formatted}
+	dial, _ := fakeDial(f)
 	var stdout, stderr bytes.Buffer
-	if code := run(append(args, "-dry-run"), &stdout, &stderr, dial); code != 0 {
-		t.Fatalf("dry run: exit %d: %s", code, stderr.String())
+	if code := run(append([]string{"schema"}, fileFlags...), &stdout, &stderr, dial); code != 0 {
+		t.Fatalf("a reformatted schema: exit %d: %s", code, stderr.String())
 	}
-	if len(c.Writes) != 0 || len(c.Relationships()) != 0 || !strings.Contains(stdout.String(), "dry run: 7 relationships to write and 0 to delete; nothing written") {
-		t.Errorf("dry run: writes = %d, stdout = %q", len(c.Writes), stdout.String())
-	}
-	if !strings.Contains(stderr.String(), "msg=touch relationship=grant:ledger-r#assignee_service@service:payments-api") {
-		t.Errorf("dry run: stderr does not log the diff: %q", stderr.String())
-	}
-
-	stdout.Reset()
+	older := "definition team {}\n\ndefinition service {}\n"
+	f = &fakeSchema{readBack: &older}
+	dial, _ = fakeDial(f)
 	stderr.Reset()
-	if code := run(args, &stdout, &stderr, dial); code != 0 {
-		t.Fatalf("apply: exit %d: %s", code, stderr.String())
+	if code := run(append([]string{"schema"}, fileFlags...), &stdout, &stderr, dial); code != 1 {
+		t.Fatalf("an older schema: exit %d, want 1: %s", code, stderr.String())
 	}
-	if len(c.Writes) != 1 || len(c.Relationships()) != 7 || !strings.Contains(stdout.String(), "wrote 7 of 7 updates (7 to write, 0 to delete) in 1 batches, at rev-1") {
-		t.Errorf("apply: writes = %d, held = %d, stdout = %q", len(c.Writes), len(c.Relationships()), stdout.String())
-	}
-
-	stdout.Reset()
-	if code := run(args, &stdout, &stderr, dial); code != 0 {
-		t.Fatalf("second apply: exit %d: %s", code, stderr.String())
-	}
-	if len(c.Writes) != 1 || !strings.Contains(stdout.String(), "nothing to change") {
-		t.Errorf("second apply: writes = %d, stdout = %q", len(c.Writes), stdout.String())
+	if !strings.Contains(stderr.String(), "definition pending_request") {
+		t.Errorf("stderr = %q, want the missing definitions named", stderr.String())
 	}
 }
 
-func TestApplyWriteFails(t *testing.T) {
-	c := fakespicedb.New()
-	c.FailWrite = 1
-	dial, _ := fakeDial(c)
+func TestSchemaWriteFails(t *testing.T) {
+	f := &fakeSchema{err: errors.New("PERMISSION_DENIED")}
+	dial, _ := fakeDial(f)
 	var stdout, stderr bytes.Buffer
-	args := []string{"apply", "-source", "testdata/good", "-endpoint", "e", "-token-file", "t"}
+	if code := run(append([]string{"schema"}, fileFlags...), &stdout, &stderr, dial); code != 2 {
+		t.Fatalf("exit %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "write schema: PERMISSION_DENIED") {
+		t.Errorf("stderr = %q", stderr.String())
+	}
+}
+
+// gateway is SpiceDB's SchemaService behind SPIFFE mTLS, recording the
+// client's SPIFFE ID.
+type gateway struct {
+	v1.UnimplementedSchemaServiceServer
+	schema string
+	client string
+}
+
+func (g *gateway) WriteSchema(ctx context.Context, in *v1.WriteSchemaRequest) (*v1.WriteSchemaResponse, error) {
+	if p, ok := peer.FromContext(ctx); ok {
+		if id, err := x509svid.IDFromCert(p.AuthInfo.(credentials.TLSInfo).State.PeerCertificates[0]); err == nil {
+			g.client = id.String()
+		}
+	}
+	g.schema = in.GetSchema()
+	return &v1.WriteSchemaResponse{}, nil
+}
+
+func (g *gateway) ReadSchema(context.Context, *v1.ReadSchemaRequest) (*v1.ReadSchemaResponse, error) {
+	return &v1.ReadSchemaResponse{SchemaText: g.schema}, nil
+}
+
+func writePEM(t *testing.T, dir, name string, data []byte) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// The SVID files, as the issuer mints them, reach a gateway that verifies
+// the reconciler's SPIFFE ID, and the reconciler verifies the gateway's.
+func TestSchemaWithSVIDFiles(t *testing.T) {
+	ca := spiffetest.NewCA(t, "cracha.test")
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := &gateway{}
+	srv := grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsconfig.MTLSServerConfig(ca.SVID(t, gatewayID), ca.Bundle(), tlsconfig.AuthorizeAny()))))
+	v1.RegisterSchemaServiceServer(srv, g)
+	go func() { _ = srv.Serve(lis) }()
+	defer srv.Stop()
+
+	dir := t.TempDir()
+	certs, key, err := ca.SVID(t, reconcilerID).Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := ca.Bundle().Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"schema", "-endpoint", lis.Addr().String(), "-server-spiffe-id", gatewayID,
+		"-svid", writePEM(t, dir, "svid.pem", certs), "-svid-key", writePEM(t, dir, "key.pem", key), "-bundle", writePEM(t, dir, "bundle.pem", bundle)}
+	var stdout, stderr bytes.Buffer
+	if code := run(args, &stdout, &stderr, dial); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr.String())
+	}
+	if g.schema != spicedb.Schema || g.client != reconcilerID {
+		t.Errorf("the gateway got the schema %v from %q", g.schema == spicedb.Schema, g.client)
+	}
+
+	// Another gateway ID: refused at the handshake.
+	args[4] = "spiffe://cracha.test/ns/cracha-system/sa/impostor"
+	stderr.Reset()
 	if code := run(args, &stdout, &stderr, dial); code != 2 {
-		t.Errorf("exit %d, want 2", code)
+		t.Fatalf("an impostor gateway: exit %d, want 2", code)
 	}
-	if !strings.Contains(stdout.String(), "wrote 0 of 7 updates") || !strings.Contains(stderr.String(), "write batch 1 (7 updates) failed after 0 of 7") {
-		t.Errorf("stdout = %q, stderr = %q", stdout.String(), stderr.String())
-	}
-}
-
-func TestApplyDiverged(t *testing.T) {
-	c := fakespicedb.New()
-	c.Intruder = &v1.Relationship{
-		Resource: &v1.ObjectReference{ObjectType: spicedb.TypeGrant, ObjectId: "ghost"},
-		Relation: spicedb.RelationAccount,
-		Subject:  &v1.SubjectReference{Object: &v1.ObjectReference{ObjectType: spicedb.TypeAWSAccount, ObjectId: "111122223333"}},
-	}
-	dial, _ := fakeDial(c)
-	var stdout, stderr bytes.Buffer
-	args := []string{"apply", "-source", "testdata/good", "-endpoint", "e", "-token-file", "t"}
-	if code := run(args, &stdout, &stderr, dial); code != 1 {
-		t.Errorf("exit %d, want 1; stderr: %s", code, stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "wrote 7 of 7 updates") || !strings.Contains(stderr.String(), "SpiceDB differs from the source after the write: by 1 relationships, such as extra grant:ghost#account@aws_account:111122223333") {
-		t.Errorf("stdout = %q, stderr = %q", stdout.String(), stderr.String())
-	}
-}
-
-func TestDial(t *testing.T) {
-	token := writeToken(t)
-	empty := filepath.Join(t.TempDir(), "empty")
-	if err := os.WriteFile(empty, []byte(" \n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	notPEM := filepath.Join(t.TempDir(), "ca.pem")
-	if err := os.WriteFile(notPEM, []byte("not a certificate"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	tests := []struct {
-		name  string
-		flags connFlags
-		want  string // error substring; empty for success
-	}{
-		{"insecure", connFlags{endpoint: "localhost:1", tokenFile: token, insecure: true}, ""},
-		{"tls with system roots", connFlags{endpoint: "localhost:1", tokenFile: token}, ""},
-		{"missing token", connFlags{endpoint: "localhost:1", tokenFile: filepath.Join(t.TempDir(), "none")}, "token file"},
-		{"empty token", connFlags{endpoint: "localhost:1", tokenFile: empty}, "is empty"},
-		{"missing ca", connFlags{endpoint: "localhost:1", tokenFile: token, ca: filepath.Join(t.TempDir(), "none")}, "ca:"},
-		{"ca not pem", connFlags{endpoint: "localhost:1", tokenFile: token, ca: notPEM}, "no certificate in"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c, err := dial(context.Background(), &tt.flags)
-			if tt.want == "" {
-				if err != nil {
-					t.Fatalf("dial: %v", err)
-				}
-				if err := c.close(); err != nil {
-					t.Errorf("close: %v", err)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), tt.want) {
-				t.Errorf("error = %v, want it to contain %q", err, tt.want)
-			}
-		})
-	}
-}
-
-func TestBearer(t *testing.T) {
-	b := bearer{token: "secret"}
-	md, err := b.GetRequestMetadata(context.Background())
-	if err != nil || md["authorization"] != "Bearer secret" {
-		t.Errorf("metadata = %v, %v", md, err)
-	}
-	if !b.RequireTransportSecurity() || (bearer{plaintext: true}).RequireTransportSecurity() {
-		t.Error("the key is sent in clear without -insecure, or refused with it")
+	// A missing file is an error before any connection.
+	args[4], args[6] = gatewayID, filepath.Join(dir, "none.pem")
+	stderr.Reset()
+	if code := run(args, &stdout, &stderr, dial); code != 2 || !strings.Contains(stderr.String(), "svid:") {
+		t.Fatalf("a missing SVID: exit %d: %s", code, stderr.String())
 	}
 }

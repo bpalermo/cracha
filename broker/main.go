@@ -77,7 +77,16 @@ func run(ctx context.Context, cfg config) error {
 	servers := newServers(cfg, probes)
 	servers.serve("health", servers.health.ListenAndServe)
 
-	store, err := newStore(cfg, log)
+	wl, err := connectWorkloadAPI(ctx, cfg.workloadAPISocket)
+	if err != nil {
+		return fmt.Errorf("workload api %s: %w", cfg.workloadAPISocket, err)
+	}
+	defer wl.Close()
+	svidReady.Set(wl.x509)
+
+	// The store after the Workload API: the SpiceDB backend reaches its
+	// gateway with the broker's own SVID.
+	store, err := newStore(cfg, wl.x509, log)
 	if err != nil {
 		return err
 	}
@@ -100,12 +109,6 @@ func run(ctx context.Context, cfg config) error {
 		probes.AddReadiness(src.ready)
 	}
 
-	wl, err := connectWorkloadAPI(ctx, cfg.workloadAPISocket)
-	if err != nil {
-		return fmt.Errorf("workload api %s: %w", cfg.workloadAPISocket, err)
-	}
-	defer wl.Close()
-	svidReady.Set(wl.x509)
 	agent, err := agentID(cfg, wl)
 	if err != nil {
 		return err
