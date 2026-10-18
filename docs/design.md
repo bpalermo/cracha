@@ -461,14 +461,14 @@ sequenceDiagram
     alt agent.enrol = init
         K->>P: start init container cracha-enrol (projected token, aud=cracha-agent)
         P->>N: POST http://hostIP:enrolPort/v1/enrol, bearer token
-        N->>N: TokenReview → pod UID; label check; CRI PodSandboxStatus → netns path
+        N->>N: TokenReview → pod UID, label check, CRI PodSandboxStatus → netns path
         N->>N: bind 127.0.0.1:port inside the pod's netns
         N-->>P: 200
         P->>P: connect to 127.0.0.1:port succeeds, init container exits
     else agent.enrol = cni
         K->>N: CNI ADD via cracha-cni over the Unix socket: netns path, pod reference
-        N->>N: label check; bind 127.0.0.1:port inside the netns path
-        N-->>K: ok (an error fails the sandbox; kubelet retries)
+        N->>N: label check, bind 127.0.0.1:port inside the netns path
+        N-->>K: ok (an error fails the sandbox, kubelet retries)
     end
     K->>P: start app containers (listener present)
 
@@ -478,7 +478,7 @@ sequenceDiagram
     N->>I: FetchJWTSVID(pod reference, aud=cracha-broker), retried on NotFound
     I-->>N: JWT-SVID (kept in memory)
     N->>B: GET /v1/credentials over SPIFFE mTLS<br/>Authorization: JWT-SVID
-    B->>B: client SVID is the agent's; verify signature, aud, exp, sub
+    B->>B: client SVID is the agent's, verify signature, aud, exp, sub
     B->>B: authz ListGrants, compose session policy, envelope check
     alt cache hit for (shape, grant set, bundle, workload)
         B-->>N: credentials + Cracha-* headers
