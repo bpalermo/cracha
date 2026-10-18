@@ -12,7 +12,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -654,7 +653,7 @@ func nodeCNI(ctx context.Context, t *testing.T, probe string) (conflists string,
 		{Name: "bin", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: cniBinDir}}},
 		{Name: "net-d", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: cniConfDir}}},
 	}
-	created := createPodAfterRollout(ctx, t, pod)
+	created := mustCreatePod(ctx, t, pod)
 	deletePodWhenDone(t, created.Name)
 	if _, err := waitForPodPhase(ctx, created.Name, corev1.PodSucceeded, corev1.PodFailed); err != nil {
 		t.Fatal(err)
@@ -664,40 +663,6 @@ func nodeCNI(ctx context.Context, t *testing.T, probe string) (conflists string,
 		t.Fatal(err)
 	}
 	return logs, strings.Contains(logs, "BINARY=present")
-}
-
-// createPodAfterRollout is mustCreatePod for the first pod after the
-// webhook rolled out: the apiserver's first call to the webhook can then
-// hang on a connection to the pod that went until its own timeout, which
-// it reports as an internal error on the create, failing closed. That is
-// the rollout's, not the switch's, so such a create is retried for a
-// while; any other failure is final.
-func createPodAfterRollout(ctx context.Context, t *testing.T, pod *corev1.Pod) *corev1.Pod {
-	t.Helper()
-	budget, cancel := context.WithTimeout(ctx, 90*time.Second)
-	defer cancel()
-	var created *corev1.Pod
-	err := eventually(budget, func() error {
-		var err error
-		created, err = createPod(ctx, pod)
-		if err != nil && apierrors.IsInternalError(err) && strings.Contains(err.Error(), "failed calling webhook") {
-			t.Logf("creating pod %s right after the webhook rolled out: %v; retrying", pod.Name, err)
-			return err
-		}
-		if err != nil {
-			t.Fatalf("creating pod %s: %v", pod.Name, err)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("creating pod %s after the webhook rolled out: %v", pod.Name, err)
-	}
-	t.Cleanup(func() {
-		if t.Failed() {
-			dumpDiagnostics(t, created.Name)
-		}
-	})
-	return created
 }
 
 // pluginOnNode asserts the node's CNI configuration has, or has not, the
