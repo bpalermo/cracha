@@ -423,6 +423,17 @@ webhook:
     - spire-mgmt
     - kube-system
 
+  # Labels a namespace must carry for the webhook to see its pods, on top of
+  # the exclusions above. Empty, the default, means every namespace that is
+  # not excluded. The webhook's failurePolicy is Fail, so while it is
+  # unreachable (its start, an outage) it refuses every pod of the
+  # namespaces it covers, wired or not; on a cluster shared with other
+  # workloads, name the namespaces that use Crachá by a label instead, for
+  # example
+  #   namespaceLabels:
+  #     cracha.dev/enabled: "true"
+  namespaceLabels: {}
+
   # The log level: debug, info, warn or error.
   logLevel: info
 

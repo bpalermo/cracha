@@ -41,7 +41,13 @@ webhooks:
     # issuer's namespaces (webhook.excludedNamespaces) are left out because
     # the webhook's certificate comes from the issuer's agent, which must
     # start without the webhook.
+    # webhook.namespaceLabels narrows it to the namespaces that opt in, so
+    # an unreachable webhook refuses only their pods.
     namespaceSelector:
+      {{- with .Values.webhook.namespaceLabels }}
+      matchLabels:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       matchExpressions:
         - key: kubernetes.io/metadata.name
           operator: NotIn

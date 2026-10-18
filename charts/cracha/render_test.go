@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -223,9 +224,10 @@ func TestWebhookConfiguration(t *testing.T) {
 	for _, tc := range []struct {
 		rendering, name string
 		excluded        []string
+		labels          map[string]any
 	}{
-		{"defaults", "cracha-webhook", []string{"default", "spire-system", "spire-server", "spire-mgmt", "kube-system"}},
-		{"overrides", "custom-webhook", []string{"default", "spire", "kube-system"}},
+		{"defaults", "cracha-webhook", []string{"default", "spire-system", "spire-server", "spire-mgmt", "kube-system"}, nil},
+		{"overrides", "custom-webhook", []string{"default", "spire", "kube-system"}, map[string]any{"cracha.dev/enabled": "true"}},
 	} {
 		t.Run(tc.rendering, func(t *testing.T) {
 			cfg := object(t, rendered(t, tc.rendering), "MutatingWebhookConfiguration", tc.name)
@@ -255,6 +257,10 @@ func TestWebhookConfiguration(t *testing.T) {
 			}
 			if got := stringList(path(exprs[0], "values")); !slices.Equal(got, tc.excluded) {
 				t.Errorf("excluded namespaces %q, want %q", got, tc.excluded)
+			}
+			got, _ := path(hook, "namespaceSelector", "matchLabels").(map[string]any)
+			if !maps.Equal(got, tc.labels) {
+				t.Errorf("namespaceSelector.matchLabels %v, want %v", got, tc.labels)
 			}
 		})
 	}

@@ -161,6 +161,8 @@ webhook:
   excludedNamespaces:
     - spire
     - kube-system
+  namespaceLabels:
+    cracha.dev/enabled: "true"
   logLevel: error
   priorityClassName: system-cluster-critical
   nodeSelector:
