@@ -2,11 +2,13 @@ apiVersion: v2
 name: cracha
 description: |
   Crachá issues AWS credentials to Kubernetes workloads from their SPIFFE
-  identity. A pod's AWS SDK reads a short-lived JWT-SVID from a file and
-  trades it with the broker for STS credentials; nothing in the pod changes.
+  identity. A pod's AWS SDK fetches them over loopback from a listener the
+  node agent binds inside the pod's network namespace; nothing in the pod
+  changes and nothing in it is trusted, mounted or protected.
 
-  This chart installs the credential broker, the CSI node plugin that writes
-  each pod's token, and the mutating webhook that wires opted-in pods up.
+  This chart installs the credential broker, the node agent that serves each
+  pod's loopback endpoint, and the mutating webhook that wires opted-in pods
+  up.
 type: application
 # The template of the chart's Chart.yaml: :chart_yaml writes @VERSION@ and
 # @APP_VERSION@ from the workspace status (bazel/workspace_status.sh) at build
@@ -23,6 +25,6 @@ keywords:
   - aws
   - credentials
   - spiffe
-  - csi
+  - loopback
 sources:
   - https://github.com/bpalermo/cracha

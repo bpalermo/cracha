@@ -2,7 +2,7 @@
 # one server with its data in memory, agents that attest with their projected
 # service account token, workloads identified by the pod they run in, and the
 # agent's SPIFFE Broker API endpoint (docs/design.md, section 4.2) open to
-# cracha-csi alone. Not how to run SPIRE in production.
+# cracha-agent alone. Not how to run SPIRE in production.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -47,8 +47,8 @@ subjects:
     namespace: spire
 ---
 # The agent asks kubelet which pod a calling process belongs to, resolves the
-# pods cracha-csi references through the Broker API, and, with the access
-# policy enforced, asks the apiserver whether cracha-csi may reference them.
+# pods cracha-agent references through the Broker API, and, with the access
+# policy enforced, asks the apiserver whether cracha-agent may reference them.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -75,13 +75,13 @@ subjects:
     namespace: spire
 ---
 # The broker authorization decision (section 4.2, access policy enforced):
-# the agent runs a SubjectAccessReview with cracha-csi's SPIFFE ID as the user
+# the agent runs a SubjectAccessReview with cracha-agent's SPIFFE ID as the user
 # and SPIRE's own verb on the referenced pod. This is what bounds which pods
-# cracha-csi may fetch tokens for.
+# cracha-agent may fetch tokens for.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: spire-agent-broker-impersonation-cracha-csi
+  name: spire-agent-broker-impersonation-cracha-agent
 rules:
   - apiGroups: [""]
     resources: ["pods"]
@@ -90,14 +90,14 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: spire-agent-broker-impersonation-cracha-csi
+  name: spire-agent-broker-impersonation-cracha-agent
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: spire-agent-broker-impersonation-cracha-csi
+  name: spire-agent-broker-impersonation-cracha-agent
 subjects:
   - kind: User
-    name: spiffe://cracha.test/ns/cracha-system/sa/cracha-csi
+    name: spiffe://cracha.test/ns/cracha-system/sa/cracha-agent
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -165,16 +165,16 @@ data:
       # than distributing its bundle first.
       insecure_bootstrap = true
       experimental {
-        # The SPIFFE Broker API endpoint cracha-csi fetches per-pod JWT-SVIDs
+        # The SPIFFE Broker API endpoint cracha-agent fetches per-pod JWT-SVIDs
         # from (docs/design.md, section 4.2). Its socket must not share a
-        # directory with the Workload API socket. cracha-csi, identified by
+        # directory with the Workload API socket. cracha-agent, identified by
         # the X509-SVID it presents, is the only broker, limited to
         # Kubernetes object references over the Unix socket.
         broker {
           socket_path = "/run/spire/broker/broker.sock"
           brokers = [
             {
-              id = "spiffe://cracha.test/ns/cracha-system/sa/cracha-csi"
+              id = "spiffe://cracha.test/ns/cracha-system/sa/cracha-agent"
               allowed_reference_types = [
                 {
                   type_url = "type.googleapis.com/spiffe.broker.KubernetesObjectReference"
@@ -200,7 +200,7 @@ data:
           node_name_env = "MY_NODE_NAME"
           skip_kubelet_verification = true
           experimental {
-            # Resolves the pods cracha-csi references and, enforced, lets
+            # Resolves the pods cracha-agent references and, enforced, lets
             # Kubernetes RBAC decide whether it may (the ClusterRole above).
             # The default reference scope, agent_node, limits it to pods
             # kubelet reports on this node.
@@ -208,7 +208,7 @@ data:
               access_policy = "enforced"
               brokers = [
                 {
-                  id = "spiffe://cracha.test/ns/cracha-system/sa/cracha-csi"
+                  id = "spiffe://cracha.test/ns/cracha-system/sa/cracha-agent"
                 }
               ]
             }
@@ -322,12 +322,12 @@ spec:
             name: spire-agent
         # Where the Workload API socket is shared with the pods of the node:
         # the broker verifies JWT-SVIDs against the bundle it serves, and
-        # cracha-csi gets its own identity from it.
+        # cracha-agent gets its own identity from it.
         - name: sockets
           hostPath:
             path: /run/spire/agent-sockets
             type: DirectoryOrCreate
-        # Where the Broker API socket is shared with cracha-csi, and with
+        # Where the Broker API socket is shared with cracha-agent, and with
         # nothing else.
         - name: broker-sockets
           hostPath:

@@ -1,4 +1,4 @@
-// Package jwttest mints unsigned JWT-SVIDs for tests. cracha-csi never
+// Package jwttest mints unsigned JWT-SVIDs for tests. cracha-agent never
 // verifies a signature (the broker does), so a token with a bogus signature
 // exercises every path the plugin has.
 package jwttest

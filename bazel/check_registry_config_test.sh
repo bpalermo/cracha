@@ -33,8 +33,8 @@ commit() {
 }
 
 host="$("${src}/registry.sh" host)"
-namespace="$("${src}/registry.sh" repo csi)"
-namespace="${namespace%/csi}"
+namespace="$("${src}/registry.sh" repo agent)"
+namespace="${namespace%/agent}"
 
 fail=0
 expect() {
@@ -54,7 +54,7 @@ expect "${clean}" 0 "the setting alone"
 
 literal="${work}/literal"
 fixture "${literal}"
-printf 'image: %s/%s/csi:dev\n' "${host}" "${namespace}" >"${literal}/manifest.yaml"
+printf 'image: %s/%s/agent:dev\n' "${host}" "${namespace}" >"${literal}/manifest.yaml"
 commit "${literal}"
 expect "${literal}" 1 "a registry literal in a tracked file"
 
@@ -63,7 +63,7 @@ expect "${literal}" 1 "a registry literal in a tracked file"
 untracked="${work}/untracked"
 fixture "${untracked}"
 commit "${untracked}"
-printf 'image: %s/%s/csi:dev\n' "${host}" "${namespace}" >"${untracked}/scratch.yaml"
+printf 'image: %s/%s/agent:dev\n' "${host}" "${namespace}" >"${untracked}/scratch.yaml"
 expect "${untracked}" 0 "a registry literal in an untracked file"
 
 readme="${work}/readme"
@@ -75,13 +75,13 @@ expect "${readme}" 0 "the README, which is allowed the literal"
 # A longer name that merely starts with the namespace is not the namespace.
 prefix="${work}/prefix"
 fixture "${prefix}"
-printf 'image: %s/%s-other/csi:dev\n' "${host}" "${namespace}" >"${prefix}/manifest.yaml"
+printf 'image: %s/%s-other/agent:dev\n' "${host}" "${namespace}" >"${prefix}/manifest.yaml"
 commit "${prefix}"
 expect "${prefix}" 0 "a namespace that only starts with ours"
 
 spelled="${work}/spelled"
 fixture "${spelled}"
-sed -i "s|\"{@//csi:image_push.repository}\"|\"${host}/${namespace}/csi\"|" "${spelled}/charts/cracha/values.yaml"
+sed -i "s|\"{@//agent:image_push.repository}\"|\"${host}/${namespace}/agent\"|" "${spelled}/charts/cracha/values.yaml"
 commit "${spelled}"
 expect "${spelled}" 1 "a chart default spelled out instead of derived"
 

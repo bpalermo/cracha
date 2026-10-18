@@ -14,8 +14,8 @@ cd "$(dirname "$0")/.."
 trust_domain="cracha.test"
 
 # The JWT-SVID lifetime of the test workloads, in seconds. The design caps a
-# token on disk at 5 minutes and cracha-csi refuses anything longer; the
-# suite's rotation test waits for a replacement, which cracha-csi writes at
+# token on disk at 5 minutes and cracha-agent refuses anything longer; the
+# suite's rotation test waits for a replacement, which cracha-agent writes at
 # the first kubelet republish after half the lifetime has passed. Kubelet
 # republishes every 60-90 s (its sync frequency with jitter), so the lifetime
 # must leave more than 90 s after its halfway point: 240 s does, and keeps
@@ -45,10 +45,10 @@ register() {
 # Every agent of this cluster, under one name the workloads can hang from.
 register "spiffe://${trust_domain}/node" -node -selector k8s_psat:cluster:cracha-e2e
 
-# Crachá's components: cracha-csi presents its X509-SVID to the agent's
+# Crachá's components: cracha-agent presents its X509-SVID to the agent's
 # Broker API endpoint, and the broker reads the trust bundle from the
 # Workload API, which only answers attested workloads.
-for sa in cracha-csi cracha-broker; do
+for sa in cracha-agent cracha-broker; do
 	register "spiffe://${trust_domain}/ns/cracha-system/sa/${sa}" \
 		-parentID "spiffe://${trust_domain}/node" \
 		-selector k8s:ns:cracha-system \

@@ -1,4 +1,4 @@
-// Package issuer is the identity issuer adapter contract of cracha-csi
+// Package issuer is the identity issuer adapter contract of cracha-agent
 // (docs/design.md, section 4.1): the one piece of the plugin that is not the
 // standard Workload API, a per-pod JWT-SVID fetch on the pod's behalf.
 //

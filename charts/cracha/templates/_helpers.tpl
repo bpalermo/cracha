@@ -13,7 +13,7 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- end -}}
 
 {{/*
-Selector labels of one component. Call with (dict "root" . "component" "csi").
+Selector labels of one component. Call with (dict "root" . "component" "agent").
 */}}
 {{- define "cracha.selectorLabels" -}}
 app.kubernetes.io/name: {{ include "cracha.name" .root }}
@@ -23,7 +23,7 @@ app.kubernetes.io/component: {{ .component }}
 
 {{/*
 An image reference: by digest when one is given, else by tag, else by the
-chart's appVersion. Call with (dict "root" . "image" .Values.csi.image).
+chart's appVersion. Call with (dict "root" . "image" .Values.agent.image).
 */}}
 {{- define "cracha.image" -}}
 {{- if .image.digest -}}

@@ -89,7 +89,7 @@ jobs:
         run: |
           bazel query --config=ci --noshow_progress 'set(
             //broker:image_push //broker:image_index
-            //csi:image_push //csi:image_index
+            //agent:image_push //agent:image_index
             //webhook:image_push //webhook:image_index
             //charts/cracha:cracha //charts/cracha:cracha.push_registry
             //bazel/cosign:cosign //bazel/cosign:verify_image)'
@@ -245,7 +245,7 @@ jobs:
 
   # End to end in a kind cluster: the images are built from this commit, loaded
   # into the node and exercised as pods against a SPIRE agent and an STS
-  # stand-in (e2e/run.sh). A CSI plugin, an admission webhook and the SDK's
+  # stand-in (e2e/run.sh). A node agent, an admission webhook and the SDK's
   # credential path can only be validated against a real kubelet and
   # apiserver, so this is where the system as deployed is tested; everything
   # else is unit tests. After `build`, so a change that does not compile never

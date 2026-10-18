@@ -7,8 +7,8 @@ go_library(
         "issuer.go",
         "retry.go",
     ],
-    importpath = "github.com/bpalermo/cracha/csi/internal/issuer",
-    visibility = ["//csi:__subpackages__"],
+    importpath = "github.com/bpalermo/cracha/agent/internal/issuer",
+    visibility = ["//agent:__subpackages__"],
 )
 
 go_test(

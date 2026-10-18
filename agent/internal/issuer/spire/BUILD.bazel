@@ -3,10 +3,10 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "spire",
     srcs = ["spire.go"],
-    importpath = "github.com/bpalermo/cracha/csi/internal/issuer/spire",
-    visibility = ["//csi:__subpackages__"],
+    importpath = "github.com/bpalermo/cracha/agent/internal/issuer/spire",
+    visibility = ["//agent:__subpackages__"],
     deps = [
-        "//csi/internal/issuer",
+        "//agent/internal/issuer",
         "@com_github_spiffe_go_spiffe_v2//bundle/x509bundle",
         "@com_github_spiffe_go_spiffe_v2//exp/proto/spiffe/broker",
         "@com_github_spiffe_go_spiffe_v2//spiffeid",
@@ -29,8 +29,8 @@ go_test(
     srcs = ["spire_test.go"],
     embed = [":spire"],
     deps = [
-        "//csi/internal/issuer",
-        "//csi/internal/jwttest",
+        "//agent/internal/issuer",
+        "//agent/internal/jwttest",
         "@com_github_spiffe_go_spiffe_v2//exp/proto/spiffe/broker",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//codes",

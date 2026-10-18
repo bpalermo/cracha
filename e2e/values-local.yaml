@@ -7,10 +7,10 @@ broker:
     tag: e2e
     digest: ""
     pullPolicy: Never
-csi:
+agent:
   image:
     <<: *local
-    repository: localhost/cracha-csi
+    repository: localhost/cracha-agent
 webhook:
   image:
     <<: *local

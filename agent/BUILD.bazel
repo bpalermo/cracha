@@ -1,0 +1,33 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+load("//bazel:registry.bzl", "IMAGE_REGISTRY", "image_repository")
+load("//bazel/image:defs.bzl", "go_image")
+
+go_library(
+    name = "agent_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/bpalermo/cracha/agent",
+    visibility = ["//visibility:private"],
+    deps = ["//common/version"],
+)
+
+go_binary(
+    name = "agent",
+    basename = "cracha-agent",
+    embed = [":agent_lib"],
+    # Pure Go: the image binary is cross-built for linux with cgo off.
+    pure = "on",
+    visibility = ["//visibility:public"],
+)
+
+go_image(
+    name = "image",
+    base = "@distroless_static",
+    binary = ":agent",
+    load_tag = "localhost/cracha-agent:e2e",
+    path = "/cracha-agent",
+    registry = IMAGE_REGISTRY,
+    repository = image_repository("agent"),
+    # Root: setns into a pod's network namespace needs CAP_SYS_ADMIN, which
+    # the runtime grants the container's process only as uid 0.
+    user = "0",
+)

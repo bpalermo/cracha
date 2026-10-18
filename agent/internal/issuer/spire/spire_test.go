@@ -14,8 +14,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
-	"github.com/bpalermo/cracha/csi/internal/issuer"
-	"github.com/bpalermo/cracha/csi/internal/jwttest"
+	"github.com/bpalermo/cracha/agent/internal/issuer"
+	"github.com/bpalermo/cracha/agent/internal/jwttest"
 )
 
 // fakeBroker is a Broker API server answering FetchJWTSVID from a function.

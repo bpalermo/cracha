@@ -2,7 +2,7 @@
 // per-pod JWT-SVIDs through the SPIFFE Broker API served by the node's SPIRE
 // agent, authenticated with the plugin's own X509-SVID from the Workload API.
 //
-// It is the only package of cracha-csi that imports the Broker API; the rest
+// It is the only package of cracha-agent that imports the Broker API; the rest
 // of the plugin sees issuer.Issuer.
 package spire
 
@@ -31,7 +31,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/bpalermo/cracha/csi/internal/issuer"
+	"github.com/bpalermo/cracha/agent/internal/issuer"
 )
 
 // Every request to a SPIFFE Broker Endpoint must carry this metadata. It is an

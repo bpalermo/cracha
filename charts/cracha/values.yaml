@@ -1,5 +1,5 @@
 # Overrides the name used for the chart's resources (default: the chart name).
-# The Services are <name>-broker and <name>-webhook, the DaemonSet <name>-csi.
+# The Services are <name>-broker and <name>-webhook, the DaemonSet <name>-agent.
 nameOverride: ""
 
 # Pull secrets added to every pod of the chart.
@@ -227,77 +227,10 @@ broker:
   resources: {}
   podAnnotations: {}
 
-# The CSI node plugin (design 7), one pod per node: writes each pod's JWT-SVID
-# where the SDK reads it, before the pod's containers start, and rotates it.
-csi:
-  image:
-    repository: "{@//csi:image_push.repository}"
-    tag: ""
-    digest: "{@//csi:image_push.digest}"
-    pullPolicy: IfNotPresent
-
-  # The sidecar that registers the plugin's socket with kubelet.
-  registrar:
-    image:
-      repository: registry.k8s.io/sig-storage/csi-node-driver-registrar
-      tag: v2.18.0
-      digest: sha256:b7fefd08651f00ac4df1a196ed4c621c2451fbb899297fe9fad9e36c667af0c0
-      pullPolicy: IfNotPresent
-    resources: {}
-
-  # kubelet's root directory on the nodes. /var/lib/kubelet on most
-  # distributions; some (k0s, MicroK8s, ...) use another path. The plugin
-  # directory and the pods directory under it are mounted into the plugin,
-  # the latter at the same path as on the host.
-  kubeletDir: /var/lib/kubelet
-
-  # The identity issuer's two sockets on each node, from a SPIRE agent
-  # (design 4.2): the Workload API, for the plugin's own identity, and the
-  # Broker API, which hands out the pods' JWT-SVIDs. Each is a host
-  # directory and the socket's file name in it; both are mounted read-only.
-  workloadAPI:
-    hostPath: /run/spire/agent-sockets
-    socket: spire-agent.sock
-  brokerAPI:
-    hostPath: /run/spire/broker-sockets
-    socket: broker.sock
-
-  # The longest JWT-SVID lifetime written to disk; a longer token is refused.
-  # The design caps it at 5m (section 11); the plugin refuses anything
-  # above, so this can only tighten it.
-  maxTokenTTL: 5m
-
-  # How long one NodePublishVolume retries a pod the issuer does not know yet
-  # or an issuer that is unavailable, before failing the mount (kubelet
-  # retries the mount itself after that).
-  publishDeadline: 30s
-
-  # The owner of the token file in each pod's volume. The file is 0640, and
-  # its group is the pod's fsGroup whenever the pod sets one: that is how a
-  # non-root workload reads it, so set securityContext.fsGroup on pods. These
-  # two are the fallback for a pod without an fsGroup, which then reads the
-  # file only as this uid or gid. 0 is root; -1 keeps the plugin's own.
-  tokenUid: 0
-  tokenGid: 0
-
-  # The port of the plugin's /healthz, for the liveness probe.
-  healthzPort: 9808
-
-  # The log level: debug, info, warn or error.
-  logLevel: info
-
-  priorityClassName: system-node-critical
-
-  # Tokens must be written on every node pods can run on.
-  tolerations:
-    - operator: Exists
-
-  nodeSelector: {}
-  resources: {}
-  podAnnotations: {}
-
-# The node agent (design 7). These are the values the webhook reads; the
-# agent slice owns the block and its DaemonSet, and defines the rest of it.
+# The node agent (design 7), one pod per node: serves the AWS SDK's credential
+# requests over a loopback listener it binds inside each enrolled pod's
+# network namespace, with an answer the broker issued for that pod's
+# identity.
 agent:
   image:
     repository: "{@//agent:image_push.repository}"
@@ -305,26 +238,20 @@ agent:
     digest: "{@//agent:image_push.digest}"
     pullPolicy: IfNotPresent
 
-  # The port of the loopback listener the agent binds inside every enrolled
-  # pod's network namespace (design 7.1), the same in every pod: the webhook
-  # writes http://127.0.0.1:<port>/v1/credentials into
-  # AWS_CONTAINER_CREDENTIALS_FULL_URI.
-  port: 8780
+  # The port of the loopback listener, the same in every pod; the webhook
+  # writes it into AWS_CONTAINER_CREDENTIALS_FULL_URI (design 7.1).
+  port: 9797
 
-  # How a new pod's listener gets bound (design 7.2):
-  #   init  the webhook injects the init container cracha-enrol, which calls
-  #         the agent on the node's address with a projected token; needs
-  #         nothing of the node but the agent.
-  #   cni   a chained CNI plugin the agent installs on every node enrols the
-  #         pod on its sandbox; nothing enters the pod spec but the
-  #         environment and the label.
+  # How a new pod's listener is bound before its app containers start
+  # (design 7.2): init (the webhook injects the cracha-enrol init container,
+  # which calls the agent's enrolment endpoint) or cni.
   enrol: init
 
-  # With enrol init: the port of the agent's enrolment endpoint on the
-  # node's address (host network), and how long the init container retries
-  # enrolment before it fails and kubelet restarts it.
-  enrolPort: 8781
-  enrolTimeout: 60s
+  # With enrol init: the port of the enrolment endpoint on every node's
+  # address, and how long the init container keeps trying before it exits
+  # non-zero and kubelet restarts it (fail closed).
+  enrolPort: 9798
+  enrolTimeout: 2m
 
 # The mutating webhook (design 7.5): for pods whose ServiceAccount opts in,
 # the loopback credentials endpoint in every container's environment, the
