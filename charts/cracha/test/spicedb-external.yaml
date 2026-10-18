@@ -1,0 +1,9 @@
+# The spicedb backend against a gateway the install runs itself: the
+# chart's SpiceDB off, the endpoint given.
+broker:
+  authz:
+    backend: spicedb
+    spicedb:
+      endpoint: spicedb.authz.svc:50051
+spicedb:
+  enabled: false

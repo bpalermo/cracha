@@ -1,0 +1,11 @@
+# The chart's SpiceDB as kind runs it: the memory datastore, one replica,
+# every identity by default from the trust domain.
+broker:
+  authz:
+    backend: spicedb
+spicedb:
+  replicas: 1
+  presharedKeySecret:
+    name: spicedb-key
+  gateway:
+    trustDomain: cracha.test

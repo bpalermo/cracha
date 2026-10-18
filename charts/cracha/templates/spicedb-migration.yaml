@@ -1,0 +1,75 @@
+{{- if include "cracha.spicedbEnabled" . }}
+{{- $s := .Values.spicedb -}}
+{{- if and $s.migration.enabled (ne (include "cracha.spicedbEngine" .) "memory") }}
+# The one owner of the datastore's migrations (design 6.4): `spicedb migrate
+# head` before an install or an upgrade starts the new pods, which never
+# migrate themselves. A failed migration fails the release.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "cracha.name" . }}-spicedb-migrate
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: spicedb-migrate
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        {{- include "cracha.labels" . | nindent 8 }}
+        app.kubernetes.io/component: spicedb-migrate
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: migrate
+          image: {{ include "cracha.image" (dict "root" . "image" $s.image) }}
+          imagePullPolicy: {{ $s.image.pullPolicy }}
+          args:
+            - migrate
+            - head
+            - --datastore-engine={{ include "cracha.spicedbEngine" . }}
+            - --migration-timeout={{ $s.migration.timeout }}
+            - --log-format=json
+            - --log-level={{ $s.logLevel }}
+          env:
+            {{- include "cracha.spicedbDatastoreEnv" . | nindent 12 }}
+          securityContext:
+            {{- include "cracha.restrictedSecurityContext" . | nindent 12 }}
+          {{- with $s.migration.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with (include "cracha.spicedbDatastoreMounts" .) }}
+          volumeMounts:
+            {{- . | nindent 12 }}
+          {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with (include "cracha.spicedbDatastoreVolumes" .) }}
+      volumes:
+        {{- . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- end }}
