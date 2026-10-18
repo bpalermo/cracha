@@ -19,6 +19,7 @@
 #       AGENT_IMAGE              image_reference("agent")
 #       WEBHOOK_IMAGE            image_reference("webhook")
 #       SPICEDB_IMAGE            image_reference("spicedb")
+#       ACCESS_IMAGE             image_reference("access")
 #       CHART_REPOSITORY         chart_registry_url("cracha")
 #       IMAGE_SIGNATURE_LAYOUT   referrer | tag
 #   registry.sh host                the registry host alone
@@ -69,6 +70,7 @@ env)
 	printf 'AGENT_IMAGE=%s/%s/agent\n' "$host" "$namespace"
 	printf 'WEBHOOK_IMAGE=%s/%s/webhook\n' "$host" "$namespace"
 	printf 'SPICEDB_IMAGE=%s/%s/spicedb\n' "$host" "$namespace"
+	printf 'ACCESS_IMAGE=%s/%s/access\n' "$host" "$namespace"
 	printf 'CHART_REPOSITORY=%s/%s/cracha\n' "$host" "$namespace"
 	printf 'IMAGE_SIGNATURE_LAYOUT=%s\n' "$layout"
 	;;

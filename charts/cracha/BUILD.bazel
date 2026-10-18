@@ -30,6 +30,7 @@ PINNED_COMPONENTS = [
     "broker",
     "agent",
     "webhook",
+    "access",
 ]
 
 # Chart.yaml, with its versions from the workspace status. rules_helm stamps
@@ -61,6 +62,7 @@ helm_chart(
         "//broker:image_push",
         "//agent:image_push",
         "//webhook:image_push",
+        "//access:image_push",
     ],
     registry_url = chart_push_url(),
     templates = glob(["templates/**"]),
@@ -111,7 +113,8 @@ helm_lint_test(
 # (overrides renders mysql), and an external gateway; the static backend
 # with an assignments ConfigMap the install keeps (the defaults render the
 # chart's own), and with its assignments from the publication (the
-# overrides render SpiceDB, which takes none).
+# overrides render SpiceDB, which takes none); cracha-access with its
+# defaults (the overrides render every knob of it).
 [
     helm_template_test(
         name = "cracha_%s_template_test" % name,
@@ -120,6 +123,7 @@ helm_lint_test(
         values = REQUIRED_VALUES + ["test/%s.yaml" % name],
     )
     for name in [
+        "access",
         "assignments-published",
         "bundle-kms",
         "bundle-secret",
@@ -174,6 +178,10 @@ helm_template_test(
             "spicedb_postgres",
             REQUIRED_VALUES + ["test/spicedb-postgres.yaml"],
         ),
+        (
+            "access",
+            REQUIRED_VALUES + ["test/access.yaml"],
+        ),
     ]
 ]
 
@@ -181,6 +189,7 @@ go_test(
     name = "cracha_test",
     size = "small",
     srcs = [
+        "access_test.go",
         "agent_test.go",
         "assignments_test.go",
         "rbac_test.go",
@@ -189,6 +198,7 @@ go_test(
         "volumes_test.go",
     ],
     data = [
+        ":rendered_access",
         ":rendered_cni",
         ":rendered_defaults",
         ":rendered_overrides",

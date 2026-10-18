@@ -1,0 +1,15 @@
+# cracha-access with its defaults, on top of the required values: SpiceDB
+# behind the chart's gateway, and the broker's S3 bundle verified with a
+# KMS key.
+broker:
+  authz:
+    backend: spicedb
+    spicedb:
+      endpoint: cracha-spicedb.cracha.svc:50051
+      tokenSecret:
+        name: spicedb-key
+  bundle:
+    source: s3://grant-bundles/cracha/prod
+    kmsKey: arn:aws:kms:eu-west-1:111122223333:key/0123abcd-0123-0123-0123-0123456789ab
+access:
+  enabled: true
