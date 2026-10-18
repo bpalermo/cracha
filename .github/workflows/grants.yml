@@ -1,0 +1,296 @@
+name: grants
+
+# The grant pipeline of design 6.2 for a repository that holds a grant source
+# tree and does not build Crachá: it runs a released grantc, verified first,
+# and in `publish` mode compiles, signs with a KMS key and publishes the
+# bundle to S3. docs/grants-repository.md has the callers and the AWS side.
+#
+#   check    lint (with Access Analyzer unless access-analyzer is false) and
+#            compile, publishing nothing: for pull requests.
+#   publish  the same, then sign with kms-key, verify the signature and
+#            publish to destination: for pushes to the default branch.
+#
+# The caller grants `id-token: write` and `contents: read`; a reusable
+# workflow can only narrow what its caller gives it. No job here runs in a
+# GitHub environment: an environment changes the OIDC token's subject to
+# `repo:<owner>/<repo>:environment:<name>`, and the roles' trust policies
+# name the branch or pull_request subject instead.
+#
+# Third-party actions are pinned to commit SHAs with the version beside each,
+# and so is everything downloaded: cosign by its sha256, grantc by the
+# checksums.txt its release signed.
+on:
+  workflow_call:
+    inputs:
+      grantc-version:
+        description: The Crachá release whose grantc to run, such as v0.1.0.
+        type: string
+        required: true
+      source:
+        description: The grant source tree, relative to the caller's checkout.
+        type: string
+        default: "."
+      mode:
+        description: check or publish.
+        type: string
+        required: true
+      aws-region:
+        description: The region of the AWS calls (Access Analyzer, KMS, S3).
+        type: string
+        default: ""
+      role-to-assume:
+        description: The IAM role ARN the job assumes through GitHub OIDC. Required in publish mode and for Access Analyzer.
+        type: string
+        default: ""
+      kms-key:
+        description: The KMS signing key, a key or alias ARN (publish only).
+        type: string
+        default: ""
+      destination:
+        description: Where to publish, s3://bucket/prefix (publish only).
+        type: string
+        default: ""
+      access-analyzer:
+        description: Run IAM Access Analyzer's ValidatePolicy and CheckNoNewAccess in the lint.
+        type: boolean
+        default: true
+    outputs:
+      bundle-version:
+        description: The version of the bundle compiled (and, in publish mode, published).
+        value: ${{ jobs.grants.outputs.bundle-version }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  grants:
+    name: grants (${{ inputs.mode }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    # Publications to one destination are serialized, so two merges cannot
+    # interleave their writes of `latest`; checks run side by side. Together
+    # with the refusal below to publish a commit that is no longer its
+    # branch's tip, the newest commit always wins `latest`.
+    concurrency:
+      group: ${{ inputs.mode == 'publish' && format('cracha-grants-publish-{0}', inputs.destination) || format('cracha-grants-check-{0}', github.run_id) }}
+      cancel-in-progress: false
+    outputs:
+      bundle-version: ${{ steps.compile.outputs.version }}
+    env:
+      # Where grantc comes from and who must have signed it. This is the
+      # Crachá repository, not the caller's (github.repository here is the
+      # caller).
+      GRANTC_REPOSITORY: bpalermo/cracha
+      GRANTC_VERSION: ${{ inputs.grantc-version }}
+      # The cosign that //bazel/cosign pins (rules_img_signer_cosign), as its
+      # release binaries; //bazel/cosign:workflow_pin_test fails when the two
+      # disagree.
+      COSIGN_VERSION: v3.1.2
+      COSIGN_SHA256_LINUX_AMD64: f7622ed3cf22e55e1ae6377c080979ff77a22da9981c11df222a2e444991e7cf
+      COSIGN_SHA256_LINUX_ARM64: 90e7ae0b5dfd60f20816b52c012addf7fc055ebcc7bea4ce81c428ca8518c302
+      MODE: ${{ inputs.mode }}
+      SOURCE: ${{ inputs.source }}
+      AWS_REGION_INPUT: ${{ inputs.aws-region }}
+      ROLE_TO_ASSUME: ${{ inputs.role-to-assume }}
+      KMS_KEY: ${{ inputs.kms-key }}
+      DESTINATION: ${{ inputs.destination }}
+      ACCESS_ANALYZER: ${{ inputs.access-analyzer }}
+    steps:
+      # Every input is checked before anything is downloaded or assumed, and
+      # inputs reach the scripts only through the environment, never spliced
+      # into them.
+      - name: Check the inputs
+        id: inputs
+        run: |
+          set -euo pipefail
+          err=0
+          bad() {
+            echo "::error::$*" >&2
+            err=1
+          }
+          [[ "${GRANTC_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]] ||
+            bad "grantc-version '${GRANTC_VERSION}' is not a Crachá release tag (vX.Y.Z or vX.Y.Z-rc.N)"
+          case "${MODE}" in
+            check | publish) ;;
+            *) bad "mode '${MODE}': want check or publish" ;;
+          esac
+          [[ "${SOURCE}" != /* && "${SOURCE}" != *..* ]] ||
+            bad "source '${SOURCE}' must be a path inside the checkout"
+          aws=false
+          if [ "${MODE}" = publish ] || [ "${ACCESS_ANALYZER}" = true ]; then
+            aws=true
+            [[ "${ROLE_TO_ASSUME}" =~ ^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$ ]] ||
+              bad "role-to-assume '${ROLE_TO_ASSUME}' is not an IAM role ARN (required in publish mode and for Access Analyzer)"
+            [[ "${AWS_REGION_INPUT}" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]] ||
+              bad "aws-region '${AWS_REGION_INPUT}' is not an AWS region"
+          fi
+          if [ "${MODE}" = publish ]; then
+            [[ "${KMS_KEY}" =~ ^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:(key|alias)/[A-Za-z0-9/_-]+$ ]] ||
+              bad "kms-key '${KMS_KEY}' is not a KMS key or alias ARN"
+            [[ "${DESTINATION}" =~ ^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9](/[A-Za-z0-9._/-]*)?$ ]] ||
+              bad "destination '${DESTINATION}' is not s3://bucket[/prefix]"
+            # Only a push to a branch publishes: a pull request's commit is
+            # not something the branch has been.
+            case "${GITHUB_EVENT_NAME}:${GITHUB_REF}" in
+              push:refs/heads/* | workflow_dispatch:refs/heads/*) ;;
+              *) bad "publish mode runs on a push to a branch, not ${GITHUB_EVENT_NAME} of ${GITHUB_REF}" ;;
+            esac
+          fi
+          if [ "${err}" != 0 ]; then
+            exit 1
+          fi
+          echo "aws=${aws}" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # A merge that a newer one has already superseded would otherwise move
+      # `latest` back to an older bundle when its run finishes last. Read
+      # through the API with the job's token, since the caller's repository
+      # may be private.
+      - name: Refuse to publish a commit that is not its branch's tip
+        if: inputs.mode == 'publish'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tip="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/${GITHUB_REF#refs/}" --jq .object.sha)"
+          if [ "${tip}" != "${GITHUB_SHA}" ]; then
+            echo "::error::refusing to publish ${GITHUB_SHA}: ${GITHUB_REF} is now ${tip}, whose run publishes instead" >&2
+            exit 1
+          fi
+          echo "publishing ${GITHUB_SHA}, the tip of ${GITHUB_REF}"
+
+      - name: Install the pinned cosign
+        run: |
+          set -euo pipefail
+          case "${RUNNER_OS}/${RUNNER_ARCH}" in
+            Linux/X64) arch=amd64 want="${COSIGN_SHA256_LINUX_AMD64}" ;;
+            Linux/ARM64) arch=arm64 want="${COSIGN_SHA256_LINUX_ARM64}" ;;
+            *)
+              echo "::error::no pinned cosign for ${RUNNER_OS}/${RUNNER_ARCH}" >&2
+              exit 1
+              ;;
+          esac
+          bin="${RUNNER_TEMP}/cracha-bin"
+          mkdir -p "${bin}"
+          curl -fsSL --retry 3 -o "${bin}/cosign" \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-${arch}"
+          echo "${want}  ${bin}/cosign" | sha256sum -c -
+          chmod 0755 "${bin}/cosign"
+          echo "GRANTC_ARCH=${arch}" >> "${GITHUB_ENV}"
+          echo "${bin}" >> "${GITHUB_PATH}"
+
+      # checksums.txt is what the release's workflow run signed, keyless:
+      # its certificate must name publish.yml of the Crachá repository at
+      # exactly this tag, issued to GitHub Actions. Then the binary must be
+      # the one checksums.txt lists, and must say it is that release.
+      - name: Download and verify grantc ${{ inputs.grantc-version }}
+        run: |
+          set -euo pipefail
+          dl="${RUNNER_TEMP}/grantc-download"
+          mkdir -p "${dl}"
+          base="https://github.com/${GRANTC_REPOSITORY}/releases/download/${GRANTC_VERSION}"
+          asset="grantc_${GRANTC_VERSION#v}_linux_${GRANTC_ARCH}"
+          for f in "${asset}" checksums.txt checksums.txt.sigstore.json; do
+            curl -fsSL --retry 3 -o "${dl}/${f}" "${base}/${f}"
+          done
+          cosign verify-blob "${dl}/checksums.txt" \
+            --bundle "${dl}/checksums.txt.sigstore.json" \
+            --certificate-identity "https://github.com/${GRANTC_REPOSITORY}/.github/workflows/publish.yml@refs/tags/${GRANTC_VERSION}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          lines="$(awk -v f="${asset}" '$2 == f' "${dl}/checksums.txt")"
+          if [ "$(grep -c . <<<"${lines}")" != 1 ]; then
+            echo "::error::checksums.txt of ${GRANTC_VERSION} does not list ${asset} exactly once" >&2
+            exit 1
+          fi
+          (cd "${dl}" && sha256sum -c - <<<"${lines}")
+          install -m 0755 "${dl}/${asset}" "${RUNNER_TEMP}/cracha-bin/grantc"
+          got="$(grantc --version)"
+          if [ "${got}" != "cracha-grantc ${GRANTC_VERSION}" ]; then
+            echo "::error::the binary reports '${got}', want 'cracha-grantc ${GRANTC_VERSION}'" >&2
+            exit 1
+          fi
+          echo "${got}, verified"
+
+      - name: Assume the role
+        if: steps.inputs.outputs.aws == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: cracha-grants-${{ inputs.mode }}-${{ github.run_id }}
+
+      # The grantc commands. Go's flag package stops at the first argument
+      # that is not a flag, so flags go before the files. The output
+      # directory holds every file compile writes; sign and verify go over
+      # GRANTC_SIGNED and publish reads the same directory, so a new artifact
+      # of compile is a name added there and a flag added to publish.
+      - name: Lint
+        run: |
+          set -euo pipefail
+          flags=()
+          if [ "${ACCESS_ANALYZER}" = true ]; then
+            flags+=(-access-analyzer -region "${AWS_REGION_INPUT}")
+          fi
+          grantc lint "${flags[@]}" "${SOURCE}"
+
+      # The bundle's version is the commit it was compiled from, so the
+      # bucket says which commit each published bundle is. In publish mode
+      # compile repeats the full lint itself, so the bundle signed is the one
+      # that passed it; a check has run it in the step above already.
+      - name: Compile
+        id: compile
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/grantc-out"
+          rm -rf "${out}"
+          mkdir -p "${out}"
+          flags=(-o "${out}/bundle.json" -version "${GITHUB_SHA}")
+          if [ "${MODE}" = publish ] && [ "${ACCESS_ANALYZER}" = true ]; then
+            flags+=(-access-analyzer -region "${AWS_REGION_INPUT}")
+          fi
+          grantc compile "${flags[@]}" "${SOURCE}"
+          echo "GRANTC_OUT=${out}" >> "${GITHUB_ENV}"
+          echo "GRANTC_SIGNED=bundle.json" >> "${GITHUB_ENV}"
+          echo "version=${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Sign with ${{ inputs.kms-key }}
+        if: inputs.mode == 'publish'
+        run: |
+          set -euo pipefail
+          for f in ${GRANTC_SIGNED}; do
+            grantc sign -kms-key "${KMS_KEY}" -region "${AWS_REGION_INPUT}" \
+              -o "${GRANTC_OUT}/${f}.sig" "${GRANTC_OUT}/${f}"
+          done
+
+      # What the broker will do, before anything is written to the bucket:
+      # grantc fetches the key's public key (kms:GetPublicKey) and checks
+      # the signature locally, against the keyId the broker computes from
+      # its verifyKey PEM.
+      - name: Verify the signatures
+        if: inputs.mode == 'publish'
+        run: |
+          set -euo pipefail
+          for f in ${GRANTC_SIGNED}; do
+            grantc verify -kms-key "${KMS_KEY}" -region "${AWS_REGION_INPUT}" \
+              -sig "${GRANTC_OUT}/${f}.sig" "${GRANTC_OUT}/${f}"
+          done
+
+      # The versioned objects first and `latest` last (grant.S3Publisher), so
+      # a broker never follows the pointer to a half-written version.
+      - name: Publish to ${{ inputs.destination }}
+        if: inputs.mode == 'publish'
+        run: |
+          set -euo pipefail
+          grantc publish -s3 "${DESTINATION}" -region "${AWS_REGION_INPUT}" \
+            -sig "${GRANTC_OUT}/bundle.json.sig" "${GRANTC_OUT}/bundle.json" | tee "${RUNNER_TEMP}/publish.log"
+          {
+            echo "### Published grant bundle"
+            echo
+            echo "\`$(tail -1 "${RUNNER_TEMP}/publish.log")\` to \`${DESTINATION}\`, signed with \`${KMS_KEY}\`, by grantc ${GRANTC_VERSION}."
+          } >> "${GITHUB_STEP_SUMMARY}"

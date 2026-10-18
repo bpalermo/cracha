@@ -1,5 +1,7 @@
-# The image platforms. The image index switches only the target platform; the
-# Go binaries are pure Go and cross-compile for either one on any host.
+# The platforms the Go binaries are built for. The image index switches only
+# the target platform; the Go binaries are pure Go and cross-compile for any
+# of these on any host. linux_amd64 and linux_arm64 are the image platforms;
+# darwin_arm64 is only for the grantc release binaries (//grantc:BUILD.bazel).
 package(default_visibility = ["//visibility:public"])
 
 platform(
@@ -15,5 +17,13 @@ platform(
     constraint_values = [
         "@platforms//cpu:aarch64",
         "@platforms//os:linux",
+    ],
+)
+
+platform(
+    name = "darwin_arm64",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:osx",
     ],
 )

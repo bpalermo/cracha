@@ -84,7 +84,8 @@ jobs:
       # impacted; naming it here keeps a rename or a removal from passing CI
       # and failing on the first publish. A query, not a build: it fails on a
       # label that does not exist and costs nothing else. Keep this list equal
-      # to the build step of publish.yml.
+      # to the build step of publish.yml, and its grantc job's
+      # GRANTC_PLATFORMS.
       - name: the publish targets exist
         run: |
           bazel query --config=ci --noshow_progress 'set(
@@ -92,7 +93,9 @@ jobs:
             //agent:image_push //agent:image_index
             //webhook:image_push //webhook:image_index
             //charts/cracha:cracha //charts/cracha:cracha.push_registry
-            //bazel/cosign:cosign //bazel/cosign:verify_image)'
+            //bazel/cosign:cosign //bazel/cosign:verify_image
+            //grantc:grantc_linux_amd64 //grantc:grantc_linux_arm64
+            //grantc:grantc_darwin_arm64)'
 
   # Target determination. bazel-diff hashes the build graph at the base and at
   # the head of the range under test and reports the targets whose hash

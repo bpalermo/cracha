@@ -1,4 +1,5 @@
-load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+load("@rules_go//go:def.bzl", "go_binary", "go_cross_binary", "go_library", "go_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 go_library(
     name = "grantc_lib",
@@ -30,4 +31,45 @@ go_test(
     srcs = ["main_test.go"],
     embed = [":grantc_lib"],
     deps = ["//common/grant"],
+)
+
+# The release binaries (publish.yml attaches them to the GitHub Release of a
+# v* tag as grantc_<version>_<os>_<arch>, with a signed checksums.txt), for
+# the grants repository's CI, which runs grantc without building Crachá
+# (docs/grants-repository.md). Each is :grantc built for one platform: pure
+# Go, so statically linked on linux, and stamped like every binary
+# (//common/version), so a release build reports its tag. Keep the list equal
+# to GRANTC_PLATFORMS of publish.yml and the query in ci.yml.
+[
+    go_cross_binary(
+        name = "grantc_" + platform,
+        platform = "//bazel/platforms:" + platform,
+        target = ":grantc",
+        visibility = ["//visibility:public"],
+    )
+    for platform in [
+        "linux_amd64",
+        "linux_arm64",
+        "darwin_arm64",
+    ]
+]
+
+# Each release binary is an executable of its own OS and CPU, and the linux
+# ones are static (no program interpreter): what the grants workflow
+# downloads must run on a bare runner.
+sh_test(
+    name = "release_binaries_test",
+    size = "small",
+    srcs = ["release_binaries_test.sh"],
+    args = [
+        "linux_amd64=$(rlocationpath :grantc_linux_amd64)",
+        "linux_arm64=$(rlocationpath :grantc_linux_arm64)",
+        "darwin_arm64=$(rlocationpath :grantc_darwin_arm64)",
+    ],
+    data = [
+        ":grantc_darwin_arm64",
+        ":grantc_linux_amd64",
+        ":grantc_linux_arm64",
+    ],
+    deps = ["@bazel_tools//tools/bash/runfiles"],
 )
