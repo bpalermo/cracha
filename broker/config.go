@@ -157,7 +157,7 @@ func (c *config) bindFlags(fs *flag.FlagSet, env envDefaults) {
 	fs.StringVar(&c.bundleSource, "bundle-source", env.str("bundle-source", ""), "where the compiled grant bundle is published: local:<dir> or s3://bucket[/prefix]; excludes --grants-fixture")
 	c.bundleVerifyKey = newPathList(env.str("bundle-verify-key", ""))
 	fs.Var(&c.bundleVerifyKey, "bundle-verify-key", "path to a PEM file of the public key, or keys, the bundle's signature is verified with; repeatable, and any key of any file verifies (the one the signature names), for rotating the signing key; the environment takes a comma-separated list")
-	fs.StringVar(&c.bundleKMSKey, "bundle-kms-key", env.str("bundle-kms-key", ""), "ARN of the KMS key the bundle's signature is verified with, instead of --bundle-verify-key")
+	fs.StringVar(&c.bundleKMSKey, "bundle-kms-key", env.str("bundle-kms-key", ""), "ARN or alias of the KMS signing key whose public key (kms:GetPublicKey, fetched once) the bundle's signature is verified with, instead of --bundle-verify-key")
 	fs.StringVar(&c.bundlePollInterval, "bundle-poll-interval", env.str("bundle-poll-interval", bundle.DefaultPollInterval.String()), "how often to look for a new bundle version")
 	fs.StringVar(&c.awsRegion, "aws-region", env.str("aws-region", ""), "AWS region for STS; the SDK's default chain when empty")
 	fs.StringVar(&c.logLevel, "log-level", env.str("log-level", "info"), "log level: debug, info, warn or error")

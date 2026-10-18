@@ -294,8 +294,10 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   (`--bundle-source local:<dir>` or `s3://bucket/prefix`,
   `broker/internal/bundle`): polled, its signature verified over the
   published bytes with public keys (`--bundle-verify-key`, repeatable, each
-  file one or more PEM keys, any of which verifies: rotation) or a KMS key
-  (`--bundle-kms-key`), swapped atomically when the version changes, and
+  file one or more PEM keys, any of which verifies: rotation is adding the
+  new key's PEM beside the old one) or a KMS key's public key
+  (`--bundle-kms-key`, fetched once with `kms:GetPublicKey`), swapped
+  atomically when the version changes, and
   kept at the last good version on any failure; `/readyz` reports not
   ready until a bundle has verified. With `--assignments-source published`
   every version's assignments are fetched and verified too, and the
@@ -393,6 +395,11 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   operator keeps, whose key is mounted as a file and never put in the
   environment, an optional `ca` the chart puts in a ConfigMap, `insecure`
   for kind only, `timeout`).
+- Brokers verify the publication with the signing key's PEM and need no
+  KMS access: a KMS signature's `keyId` is its public key's identity, the
+  same a local verifier of the exported PEM computes (`aws kms
+  get-public-key`, or the Terraform output, gives it), and nothing calls
+  `kms:Verify`. Never commit a real key's ARN or PEM to this repository.
 - `broker.bundle.verifyKey` is one PEM key, a string of several or a list
   of them, all in the one Secret file the broker reads, any of which
   verifies: a signing key rotates by trusting the new key beside the old,

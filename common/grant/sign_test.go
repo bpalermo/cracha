@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"errors"
 	"strings"
 	"testing"
@@ -151,14 +152,16 @@ func TestParseSignature(t *testing.T) {
 }
 
 // fakeKMS signs with a real P-256 key, the way KMS does for an
-// ECC_NIST_P256 key, so that KMS and local signatures can be checked
-// against each other.
+// ECC_NIST_P256 key (an ASN.1 DER signature over the digest), and exports
+// its public key as DER SubjectPublicKeyInfo, as kms:GetPublicKey does. It
+// has no Verify: nothing may call kms:Verify.
 type fakeKMS struct {
-	key    *ecdsa.PrivateKey
-	keyARN string
-	signIn *kms.SignInput
-	verIn  *kms.VerifyInput
-	err    error
+	key      *ecdsa.PrivateKey
+	keyARN   string
+	signIn   *kms.SignInput
+	getCalls int
+	err      error
+	getErr   error
 }
 
 func (f *fakeKMS) Sign(_ context.Context, in *kms.SignInput, _ ...func(*kms.Options)) (*kms.SignOutput, error) {
@@ -179,74 +182,114 @@ func (f *fakeKMS) Sign(_ context.Context, in *kms.SignInput, _ ...func(*kms.Opti
 	return &kms.SignOutput{KeyId: in.KeyId, Signature: raw, SigningAlgorithm: in.SigningAlgorithm}, nil
 }
 
-func (f *fakeKMS) Verify(_ context.Context, in *kms.VerifyInput, _ ...func(*kms.Options)) (*kms.VerifyOutput, error) {
-	f.verIn = in
-	if f.err != nil {
-		return nil, f.err
+func (f *fakeKMS) GetPublicKey(_ context.Context, in *kms.GetPublicKeyInput, _ ...func(*kms.Options)) (*kms.GetPublicKeyOutput, error) {
+	f.getCalls++
+	if f.getErr != nil {
+		return nil, f.getErr
 	}
 	if aws.ToString(in.KeyId) != f.keyARN {
 		return nil, errors.New("NotFoundException")
 	}
-	if in.MessageType != kmstypes.MessageTypeDigest || in.SigningAlgorithm != kmstypes.SigningAlgorithmSpecEcdsaSha256 {
-		return nil, errors.New("ValidationException")
+	der, err := x509.MarshalPKIXPublicKey(&f.key.PublicKey)
+	if err != nil {
+		return nil, err
 	}
-	return &kms.VerifyOutput{KeyId: in.KeyId, SignatureValid: ecdsa.VerifyASN1(&f.key.PublicKey, in.Message, in.Signature)}, nil
+	return &kms.GetPublicKeyOutput{KeyId: in.KeyId, PublicKey: der, KeySpec: kmstypes.KeySpecEccNistP256}, nil
 }
 
 func TestKMSSignVerify(t *testing.T) {
 	ctx := context.Background()
-	const arn = "arn:aws:kms:us-east-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab"
-	api := &fakeKMS{key: mustKey(t), keyARN: arn}
-	signer := NewKMSSigner(api, arn)
-	verifier := NewKMSVerifier(api, arn)
+	const alias = "alias/test-signing"
+	api := &fakeKMS{key: mustKey(t), keyARN: alias}
+	signer := NewKMSSigner(api, alias)
 	bundle := []byte(`{"version":"v1"}` + "\n")
 
 	sig, err := signer.Sign(ctx, bundle)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sig.KeyID != arn || sig.Algorithm != AlgorithmECDSASHA256 || sig.Digest != Digest(bundle) {
-		t.Errorf("signature = %+v", sig)
+	// The keyId is the public key's identity, not the KMS name.
+	want, _ := KeyID(&api.key.PublicKey)
+	if sig.KeyID != want || sig.Algorithm != AlgorithmECDSASHA256 || sig.Digest != Digest(bundle) {
+		t.Errorf("signature = %+v, want keyId %s", sig, want)
 	}
-	if err := verifier.Verify(ctx, bundle, sig); err != nil {
-		t.Errorf("Verify: %v", err)
+
+	// The exported PEM alone verifies it, offline, as a broker does.
+	pemData, _ := EncodeECPublicKey(&api.key.PublicKey)
+	pubs, err := ParseECPublicKeys(pemData)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := verifier.Verify(ctx, []byte("tampered"), sig); err == nil {
+	ring, _ := NewKeyRing(pubs...)
+	if err := ring.Verify(ctx, bundle, sig); err != nil {
+		t.Errorf("the exported PEM does not verify a KMS signature: %v", err)
+	}
+	if err := ring.Verify(ctx, []byte("tampered"), sig); err == nil {
 		t.Error("tampered bundle verified")
+	}
+
+	// KMSVerifier fetches the public key once and verifies locally: the
+	// fake has no Verify to call.
+	verifier := NewKMSVerifier(api, alias)
+	api.getCalls = 0
+	for range 3 {
+		if err := verifier.Verify(ctx, bundle, sig); err != nil {
+			t.Errorf("Verify: %v", err)
+		}
+	}
+	if api.getCalls != 1 {
+		t.Errorf("GetPublicKey called %d times, want once", api.getCalls)
 	}
 	bad := *sig
 	bad.Signature = "AAAA"
 	if err := verifier.Verify(ctx, bundle, &bad); err == nil || !strings.Contains(err.Error(), "does not verify") {
 		t.Errorf("Verify(garbage) = %v", err)
 	}
-
-	// A KMS signature verifies offline with the exported public key, and a
-	// local signature verifies through KMS.
-	local, _ := NewLocalVerifier(&api.key.PublicKey)
-	offline := *sig
-	offline.KeyID = local.KeyID()
-	if err := local.Verify(ctx, bundle, &offline); err != nil {
-		t.Errorf("local verify of a KMS signature: %v", err)
-	}
+	// A local signature by the same key verifies through the KMS verifier.
 	localSigner, _ := NewLocalSigner(api.key)
 	lsig, _ := localSigner.Sign(ctx, bundle)
-	lsig.KeyID = arn
 	if err := verifier.Verify(ctx, bundle, lsig); err != nil {
-		t.Errorf("KMS verify of a local signature: %v", err)
+		t.Errorf("KMS verifier on a local signature: %v", err)
+	}
+	// Another key's signature does not.
+	other, _ := NewLocalSigner(mustKey(t))
+	osig, _ := other.Sign(ctx, bundle)
+	if err := verifier.Verify(ctx, bundle, osig); err == nil || !strings.Contains(err.Error(), "signature by key") {
+		t.Errorf("Verify of another key's signature = %v", err)
 	}
 
-	other := NewKMSVerifier(api, "arn:aws:kms:us-east-1:111122223333:key/other")
-	if err := other.Verify(ctx, bundle, sig); err == nil || !strings.Contains(err.Error(), "signature by key") {
-		t.Errorf("Verify with another key = %v", err)
+	// Errors: a failed GetPublicKey is not kept; a failed Sign is reported.
+	fresh := &fakeKMS{key: api.key, keyARN: alias, getErr: errors.New("AccessDeniedException")}
+	v2 := NewKMSVerifier(fresh, alias)
+	if err := v2.Verify(ctx, bundle, sig); err == nil || !strings.Contains(err.Error(), "kms GetPublicKey") {
+		t.Errorf("Verify = %v", err)
 	}
-
+	fresh.getErr = nil
+	if err := v2.Verify(ctx, bundle, sig); err != nil {
+		t.Errorf("Verify after GetPublicKey recovered = %v", err)
+	}
 	api.err = errors.New("AccessDeniedException")
 	if _, err := signer.Sign(ctx, bundle); err == nil || !strings.Contains(err.Error(), "kms Sign") {
 		t.Errorf("Sign = %v", err)
 	}
-	if err := verifier.Verify(ctx, bundle, sig); err == nil || !strings.Contains(err.Error(), "kms Verify") {
-		t.Errorf("Verify = %v", err)
+	// A KMS key that signs with another key than it exports is caught.
+	api.err = nil
+	liar := &fakeKMS{key: mustKey(t), keyARN: alias}
+	liarSigner := NewKMSSigner(&mixedKMS{sign: liar, pub: api}, alias)
+	if _, err := liarSigner.Sign(ctx, bundle); err == nil || !strings.Contains(err.Error(), "does not verify with the key's public key") {
+		t.Errorf("Sign with a mismatched public key = %v", err)
 	}
+}
+
+// mixedKMS signs with one fake and exports the other's public key.
+type mixedKMS struct{ sign, pub *fakeKMS }
+
+func (m *mixedKMS) Sign(ctx context.Context, in *kms.SignInput, o ...func(*kms.Options)) (*kms.SignOutput, error) {
+	return m.sign.Sign(ctx, in, o...)
+}
+
+func (m *mixedKMS) GetPublicKey(ctx context.Context, in *kms.GetPublicKeyInput, o ...func(*kms.Options)) (*kms.GetPublicKeyOutput, error) {
+	return m.pub.GetPublicKey(ctx, in, o...)
 }
 
 func TestKeyRing(t *testing.T) {

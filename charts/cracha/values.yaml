@@ -183,8 +183,11 @@ broker:
   #                 beside the old, sign with the new, then drop the old; or
   #   existingSecret  a Secret you keep, with the PEM, of one or more keys,
   #                 under `public.pem`; or
-  #   kmsKey        the ARN of the KMS signing key, verified through
-  #                 kms:Verify with the broker's credentials.
+  #   kmsKey        the ARN or alias of the KMS signing key, whose public
+  #                 key the broker fetches once (kms:GetPublicKey, the only
+  #                 KMS permission it needs) and verifies with locally.
+  #                 Prefer verifyKey with the key's exported PEM
+  #                 (`aws kms get-public-key`): no AWS call at all.
   #                 Exactly one of the three.
   #   pollInterval  how often the broker looks for a new version.
   #   volume        for a local source, the Kubernetes volume source mounted

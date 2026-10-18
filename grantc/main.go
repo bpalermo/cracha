@@ -13,7 +13,10 @@
 // content; each one's signature is <file>.sig unless -o or -sig names it,
 // which only a single file allows (publish's -sig is the bundle's). -pub
 // may hold several public keys, any of which verifies: the one the
-// signature names.
+// signature names. A KMS signature names the key by its public key, so the
+// key's exported PEM (aws kms get-public-key) verifies it; verify -kms-key
+// fetches that public key (kms:GetPublicKey) and checks locally, never
+// calling kms:Verify.
 //
 // The exit status is 0 on success, 1 when a lint finds problems or a
 // signature does not verify, and 2 on a usage or operational error.
@@ -434,7 +437,7 @@ func signFile(ctx context.Context, stdout io.Writer, signer grant.Signer, path, 
 func runVerify(ctx context.Context, args []string, stdout, stderr io.Writer, clients awsClients) error {
 	fs := newFlags("verify", stderr)
 	kf := keyFlags{cmd: "verify", local: "pub"}
-	kf.register(fs, "PEM file with the ECDSA P-256 public key, or several: any of them verifies", "ARN of the KMS key that signed")
+	kf.register(fs, "PEM file with the ECDSA P-256 public key, or several: any of them verifies", "ARN or alias of the KMS key that signed; only its public key is fetched")
 	sigPath := fs.String("sig", "", "the signature file, with a single file (default: <file>.sig)")
 	if err := fs.Parse(args); err != nil {
 		return err

@@ -64,8 +64,9 @@ func newGrantSource(ctx context.Context, cfg config, awsCfg aws.Config, assignme
 }
 
 // newVerifier makes the verifier the configuration names: the PEM public
-// keys, any of which verifies (the one the signature names), or the KMS key
-// through kms:Verify.
+// keys, any of which verifies (the one the signature names), or the KMS
+// key's public key, fetched once with kms:GetPublicKey and used the same
+// way: no kms:Verify.
 func newVerifier(cfg config, awsCfg aws.Config) (grant.Verifier, error) {
 	if cfg.bundleKMSKey != "" {
 		return grant.NewKMSVerifier(kms.NewFromConfig(awsCfg), cfg.bundleKMSKey), nil

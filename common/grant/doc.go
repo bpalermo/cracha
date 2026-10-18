@@ -184,7 +184,7 @@
 //	{
 //	  "version": 1,
 //	  "algorithm": "ECDSA_SHA_256",
-//	  "keyId": "<local: sha256:<hex> of the public key's DER; KMS: the key ARN>",
+//	  "keyId": "sha256:<hex> of the signing key's public key, PKIX DER",
 //	  "digest": "sha256:<hex of the document's bytes>",
 //	  "signature": "<base64 of the ASN.1 DER ECDSA signature over the digest>"
 //	}
@@ -192,9 +192,12 @@
 // The signature covers the exact bytes of the published file. The
 // local signer uses an ECDSA P-256 key; the KMS signer uses an asymmetric
 // ECC_NIST_P256 signing key through kms:Sign, and the two produce
-// interchangeable signatures, so a bundle signed by KMS verifies offline
-// with the key's exported public key. Cosign signing (design 6.2 step 6) is
-// a later addition.
+// interchangeable signatures: the KMS signer names the key by its public
+// key's identity too (fetched once with kms:GetPublicKey), so a document
+// signed by KMS verifies offline with the key's exported PEM, and nothing
+// calls kms:Verify. KMSVerifier is that same local check with the public
+// key fetched from KMS. Cosign signing (design 6.2 step 6) is a later
+// addition.
 //
 // A reader may trust several keys (KeyRing): the envelope's keyId selects
 // the one that verifies, which is how a signing key is rotated.
