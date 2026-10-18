@@ -24,7 +24,9 @@ import (
 // (broker.assignments.source published). The test here republishes the
 // tree the way a grant repository's pipeline would, compiled, signed and
 // published as a new version, and the running broker takes it at its next
-// poll, with no restart and no change to its pod.
+// poll, with no restart and no change to its pod. It runs the assigned
+// workload's identity through STS, so it is in a file that sorts after
+// credentials_test.go, whose test counts that identity's AssumeRole calls.
 
 const (
 	// bundleKeyEnv names the private key run.sh signed the publication

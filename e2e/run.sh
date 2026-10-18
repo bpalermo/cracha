@@ -188,7 +188,7 @@ e2e/spire.sh
 # read back from the ConfigMap's latest pointer and expect in
 # Cracha-Bundle-Version. The volume also lays out, optionally, a second
 # version, e2e-republished, under keys the ConfigMap does not have yet:
-# the test that republishes the tree (assignments_test.go) compiles it under
+# the test that republishes the tree (published_test.go) compiles it under
 # that version with the private key (E2E_BUNDLE_KEY) and adds the keys, so
 # the new version reaches the running broker without a change to its pod.
 openssl ecparam -name prime256v1 -genkey -noout -out "${bundle}/key.pem"
