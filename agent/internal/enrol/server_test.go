@@ -139,6 +139,24 @@ func TestEnrolEndpointFailuresAre503(t *testing.T) {
 	}
 }
 
+func TestEnrolEndpointGlobalLimitPrecedesTheReview(t *testing.T) {
+	reg := newFakeRegistry()
+	calls := &tokenreview.Fake{Fn: reviewer.Fn}
+	client := fake.NewClientset(enrolledPod("apps", "api", "uid-1"))
+	srv := NewServer(calls, NewEnroller(client, reg, nil), resolver, ServerConfig{Port: 1, GlobalRate: rate.Every(time.Hour), GlobalBurst: 2})
+	for i := range 2 {
+		if rec := post(srv, http.MethodPost, enrolapi.Path, "Bearer good"); rec.Code != http.StatusOK {
+			t.Fatalf("request %d: %d", i, rec.Code)
+		}
+	}
+	if rec := post(srv, http.MethodPost, enrolapi.Path, "Bearer garbage"); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("third request: %d, want 429", rec.Code)
+	}
+	if calls.Calls() != 2 {
+		t.Errorf("%d TokenReviews, want the limited request to cost none", calls.Calls())
+	}
+}
+
 func TestEnrolEndpointRateLimitsPerPod(t *testing.T) {
 	reg := newFakeRegistry()
 	srv := newServer(t, reg, ServerConfig{Rate: rate.Every(time.Hour), Burst: 2})

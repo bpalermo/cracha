@@ -23,6 +23,12 @@ import (
 const (
 	DefaultRate  = rate.Limit(1) // enrolments per second, per pod
 	DefaultBurst = 5
+	// The endpoint-wide bound, applied before the token is reviewed: the
+	// per-pod limit is keyed on what the TokenReview says, so without this
+	// a flood of garbage bearers would cost one TokenReview each. A node
+	// enrols pods at kubelet's pace, far below it.
+	DefaultGlobalRate  = rate.Limit(50)
+	DefaultGlobalBurst = 100
 	// limiterTTL is how long an idle pod's limiter is kept.
 	limiterTTL = 5 * time.Minute
 )
@@ -35,6 +41,10 @@ type ServerConfig struct {
 	// Rate and Burst bound enrolments per pod UID; the defaults when zero.
 	Rate  rate.Limit
 	Burst int
+	// GlobalRate and GlobalBurst bound requests to the endpoint as a whole,
+	// before any token is reviewed; the defaults when zero.
+	GlobalRate  rate.Limit
+	GlobalBurst int
 	// Logger; the default logger when nil.
 	Logger *slog.Logger
 }
@@ -48,6 +58,8 @@ type Server struct {
 	enroller *Enroller
 	resolver cri.Resolver
 	cfg      ServerConfig
+
+	global *rate.Limiter
 
 	mu       sync.Mutex
 	limiters map[string]*limiter
@@ -67,11 +79,18 @@ func NewServer(reviewer tokenreview.Reviewer, enroller *Enroller, resolver cri.R
 	if cfg.Burst <= 0 {
 		cfg.Burst = DefaultBurst
 	}
+	if cfg.GlobalRate <= 0 {
+		cfg.GlobalRate = DefaultGlobalRate
+	}
+	if cfg.GlobalBurst <= 0 {
+		cfg.GlobalBurst = DefaultGlobalBurst
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
 	return &Server{
 		reviewer: reviewer, enroller: enroller, resolver: resolver, cfg: cfg,
+		global:   rate.NewLimiter(cfg.GlobalRate, cfg.GlobalBurst),
 		limiters: map[string]*limiter{}, now: time.Now,
 	}
 }
@@ -91,6 +110,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="cracha-agent"`)
 		http.Error(w, "a bearer token is required", http.StatusUnauthorized)
+		return
+	}
+	if !s.global.AllowN(s.now(), 1) {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "too many enrolments", http.StatusTooManyRequests)
 		return
 	}
 	status, ref, err := s.enrol(r.Context(), token)
