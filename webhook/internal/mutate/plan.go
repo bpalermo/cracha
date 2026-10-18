@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // planner walks one pod and collects the patch operations it needs, the
@@ -169,14 +168,15 @@ func enrolVolume() corev1.Volume {
 // enrolContainer is the init container: the agent image's `enrol`, told the
 // node's address, the enrolment port, how long to try and where the token
 // is, under the restricted Pod Security standard so that it never makes a
-// pod inadmissible. Its resources are fixed and small, with requests equal
-// to limits so that a Guaranteed pod stays Guaranteed.
+// pod inadmissible. Its resources are the configuration's (DefaultEnrolCPU
+// says how they were sized), with requests equal to limits so that a
+// Guaranteed pod stays Guaranteed.
 func (p *planner) enrolContainer() corev1.Container {
 	no, yes := false, true
 	uid := enrolUID
 	resources := corev1.ResourceList{
-		corev1.ResourceCPU:    resource.MustParse("10m"),
-		corev1.ResourceMemory: resource.MustParse("16Mi"),
+		corev1.ResourceCPU:    p.cfg.EnrolCPU.DeepCopy(),
+		corev1.ResourceMemory: p.cfg.EnrolMemory.DeepCopy(),
 	}
 	return corev1.Container{
 		Name:  EnrolContainerName,

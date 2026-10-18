@@ -59,6 +59,8 @@ spec:
             - --agent-image={{ include "cracha.image" (dict "root" . "image" .Values.agent.image) }}
             - --enrol-port={{ int .Values.agent.enrolPort }}
             - --enrol-timeout={{ .Values.agent.enrolTimeout }}
+            - --enrol-cpu={{ required "agent.enrolResources.cpu is required with agent.enrol init" .Values.agent.enrolResources.cpu }}
+            - --enrol-memory={{ required "agent.enrolResources.memory is required with agent.enrol init" .Values.agent.enrolResources.memory }}
             {{- end }}
             - --default-region={{ required "webhook.defaultRegion is required: AWS_REGION for the pods that do not set their own" .Values.webhook.defaultRegion }}
             - --conflicting-env={{ .Values.webhook.conflictingEnv }}

@@ -12,7 +12,9 @@
 // it runs in and exits 0 once the listener accepts a connection.
 // `cracha-agent cni-install` is the cni-install init container of the
 // DaemonSet in cni mode: it puts the cracha-cni plugin on the node
-// (internal/cni/install) and exits 0.
+// (internal/cni/install) and exits 0. `cracha-agent cni-retire` is the
+// agent container's preStop hook in cni mode: it takes the plugin off the
+// node when the agent is not coming back in cni mode (internal/cni/retire).
 package main
 
 import (
@@ -35,6 +37,7 @@ import (
 	"k8s.io/klog/v2"
 
 	cniinstall "github.com/bpalermo/cracha/agent/internal/cni/install"
+	cniretire "github.com/bpalermo/cracha/agent/internal/cni/retire"
 	cniserver "github.com/bpalermo/cracha/agent/internal/cni/server"
 	"github.com/bpalermo/cracha/agent/internal/enrol"
 	"github.com/bpalermo/cracha/agent/internal/serve"
@@ -48,6 +51,8 @@ func main() {
 			os.Exit(enrolMain(os.Args[2:]))
 		case "cni-install":
 			os.Exit(cniInstallMain(os.Args[2:]))
+		case "cni-retire":
+			os.Exit(cniRetireMain(os.Args[2:]))
 		}
 	}
 	os.Exit(serveMain(os.Args[1:]))
@@ -190,8 +195,7 @@ func cniInstallMain(args []string) int {
 	fs := flag.NewFlagSet("cracha-agent cni-install", flag.ContinueOnError)
 	var cfg cniinstall.Config
 	fs.StringVar(&cfg.Plugin, "plugin", cniinstall.DefaultPlugin, "the cracha-cni binary in the image")
-	fs.StringVar(&cfg.BinDir, "bin-dir", cniinstall.DefaultBinDir, "the node's CNI bin directory, as mounted (agent.cni.binDir)")
-	fs.StringVar(&cfg.ConfDir, "conf-dir", cniinstall.DefaultConfDir, "the node's CNI conf directory, as mounted (agent.cni.confDir)")
+	cniDirFlags(fs, &cfg)
 	fs.StringVar(&cfg.Socket, "socket", DefaultCNISocket, "the agent's socket the plugin's entry names (agent.cni.socket)")
 	uninstall := fs.Bool("uninstall", false, "remove the entry and the binary instead")
 	logLevel := fs.String("log-level", "info", "log level: debug, info, warn or error")
@@ -210,6 +214,56 @@ func cniInstallMain(args []string) int {
 	}
 	if err := run(cfg); err != nil {
 		log.Error("cni-install failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
+// cniDirFlags registers the node's CNI directories, which cni-install
+// writes into and cni-retire cleans.
+func cniDirFlags(fs *flag.FlagSet, cfg *cniinstall.Config) {
+	fs.StringVar(&cfg.BinDir, "bin-dir", cniinstall.DefaultBinDir, "the node's CNI bin directory, as mounted (agent.cni.binDir)")
+	fs.StringVar(&cfg.ConfDir, "conf-dir", cniinstall.DefaultConfDir, "the node's CNI conf directory, as mounted (agent.cni.confDir)")
+}
+
+// cniRetireMain is `cracha-agent cni-retire`, the agent container's
+// preStop hook in cni mode: it reads the agent's own DaemonSet and takes
+// the plugin off the node when the agent is not coming back in cni mode,
+// and leaves it otherwise.
+func cniRetireMain(args []string) int {
+	fs := flag.NewFlagSet("cracha-agent cni-retire", flag.ContinueOnError)
+	var cfg cniretire.Config
+	fs.StringVar(&cfg.DaemonSet, "daemonset", "", "the agent's own DaemonSet, whose pod template says the mode it selects (required)")
+	fs.StringVar(&cfg.Namespace, "namespace", envOr("POD_NAMESPACE", ""), "the DaemonSet's namespace (default $POD_NAMESPACE)")
+	cniDirFlags(fs, &cfg.Install)
+	fs.DurationVar(&cfg.Timeout, "timeout", cniretire.DefaultTimeout, "how long the DaemonSet is retried for before the plugin is left in place; the pod's terminationGracePeriodSeconds must cover it")
+	logLevel := fs.String("log-level", "info", "log level: debug, info, warn or error")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	log, err := logger(*logLevel)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cracha-agent cni-retire: %v\n", err)
+		return 2
+	}
+	if cfg.DaemonSet == "" || cfg.Namespace == "" {
+		log.Error("cni-retire needs --daemonset and --namespace (or $POD_NAMESPACE)")
+		return 2
+	}
+	cfg.Logger = log
+	restCfg, err := rest.InClusterConfig()
+	if err != nil {
+		log.Error("cni-retire needs the in-cluster Kubernetes configuration", "error", err)
+		return 1
+	}
+	restCfg.UserAgent = "cracha-agent/" + version.Version
+	client, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		log.Error("creating the Kubernetes client", "error", err)
+		return 1
+	}
+	if err := cniretire.Run(context.Background(), client, cfg); err != nil {
+		log.Error("cni-retire failed", "error", err)
 		return 1
 	}
 	return 0

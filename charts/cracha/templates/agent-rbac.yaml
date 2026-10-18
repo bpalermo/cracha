@@ -44,3 +44,39 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "cracha.name" . }}-agent
     namespace: {{ .Release.Namespace }}
+---
+# The agent's own DaemonSet, by name, read by the cni-retire preStop hook
+# of cni mode (design 7.2) to tell a termination that retires the plugin
+# (the DaemonSet gone, or its pod template selecting another mode) from a
+# restart. Granted in both modes: the hook runs in the pod that is going,
+# under the chart as it is after a switch to init.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "cracha.name" . }}-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+rules:
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    resourceNames: ["{{ include "cracha.name" . }}-agent"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "cracha.name" . }}-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "cracha.name" . }}-agent
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cracha.name" . }}-agent
+    namespace: {{ .Release.Namespace }}

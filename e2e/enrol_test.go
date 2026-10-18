@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -34,6 +37,11 @@ const (
 	// hold the agent off the node: no node carries it.
 	holdLabel = "e2e.cracha.dev/agent-held"
 
+	// enrolBudget is how long from a pod's creation the enrolment init
+	// container may take to exit in init mode (design 7.2): the container
+	// is sized not to be CFS-throttled (the chart's agent.enrolResources),
+	// and at 10m CPU it took close to 30 s.
+	enrolBudget = 5 * time.Second
 	// restartBudget is how long after the restarted agent is ready a pod's
 	// fetches must be answered again (design 7.4: the restart is hitless
 	// for an SDK that retries a refused connection).
@@ -220,11 +228,12 @@ func holdAgent(ctx context.Context, t *testing.T) (release func()) {
 
 // Enrolment completes before the app containers start (design 7.2,
 // "Ordering"): the SDK's first request, with the provider's retries off,
-// is answered, so the listener was there at first use.
+// is answered, so the listener was there at first use. In init mode the
+// init container also exits within enrolBudget of the pod's creation.
 func TestFirstFetchNeedsNoRetry(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
-	_, rep := assignedWorkload(ctx, t)
+	pod, rep := assignedWorkload(ctx, t)
 	if rep.Error != "" {
 		t.Fatalf("the SDK's first request failed: %s (exchange: %+v)", rep.Error, rep.Exchange)
 	}
@@ -234,6 +243,37 @@ func TestFirstFetchNeedsNoRetry(t *testing.T) {
 	if rep.Exchange == nil || rep.Exchange.Status != 200 {
 		t.Errorf("the first request was answered %+v, want 200", rep.Exchange)
 	}
+	if enrolMode() == enrolInit {
+		// And it was quick about it: the init container exited within the
+		// budget of the pod's creation, so its resources did not throttle it.
+		current, err := client.CoreV1().Pods(testNamespace).Get(ctx, pod.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		took, err := enrolDuration(current)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("%s exited %s after the pod was created", enrolContainer, took)
+		if took > enrolBudget {
+			t.Errorf("%s took %s from the pod's creation to its exit, want under %s: its resources throttle it", enrolContainer, took, enrolBudget)
+		}
+	}
+}
+
+// enrolDuration is how long after the pod's creation its enrolment init
+// container exited, from the pod's status.
+func enrolDuration(pod *corev1.Pod) (time.Duration, error) {
+	for _, s := range pod.Status.InitContainerStatuses {
+		if s.Name != enrolContainer {
+			continue
+		}
+		if s.State.Terminated == nil {
+			return 0, fmt.Errorf("%s has not terminated: %+v", enrolContainer, s.State)
+		}
+		return s.State.Terminated.FinishedAt.Sub(pod.CreationTimestamp.Time), nil
+	}
+	return 0, fmt.Errorf("the pod has no %s init container status: %+v", enrolContainer, pod.Status.InitContainerStatuses)
 }
 
 // grantsLine is what e2e/client prints about GET /v1/grants.
@@ -559,5 +599,163 @@ func TestRequestIsLoggedWithIdentities(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Switching the release's enrolment mode (design 7.2, retirement): the helm
+// run.sh installed the chart with and the package it installed, handed
+// over as E2E_HELM and E2E_CHART_PACKAGE (forwarded by .bazelrc's
+// test:e2e), the release name, and the node's CNI directories as the
+// chart's defaults have them, which e2e/values.yaml leaves alone.
+const (
+	helmEnv         = "E2E_HELM"
+	chartPackageEnv = "E2E_CHART_PACKAGE"
+	releaseName     = "cracha"
+	cniPluginType   = "cracha-cni"
+	cniBinDir       = "/opt/cni/bin"
+	cniConfDir      = "/etc/cni/net.d"
+)
+
+// helmUpgrade switches the release to the given enrolment mode, keeping
+// every other value run.sh installed it with, and waits for the rollout.
+func helmUpgrade(ctx context.Context, t *testing.T, mode string) {
+	t.Helper()
+	helm, chart := os.Getenv(helmEnv), os.Getenv(chartPackageEnv)
+	if helm == "" || chart == "" {
+		t.Skipf("%s and %s are not set: this test switches the release's mode with helm; run it through e2e/run.sh", helmEnv, chartPackageEnv)
+	}
+	started := time.Now()
+	cmd := exec.CommandContext(ctx, helm, "upgrade", releaseName, chart,
+		"--namespace", systemNamespace, "--reuse-values", "--set", "agent.enrol="+mode,
+		"--wait", "--timeout", "300s")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm upgrade to %s mode: %v\n%s", mode, err, out)
+	}
+	t.Logf("the release switched to %s mode in %s", mode, time.Since(started).Round(time.Millisecond))
+}
+
+// nodeCNI reads the node's CNI configuration through a pod that mounts the
+// node's two CNI directories (the suite has no shell on the node): the
+// conflists of the conf directory concatenated, and whether the plugin
+// binary is in the bin directory.
+func nodeCNI(ctx context.Context, t *testing.T, probe string) (conflists string, binary bool) {
+	t.Helper()
+	pod := sleeper(probe, "default")
+	pod.Spec.Containers[0].Command = []string{
+		"sh", "-c",
+		"cat /host/net.d/*.conflist; echo; if [ -x /host/bin/" + cniPluginType + " ]; then echo BINARY=present; else echo BINARY=absent; fi",
+	}
+	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{
+		{Name: "bin", MountPath: "/host/bin", ReadOnly: true},
+		{Name: "net-d", MountPath: "/host/net.d", ReadOnly: true},
+	}
+	pod.Spec.Volumes = []corev1.Volume{
+		{Name: "bin", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: cniBinDir}}},
+		{Name: "net-d", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: cniConfDir}}},
+	}
+	created := createPodAfterRollout(ctx, t, pod)
+	deletePodWhenDone(t, created.Name)
+	if _, err := waitForPodPhase(ctx, created.Name, corev1.PodSucceeded, corev1.PodFailed); err != nil {
+		t.Fatal(err)
+	}
+	logs, err := podLogs(ctx, testNamespace, created.Name, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return logs, strings.Contains(logs, "BINARY=present")
+}
+
+// createPodAfterRollout is mustCreatePod for the first pod after the
+// webhook rolled out: the apiserver's first call to the webhook can then
+// hang on a connection to the pod that went until its own timeout, which
+// it reports as an internal error on the create, failing closed. That is
+// the rollout's, not the switch's, so such a create is retried for a
+// while; any other failure is final.
+func createPodAfterRollout(ctx context.Context, t *testing.T, pod *corev1.Pod) *corev1.Pod {
+	t.Helper()
+	budget, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	var created *corev1.Pod
+	err := eventually(budget, func() error {
+		var err error
+		created, err = createPod(ctx, pod)
+		if err != nil && apierrors.IsInternalError(err) && strings.Contains(err.Error(), "failed calling webhook") {
+			t.Logf("creating pod %s right after the webhook rolled out: %v; retrying", pod.Name, err)
+			return err
+		}
+		if err != nil {
+			t.Fatalf("creating pod %s: %v", pod.Name, err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("creating pod %s after the webhook rolled out: %v", pod.Name, err)
+	}
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpDiagnostics(t, created.Name)
+		}
+	})
+	return created
+}
+
+// pluginOnNode asserts the node's CNI configuration has, or has not, the
+// plugin chained and its binary installed.
+func pluginOnNode(ctx context.Context, t *testing.T, probe string, want bool) {
+	t.Helper()
+	conflists, binary := nodeCNI(ctx, t, probe)
+	chained := strings.Contains(conflists, cniPluginType)
+	if chained != want || binary != want {
+		t.Fatalf("%s: the plugin is chained %t and its binary present %t, want %t both:\n%s", probe, chained, binary, want, conflists)
+	}
+	t.Logf("%s: the plugin is chained %t and its binary present %t", probe, chained, binary)
+}
+
+// Leaving cni mode retires the plugin (design 7.2): switched to init mode
+// with helm upgrade, the release's old agent takes the entry out of the
+// node's conflist and the binary off the node in its preStop hook, and a
+// pod created then is wired the init way and fetches; switched back, the
+// installer chains the plugin again and a cni-mode pod fetches. On a
+// node that kept the plugin, every sandbox would fail with no agent on
+// the socket, so the pods of each half are the proof.
+func TestLeavingCNIModeRetiresPlugin(t *testing.T) {
+	requireEnrol(t, enrolCNI)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	pluginOnNode(ctx, t, "cni-probe-before", true)
+
+	// Whatever happens, the release ends in the mode the suite runs in.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+		defer cancel()
+		helmUpgrade(ctx, t, enrolCNI)
+		waitForAgentRollout(ctx, t)
+	})
+
+	helmUpgrade(ctx, t, enrolInit)
+	waitForAgentRollout(ctx, t)
+	pluginOnNode(ctx, t, "cni-probe-init", false)
+	pod, rep := runWorkload(ctx, t, "switched-to-init", assignedSA)
+	deletePodWhenDone(t, pod.Name)
+	if rep.Error != "" || rep.Exchange == nil || rep.Exchange.Status != 200 {
+		t.Errorf("in init mode after the switch the first request got %+v (error %q), want 200", rep.Exchange, rep.Error)
+	}
+	if len(pod.Spec.InitContainers) == 0 || pod.Spec.InitContainers[0].Name != enrolContainer {
+		t.Errorf("the pod created in init mode has init containers %+v, want %s first", pod.Spec.InitContainers, enrolContainer)
+	}
+
+	helmUpgrade(ctx, t, enrolCNI)
+	waitForAgentRollout(ctx, t)
+	pluginOnNode(ctx, t, "cni-probe-cni", true)
+	pod, rep = runWorkload(ctx, t, "switched-to-cni", assignedSA)
+	deletePodWhenDone(t, pod.Name)
+	if rep.Error != "" || rep.Exchange == nil || rep.Exchange.Status != 200 {
+		t.Errorf("in cni mode after the switch back the first request got %+v (error %q), want 200", rep.Exchange, rep.Error)
+	}
+	for _, c := range pod.Spec.InitContainers {
+		if c.Name == enrolContainer {
+			t.Errorf("the pod created in cni mode was given %s", enrolContainer)
+		}
 	}
 }

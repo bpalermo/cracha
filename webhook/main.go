@@ -24,6 +24,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -64,6 +65,10 @@ func main() {
 	flag.StringVar(&opts.mutate.AgentImage, "agent-image", "", "the agent image the cracha-enrol init container runs (required with --enrol=init)")
 	flag.IntVar(&opts.mutate.EnrolPort, "enrol-port", 0, "port of the agent's enrolment endpoint on the node's address (required with --enrol=init)")
 	flag.DurationVar(&opts.mutate.EnrolTimeout, "enrol-timeout", 60*time.Second, "how long the cracha-enrol init container retries before it fails")
+	opts.mutate.EnrolCPU = resource.MustParse(mutate.DefaultEnrolCPU)
+	opts.mutate.EnrolMemory = resource.MustParse(mutate.DefaultEnrolMemory)
+	flag.Var(mutate.QuantityValue{Q: &opts.mutate.EnrolCPU}, "enrol-cpu", "CPU of the cracha-enrol init container, its request and its limit alike; under about 100m the container is CFS-throttled and holds the pod in Init for tens of seconds")
+	flag.Var(mutate.QuantityValue{Q: &opts.mutate.EnrolMemory}, "enrol-memory", "memory of the cracha-enrol init container, its request and its limit alike")
 	flag.StringVar(&opts.mutate.DefaultRegion, "default-region", "", "AWS_REGION for pods that do not set their own (required)")
 	flag.Var(&opts.mutate.ConflictingEnv, "conflicting-env", "what to do with AWS credential variables a pod sets itself: reject or strip")
 	flag.DurationVar(&opts.saCacheTTL, "sa-cache-ttl", 30*time.Second, "how long a ServiceAccount lookup is remembered; 0 disables the cache")
@@ -155,6 +160,7 @@ func run(ctx context.Context, opts options, logger *slog.Logger) error {
 		"credentials_uri", cfg.CredentialsURI(), "default_region", cfg.DefaultRegion,
 		"conflicting_env", cfg.ConflictingEnv.String(), "enrol", cfg.Enrol.String(),
 		"agent_image", cfg.AgentImage, "enrol_port", cfg.EnrolPort, "enrol_timeout", cfg.EnrolTimeout,
+		"enrol_cpu", cfg.EnrolCPU.String(), "enrol_memory", cfg.EnrolMemory.String(),
 		"webhook_config", opts.webhookConfigName, "sa_cache_ttl", opts.saCacheTTL)
 	return srv.Run(ctx)
 }
