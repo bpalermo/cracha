@@ -1,6 +1,10 @@
-# The suite's grant that names its bucket (design 6.2): one shape role, a session policy
-# rendered from the template beside it, inside its envelope. What the tests
-# in e2e/credentials_test.go expect of the AssumeRole call comes from here.
+# The suite's grant that names its bucket (design 6.2), with the fields an
+# account role would leave out written anyway: its own baseRole, the
+# override for a dedicated shape role (here the account's own role, so that
+# it composes with the account's implicit grant), and its own envelope. A
+# session policy rendered from the template beside it, inside its envelope.
+# What the tests in e2e/credentials_test.go expect of the AssumeRole call
+# comes from here.
 kind: Grant
 metadata:
   name: e2e-s3-reader
