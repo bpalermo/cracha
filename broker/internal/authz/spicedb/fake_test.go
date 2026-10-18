@@ -20,18 +20,23 @@ import (
 // context (expires_at, allowed).
 type rel struct {
 	resourceType, resourceID, relation, subjectType, subjectID string
-	caveat                                                     string
-	expiresAt                                                  string
-	allowed                                                    []string
+	// subjectRelation is the subject's relation, "member" for
+	// service:<s>#member, empty for a plain object.
+	subjectRelation string
+	caveat          string
+	expiresAt       string
+	allowed         []string
 }
 
-// parseRel parses "type:id#relation@type:id".
+// parseRel parses "type:id#relation@type:id", the subject optionally
+// "type:id#relation".
 func parseRel(s string) rel {
 	res, sub, _ := strings.Cut(s, "@")
 	resource, relation, _ := strings.Cut(res, "#")
 	rt, rid, _ := strings.Cut(resource, ":")
+	sub, subRelation, _ := strings.Cut(sub, "#")
 	st, sid, _ := strings.Cut(sub, ":")
-	return rel{resourceType: rt, resourceID: rid, relation: relation, subjectType: st, subjectID: sid}
+	return rel{resourceType: rt, resourceID: rid, relation: relation, subjectType: st, subjectID: sid, subjectRelation: subRelation}
 }
 
 // fakeSpiceDB is an in-memory SpiceDB answering the calls the adapter makes
@@ -194,6 +199,9 @@ func (f *fakeSpiceDB) LookupResources(ctx context.Context, in *v1.LookupResource
 	if f.err != nil {
 		return nil, f.err
 	}
+	if in.GetResourceObjectType() != schema.TypeGrant {
+		return &fakeStream[v1.LookupResourcesResponse]{ctx: ctx, items: f.lookupResources(in), end: io.EOF}, nil
+	}
 	var out []*v1.LookupResourcesResponse
 	// Every assignment is a result of its own, as SpiceDB's lookup may
 	// return a resource more than once.
@@ -213,6 +221,40 @@ func (f *fakeSpiceDB) LookupResources(ctx context.Context, in *v1.LookupResource
 		out = append(out, resp)
 	}
 	return &fakeStream[v1.LookupResourcesResponse]{ctx: ctx, items: out, end: io.EOF}, nil
+}
+
+// lookupResources evaluates a resource type's permission for a workload:
+// read = reader + writer, write = writer, each held by the workload or by
+// a service it is a member of (service#member). Every relationship that
+// holds is a result of its own.
+func (f *fakeSpiceDB) lookupResources(in *v1.LookupResourcesRequest) []*v1.LookupResourcesResponse {
+	relations := []string{schema.RelationWriter}
+	if in.GetPermission() == schema.PermissionRead {
+		relations = append(relations, schema.RelationReader)
+	}
+	workload := in.GetSubject().GetObject().GetObjectId()
+	var out []*v1.LookupResourcesResponse
+	for _, r := range f.rels {
+		if r.resourceType != in.GetResourceObjectType() || !slices.Contains(relations, r.relation) {
+			continue
+		}
+		direct := r.subjectType == schema.TypeWorkload && r.subjectID == workload
+		viaService := r.subjectType == schema.TypeService && r.subjectRelation == schema.RelationMember && f.member(r.subjectID, workload)
+		if !direct && !viaService {
+			continue
+		}
+		resp := &v1.LookupResourcesResponse{LookedUpAt: f.zedtoken(), ResourceObjectId: r.resourceID}
+		switch r.evaluate(in.GetContext()) {
+		case allowed:
+			resp.Permissionship = v1.LookupPermissionship_LOOKUP_PERMISSIONSHIP_HAS_PERMISSION
+		case conditional:
+			resp.Permissionship = v1.LookupPermissionship_LOOKUP_PERMISSIONSHIP_CONDITIONAL_PERMISSION
+		default:
+			continue
+		}
+		out = append(out, resp)
+	}
+	return out
 }
 
 func (f *fakeSpiceDB) ReadRelationships(ctx context.Context, in *v1.ReadRelationshipsRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[v1.ReadRelationshipsResponse], error) {

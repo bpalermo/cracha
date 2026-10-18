@@ -31,10 +31,16 @@ definition grant {
   permission assume = assignee_service->member + assignee_workload
 }
 
+definition s3_bucket {
+  relation reader: workload | workload with within_window | workload with in_clusters | workload with bounded | service#member | service#member with within_window | service#member with in_clusters | service#member with bounded
+  relation writer: workload | workload with within_window | workload with in_clusters | workload with bounded | service#member | service#member with within_window | service#member with in_clusters | service#member with bounded
+  permission write = writer
+  permission read = reader + writer
+}
+
 definition dynamodb_table {
-  relation account: aws_account
-  relation writer: service
-  relation reader: service
-  permission write = writer->member
-  permission read  = write + reader->member
+  relation reader: workload | workload with within_window | workload with in_clusters | workload with bounded | service#member | service#member with within_window | service#member with in_clusters | service#member with bounded
+  relation writer: workload | workload with within_window | workload with in_clusters | workload with bounded | service#member | service#member with within_window | service#member with in_clusters | service#member with bounded
+  permission write = writer
+  permission read = reader + writer
 }

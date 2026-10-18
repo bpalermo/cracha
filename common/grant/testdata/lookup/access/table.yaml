@@ -1,0 +1,8 @@
+# A relation to a resource of another kind, which no grant here looks up.
+kind: Access
+metadata:
+  name: table
+spec:
+  subject: prod/data/report
+  resource: { kind: dynamodb_table, name: Report_Index.v2 }
+  relation: reader

@@ -1,0 +1,6 @@
+kind: Assignment
+metadata:
+  name: etl
+spec:
+  subject: prod/data/etl
+  grants: [data-write]

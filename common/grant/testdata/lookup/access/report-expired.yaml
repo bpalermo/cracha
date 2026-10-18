@@ -1,0 +1,8 @@
+kind: Access
+metadata:
+  name: report-expired
+spec:
+  subject: prod/data/report
+  resource: { kind: s3_bucket, name: data-old }
+  relation: reader
+  expiresAt: "2026-01-01T00:00:00Z"

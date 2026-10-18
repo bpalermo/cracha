@@ -10,6 +10,7 @@ go_library(
     visibility = ["//broker:__subpackages__"],
     deps = [
         "//broker/internal/authz",
+        "//common/idenc",
         "//common/spicedb",
         "@com_github_authzed_authzed_go//proto/authzed/api/v1:api",
         "@com_github_authzed_authzed_go//v1:authzed-go",

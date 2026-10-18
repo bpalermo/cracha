@@ -1,0 +1,9 @@
+# The reader's service may read cracha-e2e-data: the bucket the lookup grant
+# is rendered with for its members.
+kind: Access
+metadata:
+  name: e2e-reader-data
+spec:
+  service: e2e-reader
+  resource: { kind: s3_bucket, name: cracha-e2e-data }
+  relation: reader

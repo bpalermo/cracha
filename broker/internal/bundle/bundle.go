@@ -276,6 +276,10 @@ func convert(b *grant.Bundle) (*snapshot, error) {
 		if g.Duration < 0 || g.Duration > math.MaxInt32 {
 			return nil, fmt.Errorf("bundle: grant %q: duration %d is out of range", g.Name, g.Duration)
 		}
+		lookup, err := lookupOf(g)
+		if err != nil {
+			return nil, err
+		}
 		snap.grants[g.Name] = grants.ResolvedGrant{
 			Name:              g.Name,
 			Account:           g.Account,
@@ -285,7 +289,34 @@ func convert(b *grant.Bundle) (*snapshot, error) {
 			SessionTags:       g.SessionTags,
 			DurationSeconds:   int32(g.Duration),
 			Envelope:          g.Envelope,
+			Lookup:            lookup,
 		}
 	}
 	return snap, nil
+}
+
+// lookupOf is a lookup grant's lookup, rendered by common/grant's own
+// renderer, the compiler's: nil for any other grant. A lookup grant must
+// carry no rendered policy, a known kind and permission and a positive
+// maximum, or the bundle is rejected.
+func lookupOf(g grant.BundleGrant) (*grants.Lookup, error) {
+	l := g.Lookup
+	if l == nil {
+		return nil, nil
+	}
+	_, known := grant.LookupResourceKind(l.Kind)
+	_, permission := grant.RelationsOf(l.Permission)
+	switch {
+	case g.SessionPolicy != "":
+		return nil, fmt.Errorf("bundle: grant %q: a lookup grant carries no rendered session policy", g.Name)
+	case !known || !permission:
+		return nil, fmt.Errorf("bundle: grant %q: lookup %s#%s is not a known kind and permission", g.Name, l.Kind, l.Permission)
+	case l.MaxResources < 1:
+		return nil, fmt.Errorf("bundle: grant %q: lookup maximum %d", g.Name, l.MaxResources)
+	}
+	account := g.Account
+	return &grants.Lookup{
+		Kind: l.Kind, Permission: l.Permission, MaxResources: l.MaxResources,
+		Render: func(resources []string) (string, error) { return l.Render(account, resources) },
+	}, nil
 }

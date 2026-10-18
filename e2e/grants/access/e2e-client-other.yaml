@@ -1,0 +1,10 @@
+# The other bucket of the stub's world, cracha-e2e-other, is the client's,
+# not the reader's: it must not reach the reader's session policy. The
+# client holds no lookup grant, so its own policy does not change either.
+kind: Access
+metadata:
+  name: e2e-client-other
+spec:
+  subject: cracha/e2e/client
+  resource: { kind: s3_bucket, name: cracha-e2e-other }
+  relation: reader

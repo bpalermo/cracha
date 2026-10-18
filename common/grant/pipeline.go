@@ -25,8 +25,14 @@ type LintOptions struct {
 type GrantResult struct {
 	Grant string
 	// Rendered is the rendered session policy; empty for a grant without
-	// one.
+	// one and for a lookup grant, whose policy is rendered at issuance.
 	Rendered string
+	// Lookup is set for a lookup grant: what the bundle carries for the
+	// broker to render its policy, the compiled maximum of resources
+	// included. Probe is its policy rendered for one resource of the
+	// kind's longest name, which steps 2 and 4 check in place of Rendered.
+	Lookup *BundleLookup
+	Probe  string
 	// Validation holds the Access Analyzer findings; AccessCheck the result
 	// of the no-new-access check. Both are nil when the step was skipped.
 	Validation  []PolicyFinding
@@ -70,18 +76,22 @@ func Lint(ctx context.Context, src *Source, opts LintOptions) (*Report, error) {
 		report.Skipped = []string{StepValidatePolicy, StepCheckNoNewAccess}
 	}
 	rendered := map[string]string{}
+	lookups := map[string]*BundleLookup{}
 	for _, g := range src.Grants {
 		res, err := lintGrant(ctx, g, src.Templates, opts.Analyzer)
 		if err != nil {
 			return nil, err
 		}
 		rendered[g.Name()] = res.Rendered
+		if res.Lookup != nil {
+			lookups[g.Name()] = res.Lookup
+		}
 		report.Grants = append(report.Grants, *res)
 		for _, p := range res.Problems {
 			report.Problems.addf("grant %s: %s", g.Name(), p)
 		}
 	}
-	report.Composition = LintComposition(src, rendered, now)
+	report.Composition = LintComposition(src, rendered, lookups, now)
 	report.Problems = append(report.Problems, report.Composition.Problems...)
 	return report, nil
 }
@@ -90,6 +100,9 @@ func Lint(ctx context.Context, src *Source, opts LintOptions) (*Report, error) {
 // fails outright (not a finding) is returned as an error.
 func lintGrant(ctx context.Context, g *Grant, templates map[string]*Template, analyzer PolicyAnalyzer) (*GrantResult, error) {
 	res := &GrantResult{Grant: g.Name()}
+	if _, l := lookupParam(g.Spec.SessionPolicy); l != nil {
+		return res, res.lintLookupGrant(ctx, g, templates, analyzer)
+	}
 	res.render(g, templates)
 	if res.Rendered != "" && analyzer != nil {
 		if err := res.analyze(ctx, g, analyzer); err != nil {
@@ -103,6 +116,45 @@ func lintGrant(ctx context.Context, g *Grant, templates map[string]*Template, an
 		res.Problems = append(res.Problems, res.Envelope.Problems...)
 	}
 	return res, nil
+}
+
+// lintLookupGrant runs steps 1 to 4 for a lookup grant, whose resources
+// are known only at issuance: it renders the policy for probe resources of
+// the kind's longest name, computes the most that fit the size budget
+// (BundleLookup.MaxResources), validates the policy for one with the
+// analyzer (ValidatePolicy only: the probes are no resource the envelope
+// names, so CheckNoNewAccess would fail them all; the broker checks every
+// rendered resource against the envelope instead), and checks the
+// resources the template writes itself, those that hold no probe, against
+// the envelope.
+func (res *GrantResult) lintLookupGrant(ctx context.Context, g *Grant, templates map[string]*Template, analyzer PolicyAnalyzer) error {
+	sp := g.Spec.SessionPolicy
+	t, ok := templates[sp.Template]
+	if !ok {
+		res.Problems.addf("template %q not found", sp.Template)
+		return nil
+	}
+	l, err := newBundleLookup(g, t)
+	if err != nil {
+		res.Problems.addf("render: %v", err)
+		return nil
+	}
+	res.Lookup = l
+	res.Probe = mustRenderProbes(l, g.Spec.Account, 1)
+	res.Problems = append(res.Problems, lintSids(l, g.Spec.Account)...)
+	if analyzer != nil {
+		findings, err := analyzer.ValidatePolicy(ctx, res.Probe)
+		if err != nil {
+			return fmt.Errorf("grant %s: %w", g.Name(), err)
+		}
+		res.Validation = findings
+		res.Problems = append(res.Problems, blockingFindings(findings)...)
+	}
+	res.Size = LintSize(g.Name(), mustRenderProbes(l, g.Spec.Account, l.MaxResources), g.Spec.SessionTags)
+	res.Problems = append(res.Problems, res.Size.Problems...)
+	res.Envelope = lintEnvelope(g.Name(), res.Probe, g.Spec.Envelope, isProbeResource)
+	res.Problems = append(res.Problems, res.Envelope.Problems...)
+	return nil
 }
 
 // render is step 1: it renders the grant's session policy, when it has

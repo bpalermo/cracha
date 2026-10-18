@@ -1,0 +1,8 @@
+kind: Access
+metadata:
+  name: etl-curated-b
+spec:
+  subject: prod/data/etl
+  resource: { kind: s3_bucket, name: data.curated }
+  relation: writer
+  clusters: [prod-b]

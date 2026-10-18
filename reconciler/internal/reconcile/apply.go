@@ -25,7 +25,7 @@ var ErrDiverged = errors.New("SpiceDB differs from the source after the write")
 // OwnedTypes are the resource types whose every relationship the
 // reconciler owns: what it reads to diff, and what it deletes when the
 // tree no longer calls for it.
-var OwnedTypes = []string{spicedb.TypeGrant, spicedb.TypeService, spicedb.TypeWorkload}
+var OwnedTypes = append([]string{spicedb.TypeGrant, spicedb.TypeService, spicedb.TypeWorkload}, spicedb.ResourceTypes...)
 
 // Reconciler writes to one SpiceDB.
 type Reconciler struct {

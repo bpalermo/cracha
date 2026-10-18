@@ -1,5 +1,5 @@
 // Package grant is the grant bundle model and its compiler (docs/design.md,
-// section 6.2): it loads Grant, Assignment and Service documents and
+// section 6.2): it loads Grant, Assignment, Service and Access documents and
 // session policy templates from a Git checkout, validates them, renders the
 // templates, runs the lints of the grant-compiler pipeline, compiles the
 // signed bundle the broker consumes, and signs and publishes it. The same
@@ -18,6 +18,7 @@
 //	grants/payments-ledger-rw.yaml      kind: Grant
 //	assignments/payments.yaml           kind: Assignment
 //	services/payments-api.yaml          kind: Service
+//	access/payments-exports.yaml        kind: Access
 //	templates/dynamo-table-rw.json      a session policy template
 //
 // Unknown fields are rejected, so a typo in a field name fails the load
@@ -101,6 +102,42 @@
 // composition lint sees a subject's grants from its Assignments and from
 // its service together.
 //
+// # Lookup parameters and Access (Level 3)
+//
+// A grant may leave one parameter of its template to the authorization
+// store: the parameter is a lookup, and the broker fills it at issuance
+// with the resources of a kind the workload holds a permission on.
+//
+//	sessionPolicy:
+//	  template: s3-object-read
+//	  params:
+//	    bucket: { lookup: { kind: s3_bucket, permission: read } }
+//
+// Kinds are s3_bucket and dynamodb_table (ResourceKindNames), permissions read
+// (held through reader or writer) and write (through writer). Which
+// resources is recorded in the tree as Access documents:
+//
+//	kind: Access
+//	metadata:
+//	  name: payments-exports
+//	spec:
+//	  service: payments-api              # its members; or subject: <encoding>
+//	  resource: { kind: s3_bucket, name: payments-exports }
+//	  relation: reader                   # reader | writer
+//	  expiresAt: "2026-12-31T00:00:00Z"  # optional, as on an Assignment
+//	  clusters: [prod-us-east-1]         # optional
+//
+// Rendering (RenderLookup): a list parameter is the resources, sorted,
+// rendered once; a string parameter is rendered once per resource and the
+// statements put together under one Version, so a template written for
+// one resource serves any number. The compiler sizes the policy with
+// resources of the kind's longest name and records the most that fit
+// MaxPolicyChars in the bundle (BundleLookup.MaxResources); the broker
+// enforces it, and checks every rendered resource against the envelope.
+// The composition lint renders a subject's lookup grants with the
+// resources its Access documents give it, and leaves out one with none,
+// as the broker does.
+//
 // # Session policy templates
 //
 // A template is a JSON file, named after it (templates/<name>.json), with
@@ -147,8 +184,14 @@
 //	  "generatedAt": "<RFC 3339>",
 //	  "grants": [ { "name", "account", "baseRole", "sessionPolicy",
 //	                "managedPolicyArns", "sessionTags", "duration",
-//	                "envelope" } ]
+//	                "envelope", "lookup"? } ]
 //	}
+//
+// A lookup grant has an empty sessionPolicy and a lookup: { "param",
+// "kind", "permission", "maxResources", "template": { "name", "params",
+// "policy" }, "params" }, which the broker renders at issuance. Every other
+// grant has no lookup field at all, so a bundle without lookup grants is
+// byte for byte what it was before them.
 //
 // Its bytes are canonical: object keys sorted, grants sorted by name, two
 // space indentation and a trailing newline, so the same sources compile to
@@ -165,15 +208,20 @@
 //	{
 //	  "version", "generatedAt",
 //	  "services":  [ { "name", "team", "members", "grants": [ { "name", "expiresAt"?, "clusters"? } ] } ],
-//	  "workloads": [ { "subject", "suspended", "grants": [ { "name", "expiresAt"?, "clusters"? } ] } ]
+//	  "workloads": [ { "subject", "suspended", "grants": [ { "name", "expiresAt"?, "clusters"? } ] } ],
+//	  "access"?:   [ { "subject"? | "service"?, "resource": { "kind", "name" }, "relation", "expiresAt"?, "clusters"? } ]
 //	}
+//
+// access is every Access document (ResolveAccess), those of one holder,
+// resource and relation merged as assignments are; it is absent when the
+// tree has none, so a tree without them compiles to what it did before.
 //
 // A workload is every Assignment of one subject, merged: suspended when any
 // is, and each grant once, with the union of the bounds the Assignments give
 // it, the way the reconciler writes the same tree to SpiceDB (the mapping is
 // one function, ResolveAssignments). Its bytes are canonical as the
 // bundle's are. The version, when none is given, is the SHA-256 of the
-// grants and of the services and workloads together, so a change to who
+// grants and of the services, workloads and access together, so a change to who
 // holds a grant alone is a new version.
 //
 // # Signature envelope

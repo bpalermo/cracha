@@ -55,7 +55,7 @@ func (d Diff) Updates() ([]*v1.RelationshipUpdate, error) {
 	}
 	for _, r := range d.Delete {
 		// A delete names the relationship without its caveat.
-		rel, err := Relationship{ResourceType: r.ResourceType, ResourceID: r.ResourceID, Relation: r.Relation, SubjectType: r.SubjectType, SubjectID: r.SubjectID}.Proto()
+		rel, err := Relationship{ResourceType: r.ResourceType, ResourceID: r.ResourceID, Relation: r.Relation, SubjectType: r.SubjectType, SubjectID: r.SubjectID, SubjectRelation: r.SubjectRelation}.Proto()
 		if err != nil {
 			return nil, err
 		}

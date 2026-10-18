@@ -1,0 +1,14 @@
+kind: Grant
+metadata:
+  name: data-write
+spec:
+  account: "111122223333"
+  baseRole: arn:aws:iam::111122223333:role/broker/shape-data
+  sessionPolicy:
+    template: s3-bucket-write
+    params:
+      buckets: { lookup: { kind: s3_bucket, permission: write } }
+      prefix: incoming/
+  envelope:
+    - arn:aws:s3:::data-*
+    - arn:aws:s3:::data.*

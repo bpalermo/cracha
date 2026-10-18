@@ -1,0 +1,13 @@
+# A grant that names its bucket, beside the lookup grants of the shape.
+kind: Grant
+metadata:
+  name: data-static
+spec:
+  account: "111122223333"
+  baseRole: arn:aws:iam::111122223333:role/broker/shape-data
+  sessionPolicy:
+    template: s3-object-read
+    params: { bucket: data-static }
+  envelope:
+    - arn:aws:s3:::data-static
+    - arn:aws:s3:::data-static/*

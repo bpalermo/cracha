@@ -261,3 +261,76 @@ func TestAuthz(t *testing.T) {
 		}
 	}
 }
+
+// spicedbObjectID is SpiceDB's object ID charset, the strictest store
+// considered (design 4.3); the length, at most 1024, is Resource's own
+// check.
+var spicedbObjectID = regexp.MustCompile(`^[a-zA-Z0-9/_|\-=+]+$`)
+
+func TestResourceRoundTrip(t *testing.T) {
+	// Every shape of a valid S3 bucket name (3 to 63 characters of
+	// lower-case letters, digits, dots and hyphens, starting and ending
+	// with a letter or digit), and DynamoDB table names, which add
+	// upper-case letters and underscores.
+	names := map[string]string{
+		"abc":                          "abc",
+		"a-b":                          "a-b",
+		"a.b":                          "a_2eb",
+		"1.2.3":                        "1_2e2_2e3",
+		"my.bucket.example-com":        "my_2ebucket_2eexample-com",
+		"cracha-e2e-data":              "cracha-e2e-data",
+		"a--b":                         "a--b",
+		"x1-y2.z3":                     "x1-y2_2ez3",
+		"Payments_Ledger.v2":           "Payments_5fLedger_2ev2",
+		strings.Repeat("a", 63):        strings.Repeat("a", 63),
+		strings.Repeat("a.", 31) + "a": strings.Repeat("a_2e", 31) + "a",
+	}
+	for name, want := range names {
+		id, err := Resource(name)
+		if err != nil {
+			t.Fatalf("Resource(%q): %v", name, err)
+		}
+		if id != want {
+			t.Errorf("Resource(%q) = %q, want %q", name, id, want)
+		}
+		if !spicedbObjectID.MatchString(id) {
+			t.Errorf("Resource(%q) = %q is outside the object ID charset", name, id)
+		}
+		back, err := ParseResource(id)
+		if err != nil || back != name {
+			t.Errorf("ParseResource(%q) = %q, %v, want %q", id, back, err, name)
+		}
+	}
+}
+
+func TestResourceEveryBucketByte(t *testing.T) {
+	// Every byte a bucket name may hold, in every position.
+	alphabet := "abcdefghijklmnopqrstuvwxyz0123456789.-"
+	for i := 0; i < len(alphabet); i++ {
+		name := "a" + string(alphabet[i]) + "z"
+		id, err := Resource(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !spicedbObjectID.MatchString(id) {
+			t.Errorf("Resource(%q) = %q is outside the object ID charset", name, id)
+		}
+		if back, err := ParseResource(id); err != nil || back != name {
+			t.Errorf("ParseResource(%q) = %q, %v, want %q", id, back, err, name)
+		}
+	}
+}
+
+func TestResourceRejects(t *testing.T) {
+	if _, err := Resource(""); err == nil {
+		t.Error("Resource(\"\") succeeded")
+	}
+	if _, err := Resource(strings.Repeat(".", 400)); err == nil {
+		t.Error("Resource of a name whose ID is over 1024 characters succeeded")
+	}
+	for _, id := range []string{"", "a_2", "a_zz", "a.b", "a_2db", "a_2Eb"} {
+		if name, err := ParseResource(id); err == nil {
+			t.Errorf("ParseResource(%q) = %q, want an error", id, name)
+		}
+	}
+}

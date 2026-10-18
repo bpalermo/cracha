@@ -2,7 +2,8 @@
 // SpiceDB relationships of docs/design.md section 6.4 and makes a SpiceDB
 // instance hold exactly those: it is the authz-reconciler writer of the
 // design. It owns every relationship whose resource is a grant, a service or
-// a workload; what it does not find in the tree it deletes.
+// a workload, and every one whose resource is a resource type of Level 3
+// (an s3_bucket); what it does not find in the tree it deletes.
 package reconcile
 
 import (
@@ -25,6 +26,9 @@ type Relationship struct {
 	Relation     string
 	SubjectType  string
 	SubjectID    string
+	// SubjectRelation is the subject's relation, "member" for a service's
+	// members (service:<s>#member); empty for the object itself.
+	SubjectRelation string
 	// Caveat is the caveat's name, or empty for none. ExpiresAt (RFC 3339,
 	// UTC) and Allowed (sorted) are its context; a context value of another
 	// shape than this package writes is kept as its text, so that it
@@ -37,7 +41,11 @@ type Relationship struct {
 // Key identifies the relationship without its caveat, the way SpiceDB does:
 // writing a relationship with the same key and another caveat replaces it.
 func (r Relationship) Key() string {
-	return r.ResourceType + ":" + r.ResourceID + "#" + r.Relation + "@" + r.SubjectType + ":" + r.SubjectID
+	k := r.ResourceType + ":" + r.ResourceID + "#" + r.Relation + "@" + r.SubjectType + ":" + r.SubjectID
+	if r.SubjectRelation != "" {
+		k += "#" + r.SubjectRelation
+	}
+	return k
 }
 
 // String renders the relationship with its caveat, for logs and diffs.
@@ -65,7 +73,7 @@ func (r Relationship) Proto() (*v1.Relationship, error) {
 	rel := &v1.Relationship{
 		Resource: &v1.ObjectReference{ObjectType: r.ResourceType, ObjectId: r.ResourceID},
 		Relation: r.Relation,
-		Subject:  &v1.SubjectReference{Object: &v1.ObjectReference{ObjectType: r.SubjectType, ObjectId: r.SubjectID}},
+		Subject:  &v1.SubjectReference{Object: &v1.ObjectReference{ObjectType: r.SubjectType, ObjectId: r.SubjectID}, OptionalRelation: r.SubjectRelation},
 	}
 	if r.Caveat == "" {
 		return rel, nil
@@ -97,6 +105,9 @@ func FromProto(rel *v1.Relationship) Relationship {
 		Relation:     rel.GetRelation(),
 		SubjectType:  rel.GetSubject().GetObject().GetObjectType(),
 		SubjectID:    rel.GetSubject().GetObject().GetObjectId(),
+		// The subject's relation, kept so that it compares unequal with
+		// the plain object the reconciler writes for a workload.
+		SubjectRelation: rel.GetSubject().GetOptionalRelation(),
 	}
 	caveat := rel.GetOptionalCaveat()
 	if caveat == nil {

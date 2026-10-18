@@ -120,10 +120,20 @@ func validateSessionPolicy(s *GrantSpec) errList {
 		return errs
 	}
 	errs.add(validateName("sessionPolicy.template", sp.Template))
+	lookups := 0
 	for _, name := range sortedKeys(sp.Params) {
 		if err := validateParamName(name); err != nil {
 			errs.addf("sessionPolicy.params: %w", err)
 		}
+		if l := sp.Params[name].Lookup; l != nil {
+			lookups++
+			if err := validateLookup(l); err != nil {
+				errs.addf("sessionPolicy.params: %s: %w", name, err)
+			}
+		}
+	}
+	if lookups > 1 {
+		errs.addf("sessionPolicy.params: %d lookup parameters, at most one is allowed; a grant per kind of resource", lookups)
 	}
 	if len(s.Envelope) == 0 {
 		errs.addf("envelope is required when a sessionPolicy is set")
@@ -305,6 +315,39 @@ func ValidateService(s *Service) error {
 	return errors.Join(errs...)
 }
 
+// ValidateAccess checks an Access document's own fields; whether its
+// service exists is checked by ValidateSource.
+func ValidateAccess(a *Access) error {
+	var errs errList
+	if a.Kind != KindAccess {
+		errs.addf("kind must be %s", KindAccess)
+	}
+	errs.add(validateName("access name", a.Name()))
+	s := &a.Spec
+	switch {
+	case s.Subject != "" && s.Service != "":
+		errs.addf("subject and service are exclusive: an access relates a workload or a service's members")
+	case s.Subject != "":
+		errs.add(validateSubject(s.Subject))
+	case s.Service != "":
+		errs.add(validateName("service", s.Service))
+	default:
+		errs.addf("one of subject or service is required")
+	}
+	if k, ok := LookupResourceKind(s.Resource.Kind); !ok {
+		errs.addf("resource.kind %q: want one of %s", s.Resource.Kind, strings.Join(ResourceKindNames(), ", "))
+	} else {
+		errs.add(k.Validate(s.Resource.Name))
+	}
+	if !validRelation(s.Relation) {
+		errs.addf("relation %q: want %s or %s", s.Relation, RelationReader, RelationWriter)
+	}
+	_, err := parseExpiry(s.ExpiresAt)
+	errs.add(err)
+	errs = append(errs, validateClusters(s.Clusters)...)
+	return errors.Join(errs...)
+}
+
 // validateClusters checks an assignment's cluster names: none empty, each
 // listed once.
 func validateClusters(clusters []string) errList {
@@ -323,9 +366,10 @@ func validateClusters(clusters []string) errList {
 }
 
 // ValidateSource validates every document of a source tree and the
-// references between them: a grant's template must exist, an assignment's
-// and a service's grants must exist, and a workload is a member of at most
-// one service.
+// references between them: a grant's template must exist and declare its
+// lookup parameter, an assignment's and a service's grants must exist, a
+// workload is a member of at most one service, and an access document's
+// service must exist.
 func ValidateSource(src *Source) error {
 	var errs errList
 	for _, g := range src.Grants {
@@ -338,7 +382,22 @@ func ValidateSource(src *Source) error {
 	for _, s := range src.Services {
 		errs = append(errs, validateSourceService(src, s, memberOf)...)
 	}
+	for _, a := range src.Accesses {
+		errs.add(validateSourceAccess(src, a))
+	}
 	return errors.Join(errs...)
+}
+
+// validateSourceAccess validates one access document and, when it is
+// valid, that the service it names exists.
+func validateSourceAccess(src *Source, a *Access) error {
+	if err := ValidateAccess(a); err != nil {
+		return fmt.Errorf("access %s (%s): %w", a.Name(), a.Path, err)
+	}
+	if a.Spec.Service != "" && src.Service(a.Spec.Service) == nil {
+		return fmt.Errorf("access %s (%s): service %q not found", a.Name(), a.Path, a.Spec.Service)
+	}
+	return nil
 }
 
 // validateSourceService validates one service and, when it is valid, that
@@ -375,8 +434,14 @@ func validateSourceGrant(src *Source, g *Grant) error {
 	if sp == nil {
 		return nil
 	}
-	if _, ok := src.Templates[sp.Template]; !ok {
+	t, ok := src.Templates[sp.Template]
+	if !ok {
 		return fmt.Errorf("grant %s (%s): template %q not found under %s/", g.Name(), g.Path, sp.Template, TemplatesDir)
+	}
+	if name, l := lookupParam(sp); l != nil {
+		if _, declared := t.Params[name]; !declared {
+			return fmt.Errorf("grant %s (%s): lookup parameter %q is not declared by template %s", g.Name(), g.Path, name, t.Name)
+		}
 	}
 	return nil
 }

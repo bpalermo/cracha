@@ -51,7 +51,7 @@ func denyReason(t *testing.T, err error) Reason {
 
 func TestComposeUnion(t *testing.T) {
 	src := NewStatic("v1", ledgerRW(), outboxR())
-	c, err := Compose(src, []string{"payments-outbox-r", "payments-ledger-rw", "payments-outbox-r", ""})
+	c, err := Compose(src, []string{"payments-outbox-r", "payments-ledger-rw", "payments-outbox-r", ""}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestComposeUnion(t *testing.T) {
 		t.Errorf("policy is not compact: %q", c.Policy)
 	}
 	// Deterministic regardless of input order.
-	again, err := Compose(src, []string{"payments-ledger-rw", "payments-outbox-r"})
+	again, err := Compose(src, []string{"payments-ledger-rw", "payments-outbox-r"}, nil)
 	if err != nil || !reflect.DeepEqual(again, c) {
 		t.Errorf("order-dependent: %+v vs %+v (%v)", again, c, err)
 	}
@@ -98,7 +98,7 @@ func TestComposeNoInlinePolicy(t *testing.T) {
 	g.SessionPolicy = ""
 	g.ManagedPolicyARNs = []string{"arn:aws:iam::111122223333:policy/ledger"}
 	g.DurationSeconds = 0
-	c, err := Compose(NewStatic("v1", g), []string{g.Name})
+	c, err := Compose(NewStatic("v1", g), []string{g.Name}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func TestComposeDenies(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := Compose(NewStatic("v1", tt.grants...), tt.names)
+			_, err := Compose(NewStatic("v1", tt.grants...), tt.names, nil)
 			if err == nil {
 				t.Fatal("composed")
 			}
@@ -217,7 +217,7 @@ func TestComposeErrors(t *testing.T) {
 	noRole.BaseRole = ""
 	for name, g := range map[string]ResolvedGrant{"malformed": malformed, "bad version": badVersion, "bad tag key": badTagKey, "short duration": shortDuration, "no role": noRole} {
 		t.Run(name, func(t *testing.T) {
-			_, err := Compose(NewStatic("v1", g), []string{g.Name})
+			_, err := Compose(NewStatic("v1", g), []string{g.Name}, nil)
 			if err == nil {
 				t.Fatal("composed")
 			}
@@ -277,7 +277,7 @@ func TestStatementsOf(t *testing.T) {
 func TestComposeDurationCap(t *testing.T) {
 	g := ledgerRW()
 	g.DurationSeconds = 7200
-	c, err := Compose(NewStatic("v1", g), []string{g.Name})
+	c, err := Compose(NewStatic("v1", g), []string{g.Name}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

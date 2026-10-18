@@ -235,19 +235,28 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   domain, on start, on every Workload API update and on a resync.
 - Code shared between binaries goes under `common/`. `common/idenc` is the
   single identity-encoding library (design 4.3): nothing else formats a
-  SourceIdentity or an authorization subject ID.
+  SourceIdentity, an authorization subject ID or a resource's object ID
+  (`idenc.Resource`, the escaped resource name of Level 3).
 - `common/grant` is the grant bundle model and compiler (design 6.2): loading,
   validation, templates, lints, the compiled bundle and assignments,
   signing (one key or a `KeyRing` of several) and publishing. Who holds
-  what is `ResolveAssignments`, the one mapping from Services and
-  Assignments that both the published assignments document and the
-  reconciler's relationships come from.
-  Its source tree holds three kinds: `Grant`, `Assignment` (a workload's own
-  grants, optionally bounded, or its `suspended: true`) and `Service` (a
+  what is `ResolveAssignments` and `ResolveAccess`, the one mapping from
+  Services, Assignments and Access documents that both the published
+  assignments document and the reconciler's relationships come from.
+  Its source tree holds four kinds: `Grant`, `Assignment` (a workload's own
+  grants, optionally bounded, or its `suspended: true`), `Service` (a
   team's workloads and the grants they share, each bounded like an
-  Assignment; a workload is a member of at most one service). The
-  composition lint unions a subject's grants from both. Names are DNS labels
-  without dots, because they become SpiceDB object IDs.
+  Assignment; a workload is a member of at most one service) and `Access`
+  (a workload's or a service's members' `reader` or `writer` relation to
+  one resource, an `s3_bucket` or a `dynamodb_table`, bounded the same
+  way). A grant may leave one template parameter to a lookup (Level 3):
+  the bundle then carries the template and the compiled maximum of
+  resources (`lookup.go`, `resource.go`), the broker renders it at
+  issuance with `Template.RenderLookup`, the compiler's own rendering. The
+  composition lint unions a subject's grants from both, its lookup grants
+  rendered with its Access. Names are DNS labels without dots, because
+  they become SpiceDB object IDs; resource names may hold dots, so they go
+  through `idenc.Resource`.
 - `common/spicedb` is the SpiceDB schema (design 6.4), embedded from
   `schema.zed`, and the constants for every object type, relation,
   permission, caveat and caveat context key in it: the broker's adapter and
@@ -269,8 +278,9 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   design 6.4: the preshared key is read from `--spicedb-token-file`, never a
   flag value; every query carries the caveat context `now` and `cluster`;
   every error is a deny; its Watch feeds the cache). The contract both
-  answer is `broker/internal/authz`, and the SpiceDB tests hold the adapter
-  to the static backend's answers for the same assignments.
+  answer is `broker/internal/authz`, `LookupResources` included, and the
+  SpiceDB tests hold the adapter to the static backend's answers for the
+  same assignments and access.
 - `reconciler/` is `cracha-reconciler`, the `authz-reconciler` writer of
   design 6.4: `schema` writes the embedded schema, `apply` makes SpiceDB's
   relationships match a grant source tree (`reconciler/internal/reconcile`

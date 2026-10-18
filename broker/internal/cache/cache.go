@@ -4,8 +4,9 @@
 //
 // Every request is still resolved against the authorization store and the
 // bundle; what the cache saves is the STS call. The key is (shape, sorted
-// grant set, bundle version, encoded workload), so a changed grant set is a
-// new key and takes effect at the next fetch. A hit is served only after the
+// grant set, bundle version, encoded workload, the hash of the resources
+// the lookup grants were rendered with), so a changed grant set or
+// resource set is a new key and takes effect at the next fetch. A hit is served only after the
 // resolution succeeded, which is the re-check of the store on every issuance;
 // a denial from the store is a denial. Credentials are never served with
 // less than Options.MinRemaining left, are refreshed ahead of time in the
@@ -27,7 +28,10 @@ package cache
 import (
 	"container/list"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"sort"
@@ -247,11 +251,33 @@ func (c *Cache) Issue(ctx context.Context, id idenc.Identity) (issuer.Issuance, 
 }
 
 // keyOf is the cache key of section 6.7: shape, sorted grant set, bundle
-// version, encoded workload.
+// version, encoded workload, and the hash of the resources the lookup
+// grants were rendered with (Level 3), so that a resource related or
+// unrelated is a new key, as a grant assigned or removed is.
 func keyOf(r issuer.Resolution) string {
 	names := append([]string(nil), r.Composed.Grants...)
 	sort.Strings(names)
-	return strings.Join([]string{r.Composed.Shape, strings.Join(names, ","), r.BundleVersion, r.SourceIdentity}, "\n")
+	return strings.Join([]string{r.Composed.Shape, strings.Join(names, ","), r.BundleVersion, r.SourceIdentity, resourcesHash(r.Composed.Resources)}, "\n")
+}
+
+// resourcesHash is the hex SHA-256 of a resolution's resources, grant by
+// grant in name order, each grant's sorted; empty when there are none.
+func resourcesHash(resources map[string][]string) string {
+	if len(resources) == 0 {
+		return ""
+	}
+	grants := make([]string, 0, len(resources))
+	for g := range resources {
+		grants = append(grants, g)
+	}
+	sort.Strings(grants)
+	h := sha256.New()
+	for _, g := range grants {
+		names := append([]string(nil), resources[g]...)
+		sort.Strings(names)
+		fmt.Fprintf(h, "%s=%s\n", g, strings.Join(names, ","))
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // lookup finds a usable entry for the key, counts the hit or miss, and

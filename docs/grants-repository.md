@@ -142,6 +142,7 @@ grants/        kind: Grant, one per file
 templates/     session policy templates, <name>.json
 services/      kind: Service, a team's workloads and their shared grants
 assignments/   kind: Assignment, one workload's own grants or its suspension
+access/        kind: Access, a workload's or a service's relation to a resource
 ```
 
 A minimal tree, as an illustration only (the account and the names are
@@ -204,6 +205,49 @@ spec:
   grants: [reports-read]
   expiresAt: "2027-06-30T00:00:00Z"
 ```
+
+A grant may leave its resource to the tree instead of naming it (design
+6.2, Level 3): the parameter is a lookup, and `kind: Access` documents say
+which buckets which workloads may use. One grant per kind of access then
+serves every bucket, and giving a workload one more bucket is an Access
+document, not a new grant. `grants/bucket-read.yaml`:
+
+```yaml
+kind: Grant
+metadata:
+  name: bucket-read
+spec:
+  account: "111122223333"
+  baseRole: arn:aws:iam::111122223333:role/broker/shape-s3-read
+  sessionPolicy:
+    template: s3-read
+    params:
+      bucket: {lookup: {kind: s3_bucket, permission: read}}
+  envelope:                 # every bucket an Access gives must fall in it
+    - arn:aws:s3:::example-*
+```
+
+`access/reports-exports.yaml`:
+
+```yaml
+kind: Access
+metadata:
+  name: reports-exports
+spec:
+  service: reports-api      # its members; or subject: prod/reports/worker
+  resource: {kind: s3_bucket, name: example-exports}
+  relation: reader          # reader gives read; writer gives read and write
+  expiresAt: "2027-06-30T00:00:00Z"   # optional, as on an Assignment
+  clusters: [prod-sa-east-1]          # optional
+```
+
+The broker renders `bucket-read` at issuance with every bucket the
+workload's Access documents give it, once per bucket for a `string`
+parameter like this one (a `list` parameter takes them all at once), and
+refuses the credential (`resource_outside_envelope`) when one is outside
+the envelope. `grantc lint` reports, per grant, how many buckets of the
+longest name its policy can hold, and per workload, the buckets it will be
+rendered with.
 
 Run the same lint locally with a release binary:
 `grantc lint .` (add `-access-analyzer -region sa-east-1` with AWS

@@ -8,7 +8,9 @@
 // Object IDs: a workload's is its authorization subject encoding of design
 // 4.3 (common/idenc), whose charset is a subset of SpiceDB's object ID
 // charset; a grant's, a service's and a team's is its name in Git; an AWS
-// account's is the 12-digit account ID.
+// account's is the 12-digit account ID; a resource's (an s3_bucket's) is
+// its name escaped by common/idenc's Resource, since a bucket name may hold
+// a dot.
 package spicedb
 
 import _ "embed"
@@ -25,8 +27,18 @@ const (
 	TypeWorkload      = "workload"
 	TypeAWSAccount    = "aws_account"
 	TypeGrant         = "grant"
+	TypeS3Bucket      = "s3_bucket"
 	TypeDynamoDBTable = "dynamodb_table"
 )
+
+// ResourceTypes are the object types of the resources a workload is
+// related to by name (Level 3): each has the relations RelationReader and
+// RelationWriter, held by a workload or a service's members with the same
+// caveats as a grant's assignees, and the permissions PermissionRead
+// (reader or writer) and PermissionWrite (writer). Their names are the
+// resource kinds of common/grant, and their object IDs the resource names
+// as common/idenc's Resource encodes them.
+var ResourceTypes = []string{TypeS3Bucket, TypeDynamoDBTable}
 
 // Relations.
 const (
@@ -37,7 +49,7 @@ const (
 	// RelationSuspended is workload#suspended: a suspended workload, whose
 	// subject is the team of its service, or TeamNone when it has none.
 	RelationSuspended = "suspended"
-	// RelationAccount is grant#account and dynamodb_table#account.
+	// RelationAccount is grant#account.
 	RelationAccount = "account"
 	// RelationAssigneeService is grant#assignee_service: a service whose
 	// members hold the grant.
@@ -45,8 +57,8 @@ const (
 	// RelationAssigneeWorkload is grant#assignee_workload: a workload that
 	// holds the grant directly.
 	RelationAssigneeWorkload = "assignee_workload"
-	// RelationWriter and RelationReader are dynamodb_table#writer and
-	// dynamodb_table#reader (Level 3).
+	// RelationWriter and RelationReader are the relations of every
+	// resource type (Level 3).
 	RelationWriter = "writer"
 	RelationReader = "reader"
 )
@@ -57,8 +69,8 @@ const (
 	PermissionIsSuspended = "is_suspended"
 	// PermissionAssume is grant#assume: whether a workload holds the grant.
 	PermissionAssume = "assume"
-	// PermissionWrite and PermissionRead are dynamodb_table#write and
-	// dynamodb_table#read (Level 3).
+	// PermissionWrite and PermissionRead are the permissions of every
+	// resource type (Level 3).
 	PermissionWrite = "write"
 	PermissionRead  = "read"
 )

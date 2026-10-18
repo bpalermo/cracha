@@ -40,6 +40,22 @@ type ResolvedGrant struct {
 	// Envelope are the ARN patterns (with * and ? wildcards) every Resource
 	// of the rendered policy must match.
 	Envelope []string
+	// Lookup is set on a grant whose policy is rendered at issuance with
+	// the resources the authorization store relates the workload to
+	// (Level 3); SessionPolicy is then empty until Compose fills it.
+	Lookup *Lookup
+}
+
+// Lookup is a grant's lookup parameter (design 6.2, Level 3).
+type Lookup struct {
+	// Kind and Permission are what the store is asked: s3_bucket, read.
+	Kind       string
+	Permission string
+	// MaxResources is the compiled maximum: more is policy_too_large.
+	MaxResources int
+	// Render renders the grant's policy for the resources, sorted and at
+	// least one: the compiler's own rendering (common/grant).
+	Render func(resources []string) (string, error)
 }
 
 // Source resolves grants by name.

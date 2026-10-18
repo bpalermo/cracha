@@ -1,6 +1,7 @@
-# The namespace the suite runs its workloads in, with the two identities
-# e2e/spire.sh registers: client, which holds a grant (the assignments
-# document in e2e/values.yaml), and unassigned, which holds none. Both
+# The namespace the suite runs its workloads in, with the identities
+# e2e/spire.sh registers: client, which holds a grant (the Service of
+# e2e/grants), reader, which holds that grant and the lookup grant whose
+# bucket the Access documents give, and unassigned, which holds none. All
 # opt in to the webhook. The namespace's default ServiceAccount does not,
 # and its pods are left as they are.
 apiVersion: v1
@@ -15,6 +16,14 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: client
+  namespace: e2e
+  annotations:
+    cracha.dev/enabled: "true"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: reader
   namespace: e2e
   annotations:
     cracha.dev/enabled: "true"

@@ -47,6 +47,51 @@ func (t *Template) Render(account string, params map[string]Param) (string, erro
 	return out, nil
 }
 
+// RenderLookup renders a lookup grant's policy (design 6.2, Level 3):
+// params are the grant's parameters, the lookup parameter param among
+// them, and resources what the authorization store found for it. The rule:
+//
+//   - a parameter the template declares as a list is the resources, and
+//     the template is rendered once;
+//   - a parameter declared as a string is rendered once per resource, and
+//     the statements of every rendering are put together in resource order
+//     under one Version (ComposePolicies), so a template written for one
+//     resource serves any number.
+//
+// The resources are sorted and their repeats dropped first, so the same
+// set renders the same bytes. No resources is an error: there is nothing
+// to render.
+func (t *Template) RenderLookup(account string, params map[string]Param, param string, resources []string) (string, error) {
+	resources = sortedUnique(resources)
+	if len(resources) == 0 {
+		return "", fmt.Errorf("template %s: parameter %q: %w", t.Name, param, errNoResources)
+	}
+	spec, ok := t.Params[param]
+	if !ok {
+		return "", fmt.Errorf("template %s: parameter %q is not declared by the template", t.Name, param)
+	}
+	with := func(v Param) map[string]Param {
+		out := make(map[string]Param, len(params))
+		for k, p := range params {
+			out[k] = p
+		}
+		out[param] = v
+		return out
+	}
+	if spec.Type == ParamList {
+		return t.Render(account, with(ListParam(resources...)))
+	}
+	policies := make([]string, 0, len(resources))
+	for _, r := range resources {
+		policy, err := t.Render(account, with(StringParam(r)))
+		if err != nil {
+			return "", err
+		}
+		policies = append(policies, policy)
+	}
+	return ComposePolicies(policies...)
+}
+
 // resolveParams checks the supplied parameters against the declarations and
 // returns the values to substitute, defaults and the implicit account
 // included.
@@ -63,22 +108,10 @@ func (t *Template) resolveParams(account string, params map[string]Param) (map[s
 		}
 	}
 	for _, name := range sortedKeys(t.Params) {
-		spec := t.Params[name]
 		v, supplied := params[name]
-		switch {
-		case supplied:
-			if v.IsList != (spec.Type == ParamList) {
-				errs = append(errs, fmt.Errorf("template %s: parameter %q must be a %s", t.Name, name, spec.Type))
-				continue
-			}
-		case spec.Default != nil:
-			v = *spec.Default
-		default:
-			errs = append(errs, fmt.Errorf("template %s: parameter %q is required", t.Name, name))
-			continue
-		}
-		if v.IsList && len(v.List) == 0 {
-			errs = append(errs, fmt.Errorf("template %s: parameter %q is an empty list", t.Name, name))
+		v, err := t.paramValue(name, v, supplied)
+		if err != nil {
+			errs = append(errs, err)
 			continue
 		}
 		values[name] = v
@@ -87,6 +120,28 @@ func (t *Template) resolveParams(account string, params map[string]Param) (map[s
 		return nil, errors.Join(errs...)
 	}
 	return values, nil
+}
+
+// paramValue is the value a declared parameter is rendered with: the one
+// supplied, which must match its type and not be a lookup, or its
+// default; an empty list is an error.
+func (t *Template) paramValue(name string, v Param, supplied bool) (Param, error) {
+	spec := t.Params[name]
+	switch {
+	case supplied && v.Lookup != nil:
+		return Param{}, fmt.Errorf("template %s: parameter %q is a lookup, filled at issuance (RenderLookup)", t.Name, name)
+	case supplied && v.IsList != (spec.Type == ParamList):
+		return Param{}, fmt.Errorf("template %s: parameter %q must be a %s", t.Name, name, spec.Type)
+	case supplied:
+	case spec.Default != nil:
+		v = *spec.Default
+	default:
+		return Param{}, fmt.Errorf("template %s: parameter %q is required", t.Name, name)
+	}
+	if v.IsList && len(v.List) == 0 {
+		return Param{}, fmt.Errorf("template %s: parameter %q is an empty list", t.Name, name)
+	}
+	return v, nil
 }
 
 // substitute renders one decoded JSON value.

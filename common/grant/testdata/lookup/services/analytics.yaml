@@ -1,0 +1,9 @@
+kind: Service
+metadata:
+  name: analytics
+spec:
+  team: data
+  members: [prod/data/etl, prod/data/report]
+  grants:
+    - name: data-read
+    - name: data-static

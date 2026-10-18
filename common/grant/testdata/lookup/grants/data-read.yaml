@@ -1,0 +1,15 @@
+# A lookup grant: which buckets is left to the Access documents.
+kind: Grant
+metadata:
+  name: data-read
+spec:
+  account: "111122223333"
+  baseRole: arn:aws:iam::111122223333:role/broker/shape-data
+  sessionPolicy:
+    template: s3-object-read
+    params:
+      bucket: { lookup: { kind: s3_bucket, permission: read } }
+  sessionTags: { team: data }
+  envelope:
+    - arn:aws:s3:::data-*
+    - arn:aws:s3:::data.*

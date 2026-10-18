@@ -28,8 +28,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -281,8 +283,8 @@ func writeCompiled(stdout io.Writer, c *grant.Compiled, bundlePath, assignmentsP
 		return err
 	}
 	fmt.Fprintf(stdout, "compiled %s: version %s, %d grants, %d bytes\n", bundlePath, c.Bundle.Version, len(c.Bundle.Grants), len(data))
-	fmt.Fprintf(stdout, "compiled %s: version %s, %d services, %d workloads, %d bytes\n", assignmentsPath, c.Assignments.Version,
-		len(c.Assignments.Services), len(c.Assignments.Workloads), len(assignments))
+	fmt.Fprintf(stdout, "compiled %s: version %s, %d services, %d workloads, %d access, %d bytes\n", assignmentsPath, c.Assignments.Version,
+		len(c.Assignments.Services), len(c.Assignments.Workloads), len(c.Assignments.Access), len(assignments))
 	return nil
 }
 
@@ -604,6 +606,9 @@ func printGrant(w io.Writer, g grant.GrantResult) {
 	if g.Size != nil {
 		size = fmt.Sprintf(", policy %d/%d chars, tags %d", g.Size.PolicyChars, grant.MaxPolicyChars, g.Size.TagCount)
 	}
+	if g.Lookup != nil {
+		size += fmt.Sprintf(" at its maximum of %d resources, lookup %s: %s#%s", g.Lookup.MaxResources, g.Lookup.Param, g.Lookup.Kind, g.Lookup.Permission)
+	}
 	fmt.Fprintf(w, "grant %s: %s%s\n", g.Grant, problemStatus(g.Problems), size)
 	for _, f := range g.Validation {
 		if !f.Blocking() {
@@ -631,6 +636,15 @@ func printSubject(w io.Writer, c grant.Composition) {
 		scope += " in cluster " + c.Cluster
 	}
 	fmt.Fprintf(w, "subject %s: %s, grants %s, policy %d/%d chars\n", scope, problemStatus(c.Problems), strings.Join(c.Grants, ","), c.PolicyChars, grant.MaxPolicyChars)
+	for _, g := range slices.Sorted(maps.Keys(c.Resources)) {
+		fmt.Fprintf(w, "  grant %s: resources %s\n", g, strings.Join(c.Resources[g], ","))
+	}
+	for _, g := range c.Dropped {
+		fmt.Fprintf(w, "  grant %s: no resource related, left out\n", g)
+	}
+	if len(c.Grants) == 0 && len(c.Dropped) > 0 {
+		fmt.Fprintln(w, "  note: every grant is a lookup grant without resources; the broker refuses no_resources")
+	}
 	printProblems(w, c.Problems)
 }
 

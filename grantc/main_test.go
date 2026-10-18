@@ -477,3 +477,75 @@ func TestSignedVersion(t *testing.T) {
 		t.Errorf("publish the bundle alone: %d, %q", code, errOut)
 	}
 }
+
+// lookupTree is a tree with a lookup grant (Level 3), the workload holding
+// it, and an Access document relating it to one bucket.
+func lookupTree(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "templates", "s3-object-read.json"), `{
+	  "params": {"bucket": {"type": "string"}},
+	  "policy": {"Version": "2012-10-17", "Statement": [
+	    {"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": "arn:aws:s3:::${bucket}/*"}
+	  ]}
+	}`)
+	writeFile(t, filepath.Join(dir, "grants", "data-read.yaml"), `kind: Grant
+metadata: { name: data-read }
+spec:
+  account: "111122223333"
+  baseRole: arn:aws:iam::111122223333:role/shape-s3-r
+  sessionPolicy:
+    template: s3-object-read
+    params: { bucket: { lookup: { kind: s3_bucket, permission: read } } }
+  envelope: ["arn:aws:s3:::data-*"]
+`)
+	writeFile(t, filepath.Join(dir, "assignments", "etl.yaml"), `kind: Assignment
+metadata: { name: etl }
+spec:
+  subject: prod/data/etl
+  grants: [data-read]
+`)
+	writeFile(t, filepath.Join(dir, "access", "etl-raw.yaml"), `kind: Access
+metadata: { name: etl-raw }
+spec:
+  subject: prod/data/etl
+  resource: { kind: s3_bucket, name: data-raw }
+  relation: reader
+`)
+	return dir
+}
+
+func TestLookupGrantCommands(t *testing.T) {
+	dir := lookupTree(t)
+	code, out, _ := runCLI(t, noAWS, "lint", dir)
+	if code != 0 {
+		t.Fatalf("lint: %d\n%s", code, out)
+	}
+	for _, want := range []string{"lookup bucket: s3_bucket#read", "at its maximum of", "grant data-read: resources data-raw"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("lint output lacks %q:\n%s", want, out)
+		}
+	}
+	bundle := filepath.Join(t.TempDir(), "bundle.json")
+	code, out, errOut := runCLI(t, noAWS, "compile", "-o", bundle, "-version", "v1", dir)
+	if code != 0 || !strings.Contains(out, "1 access") {
+		t.Fatalf("compile: %d\n%s\n%s", code, out, errOut)
+	}
+	data, err := os.ReadFile(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := grant.ParseBundle(data)
+	if err != nil || len(b.Grants) != 1 || b.Grants[0].Lookup == nil || b.Grants[0].SessionPolicy != "" {
+		t.Fatalf("bundle %+v, %v: want the lookup grant, unrendered", b, err)
+	}
+
+	// The analyzer validates the policy rendered for a probe; the probe is
+	// no bucket of the envelope, so CheckNoNewAccess is not run on it.
+	fa := &fakeAnalyzer{}
+	clients := noAWS
+	clients.analyzer = func(context.Context, string) (grant.PolicyAnalyzer, error) { return fa, nil }
+	if code, out, _ := runCLI(t, clients, "lint", "-access-analyzer", dir); code != 0 || fa.calls != 1 {
+		t.Errorf("lint with analyzer: %d, calls %d\n%s", code, fa.calls, out)
+	}
+}

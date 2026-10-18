@@ -1,4 +1,4 @@
-# The suite's one service: the assigned workload, the team that owns it
+# The client's service: the assigned workload, the team that owns it
 # and the grant every member holds. This is the source of what the
 # authorization store gives the client, in both of the suite's modes: in
 # static mode grantc compiles it into the published assignments the broker

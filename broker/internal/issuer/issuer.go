@@ -136,11 +136,14 @@ func (d *Direct) resolve(ctx context.Context, id idenc.Identity) (Resolution, er
 	}
 	r.Decision = decision
 
-	composed, err := grants.Compose(d.Grants, decision.Grants)
+	composed, err := grants.Compose(d.Grants, decision.Grants, d.finder(ctx, &r))
 	if err != nil {
 		return r, err
 	}
 	r.Composed = composed
+	for _, g := range composed.Dropped {
+		r.Decision.Trace = append(r.Decision.Trace, "grant "+g+": no resource related; left out")
+	}
 
 	tags := map[string]string{
 		TagNamespace:      id.Namespace,
@@ -165,6 +168,29 @@ func (d *Direct) resolve(ctx context.Context, id idenc.Identity) (Resolution, er
 	}
 	r.SessionTags = tags
 	return r, nil
+}
+
+// finder is the store's LookupResources for Compose (Level 3), at the
+// resolution's consistency, its traces added to the decision's. A store
+// that cannot look resources up, or fails to, is a store failure: a deny,
+// or a bounded-staleness hit of the cache. A suspension found here is a
+// deny like the one ListGrants reports.
+func (d *Direct) finder(ctx context.Context, r *Resolution) grants.Finder {
+	return func(kind, permission string) ([]string, error) {
+		lookup, ok := d.Store.(authz.ResourceLookup)
+		if !ok {
+			return nil, fmt.Errorf("%w: the store cannot look up resources (%s#%s)", ErrStore, kind, permission)
+		}
+		res, err := lookup.LookupResources(ctx, r.Subject, kind, permission, ConsistencyFrom(ctx))
+		if err != nil {
+			if errors.Is(err, authz.ErrSubjectSuspended) {
+				return nil, &grants.DenyError{Reason: grants.ReasonSubjectSuspended, Detail: err.Error()}
+			}
+			return nil, fmt.Errorf("%w: %w", ErrStore, err)
+		}
+		r.Decision.Trace = append(r.Decision.Trace, res.Trace...)
+		return res.Names, nil
+	}
 }
 
 // Issue implements Issuer.
@@ -204,6 +230,8 @@ func (d *Direct) Assume(ctx context.Context, r Resolution) (Issuance, error) {
 		slog.String("shape", r.Composed.Shape),
 		slog.String("base_role", r.Composed.BaseRole),
 		slog.Any("grants", r.Composed.Grants),
+		slog.Any("resources", r.Composed.Resources),
+		slog.Any("dropped", r.Composed.Dropped),
 		slog.String("bundle_version", r.BundleVersion),
 		slog.String("consistency_token", string(r.Decision.Token)),
 		slog.Int("duration_seconds", int(r.Composed.DurationSeconds)),

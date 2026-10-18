@@ -53,7 +53,14 @@ func Compile(ctx context.Context, src *Source, opts CompileOptions) (*Compiled, 
 	if err != nil {
 		return nil, report, err
 	}
+	access, err := ResolveAccess(src)
+	if err != nil {
+		return nil, report, err
+	}
 	a := &Assignments{Services: services, Workloads: workloads}
+	if len(access) > 0 {
+		a.Access = access
+	}
 	version := opts.Version
 	if version == "" {
 		if version, err = ContentVersion(b.Grants, a); err != nil {
@@ -77,8 +84,10 @@ func Compile(ctx context.Context, src *Source, opts CompileOptions) (*Compiled, 
 // policies they rendered.
 func compileBundle(src *Source, report *Report) *Bundle {
 	rendered := map[string]string{}
+	lookups := map[string]*BundleLookup{}
 	for _, r := range report.Grants {
 		rendered[r.Grant] = r.Rendered
+		lookups[r.Grant] = r.Lookup
 	}
 	b := &Bundle{Grants: []BundleGrant{}}
 	for _, g := range src.Grants {
@@ -91,6 +100,7 @@ func compileBundle(src *Source, report *Report) *Bundle {
 			SessionTags:       nonNilMap(g.Spec.SessionTags),
 			Duration:          g.Spec.EffectiveDuration(),
 			Envelope:          nonNil(g.Spec.Envelope),
+			Lookup:            lookups[g.Name()],
 		})
 	}
 	sort.Slice(b.Grants, func(i, j int) bool { return b.Grants[i].Name < b.Grants[j].Name })
@@ -102,7 +112,7 @@ func compileBundle(src *Source, report *Report) *Bundle {
 func ValidVersion(v string) bool { return versionRE.MatchString(v) }
 
 // ContentVersion is the SHA-256, in hex, of the canonical JSON of the
-// grants and of who holds them (the services and workloads of the
+// grants and of who holds them (the services, workloads and access of the
 // assignments; their version and generatedAt are not part of it): the
 // version of a compilation whose sources carry no version of their own. A
 // change to either, the assignments alone included, is a new version.
@@ -111,9 +121,10 @@ func ContentVersion(grants []BundleGrant, a *Assignments) (string, error) {
 		Grants    []BundleGrant      `json:"grants"`
 		Services  []AssignedService  `json:"services"`
 		Workloads []AssignedWorkload `json:"workloads"`
+		Access    []AssignedAccess   `json:"access,omitempty"`
 	}{Grants: grants}
 	if a != nil {
-		content.Services, content.Workloads = a.Services, a.Workloads
+		content.Services, content.Workloads, content.Access = a.Services, a.Workloads, a.Access
 	}
 	data, err := canonical(content)
 	if err != nil {

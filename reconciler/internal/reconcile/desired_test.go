@@ -128,3 +128,56 @@ func TestDesiredBadExpiry(t *testing.T) {
 		t.Errorf("error = %v", err)
 	}
 }
+
+func access(name, subject, service, bucket, relation, expiresAt string, clusters []string) *grant.Access {
+	return &grant.Access{
+		Kind: grant.KindAccess, Metadata: grant.Metadata{Name: name},
+		Spec: grant.AccessSpec{
+			Subject: subject, Service: service, Resource: grant.Resource{Kind: grant.ResourceS3Bucket, Name: bucket},
+			Relation: relation, ExpiresAt: expiresAt, Clusters: clusters,
+		},
+	}
+}
+
+func TestDesiredAccess(t *testing.T) {
+	src := &grant.Source{Accesses: []*grant.Access{
+		access("a1", "prod/p/w1", "", "data-raw", grant.RelationReader, "", nil),
+		access("a2", "", "svc", "data.curated", grant.RelationWriter, "", []string{"west"}),
+		access("a3", "", "svc", "data.curated", grant.RelationWriter, "", []string{"east"}),
+		access("a4", "prod/p/w2", "", "data-old", grant.RelationReader, "2030-01-01T00:00:00Z", nil),
+		{Kind: grant.KindAccess, Metadata: grant.Metadata{Name: "a5"}, Spec: grant.AccessSpec{
+			Subject: "prod/p/w2", Resource: grant.Resource{Kind: grant.ResourceDynamoDBTable, Name: "Ledger_Index"}, Relation: grant.RelationWriter,
+			ExpiresAt: "2030-01-01T00:00:00Z", Clusters: []string{"east"},
+		}},
+	}}
+	got, err := Desired(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Join([]string{
+		"dynamodb_table:Ledger_5fIndex#writer@workload:prod/p/w2[bounded{expires_at=2030-01-01T00:00:00Z allowed=[east]}]",
+		"s3_bucket:data-old#reader@workload:prod/p/w2[within_window{expires_at=2030-01-01T00:00:00Z}]",
+		"s3_bucket:data-raw#reader@workload:prod/p/w1",
+		"s3_bucket:data_2ecurated#writer@service:svc#member[in_clusters{allowed=[east,west]}]",
+	}, "\n") + "\n"
+	if lines(got) != want {
+		t.Errorf("Desired =\n%swant:\n%s", lines(got), want)
+	}
+	for _, r := range got {
+		p, err := r.Proto()
+		if err != nil {
+			t.Fatalf("%s: Proto: %v", r, err)
+		}
+		if back := FromProto(p); !back.Equal(r) {
+			t.Errorf("FromProto(Proto(%s)) = %s", r, back)
+		}
+	}
+	// A relation to a service's members and one to the service object
+	// itself are different relationships.
+	member := Relationship{ResourceType: "s3_bucket", ResourceID: "b", Relation: "reader", SubjectType: "service", SubjectID: "svc", SubjectRelation: "member"}
+	plainService := member
+	plainService.SubjectRelation = ""
+	if member.Key() == plainService.Key() {
+		t.Error("the subject relation is not part of the key")
+	}
+}

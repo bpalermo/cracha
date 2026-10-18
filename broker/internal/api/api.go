@@ -155,20 +155,23 @@ func (h *Handler) credentials(w http.ResponseWriter, r *http.Request) {
 
 // grantsResponse is what /v1/grants shows the caller about itself.
 type grantsResponse struct {
-	SPIFFEID          string            `json:"spiffeId"`
-	SourceIdentity    string            `json:"sourceIdentity"`
-	Subject           string            `json:"subject"`
-	Cluster           string            `json:"cluster"`
-	Shape             string            `json:"shape"`
-	BaseRole          string            `json:"baseRole"`
-	Account           string            `json:"account"`
-	Grants            []string          `json:"grants"`
-	SessionPolicy     json.RawMessage   `json:"sessionPolicy"`
-	ManagedPolicyARNs []string          `json:"managedPolicyArns"`
-	SessionTags       map[string]string `json:"sessionTags"`
-	DurationSeconds   int32             `json:"durationSeconds"`
-	BundleVersion     string            `json:"bundleVersion"`
-	ConsistencyToken  string            `json:"consistencyToken"`
+	SPIFFEID       string   `json:"spiffeId"`
+	SourceIdentity string   `json:"sourceIdentity"`
+	Subject        string   `json:"subject"`
+	Cluster        string   `json:"cluster"`
+	Shape          string   `json:"shape"`
+	BaseRole       string   `json:"baseRole"`
+	Account        string   `json:"account"`
+	Grants         []string `json:"grants"`
+	// Resources are, per lookup grant (Level 3), the resources its policy
+	// was rendered with.
+	Resources         map[string][]string `json:"resources,omitempty"`
+	SessionPolicy     json.RawMessage     `json:"sessionPolicy"`
+	ManagedPolicyARNs []string            `json:"managedPolicyArns"`
+	SessionTags       map[string]string   `json:"sessionTags"`
+	DurationSeconds   int32               `json:"durationSeconds"`
+	BundleVersion     string              `json:"bundleVersion"`
+	ConsistencyToken  string              `json:"consistencyToken"`
 }
 
 func (h *Handler) grants(w http.ResponseWriter, r *http.Request) {
@@ -195,6 +198,7 @@ func (h *Handler) grants(w http.ResponseWriter, r *http.Request) {
 		BaseRole:          res.Composed.BaseRole,
 		Account:           res.Composed.Account,
 		Grants:            orEmpty(res.Composed.Grants),
+		Resources:         res.Composed.Resources,
 		SessionPolicy:     policy,
 		ManagedPolicyARNs: orEmpty(res.Composed.ManagedPolicyARNs),
 		SessionTags:       res.SessionTags,

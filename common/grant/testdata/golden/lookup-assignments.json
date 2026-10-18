@@ -1,0 +1,81 @@
+{
+  "access": [
+    {
+      "relation": "reader",
+      "resource": {
+        "kind": "s3_bucket",
+        "name": "data-raw"
+      },
+      "service": "analytics"
+    },
+    {
+      "clusters": [
+        "prod-a",
+        "prod-b"
+      ],
+      "relation": "writer",
+      "resource": {
+        "kind": "s3_bucket",
+        "name": "data.curated"
+      },
+      "subject": "prod/data/etl"
+    },
+    {
+      "relation": "reader",
+      "resource": {
+        "kind": "dynamodb_table",
+        "name": "Report_Index.v2"
+      },
+      "subject": "prod/data/report"
+    },
+    {
+      "expiresAt": "2030-01-01T00:00:00Z",
+      "relation": "reader",
+      "resource": {
+        "kind": "s3_bucket",
+        "name": "data-archive"
+      },
+      "subject": "prod/data/report"
+    },
+    {
+      "expiresAt": "2026-01-01T00:00:00Z",
+      "relation": "reader",
+      "resource": {
+        "kind": "s3_bucket",
+        "name": "data-old"
+      },
+      "subject": "prod/data/report"
+    }
+  ],
+  "generatedAt": "2026-10-17T12:34:56Z",
+  "services": [
+    {
+      "grants": [
+        {
+          "name": "data-read"
+        },
+        {
+          "name": "data-static"
+        }
+      ],
+      "members": [
+        "prod/data/etl",
+        "prod/data/report"
+      ],
+      "name": "analytics",
+      "team": "data"
+    }
+  ],
+  "version": "lookup1",
+  "workloads": [
+    {
+      "grants": [
+        {
+          "name": "data-write"
+        }
+      ],
+      "subject": "prod/data/etl",
+      "suspended": false
+    }
+  ]
+}
