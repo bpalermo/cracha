@@ -245,7 +245,12 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   permission, caveat and caveat context key in it: the broker's adapter and
   the reconciler spell nothing in the schema twice.
 - `grantc/` is the grant compiler CLI over `common/grant` (lint, compile,
-  sign, verify, publish); it runs in CI and has no container image.
+  sign, verify, publish); it runs in CI and has no container image. The
+  grants themselves are not in this repository: they live in the private
+  `bpalermo/cracha-grants`, whose CI calls the reusable
+  `.github/workflows/grants.yml` with a released, verified `grantc`
+  ([docs/grants-repository.md](docs/grants-repository.md)). Never commit a
+  grant tree or a caller of that workflow here.
 - The broker's authorization store is one of two backends, chosen by
   `--authz-backend`: `static` (`broker/internal/authz/static`, the
   assignments file `--assignments`) or `spicedb`
@@ -467,9 +472,29 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   check, release notes) and, if the chart deploys it, `values.yaml`, the
   chart's `images` and `PINNED_COMPONENTS`, and
   `bazel/check-registry-config.sh`.
+- On a `v*` tag the `grantc` job of `publish.yml` builds
+  `//grantc:grantc_{linux_amd64,linux_arm64,darwin_arm64}` (`go_cross_binary`
+  of the pure-Go, stamped `//grantc`; `//grantc:release_binaries_test`
+  checks each one's header and that the linux ones are static), names them
+  `grantc_<version>_<os>_<arch>` (the version without its `v`), writes
+  `checksums.txt` (sha256), signs it keyless with the pinned cosign
+  (`cosign sign-blob`, the Sigstore bundle `checksums.txt.sigstore.json`)
+  and verifies it; `release` attaches the five files to the GitHub Release.
+  A snapshot of `main` publishes no binaries. A new platform is a name in
+  the list of `grantc/BUILD.bazel`, in `GRANTC_PLATFORMS` of `publish.yml`,
+  in the query of `ci.yml` and in the release job's expected files.
+- `.github/workflows/grants.yml` is the reusable workflow
+  (`on: workflow_call`) a grants repository runs: it verifies a release's
+  `checksums.txt` signature against `publish.yml@refs/tags/<version>` and
+  the binary against it, assumes the caller's role through GitHub OIDC and
+  runs `grantc` (docs/grants-repository.md). It declares no environment,
+  since one would change the OIDC subject the roles trust. It cannot run
+  Bazel, so it downloads cosign itself, pinned by version and sha256.
 - cosign is the release binary the `rules_img_signer_cosign` bazel_dep pins by
   sha256, wrapped as `//bazel/cosign`; `//bazel/cosign:version_test` fails
-  when the pin and the test's `EXPECTED` disagree, so bump both together. To
+  when the pin and the test's `EXPECTED` disagree, so bump both together,
+  and `//bazel/cosign:workflow_pin_test` fails when `COSIGN_VERSION` and
+  the sha256 of `grants.yml` are not that cosign, so bump those with it. To
   verify a published image (the index and every platform manifest, and that
   the signature is a referrer as `SIGNATURE_LAYOUT` promises) or the chart:
 
@@ -494,7 +519,11 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   job reports as `CHART_VERSION`), once per backend. The tag publishes the images under
   `v<VERSION>` (and `v<VERSION>-<commit>`), the chart as `<VERSION>`, signs
   them, and once `check` passes creates the GitHub Release with the pinned
-  references and the `cosign verify` command in its notes. A tag that is not
+  references and the `cosign verify` command in its notes, and the `grantc`
+  binaries with their signed `checksums.txt` and the `cosign verify-blob`
+  command. The tag path cannot run before a real tag: check a candidate's
+  release assets with that command and with a grants repository's `check`
+  run against the candidate before tagging the release. A tag that is not
   on `main`, or that does not match `VERSION` (the workspace status then
   reports a snapshot, not the release), is refused.
 - After the release, set `VERSION` to the next one in a pull request.

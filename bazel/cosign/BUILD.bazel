@@ -54,3 +54,23 @@ sh_test(
     env = {"COSIGN_RLOCATIONPATH": "$(rlocationpath %s)" % _COSIGN},
     deps = ["@bazel_tools//tools/bash/runfiles"],
 )
+
+# .github/workflows/grants.yml cannot run Bazel (it runs in the grants
+# repository), so it downloads cosign's release binary itself, pinned by
+# version and sha256. This fails when that pin is not the cosign above: the
+# version always, the sha256 of the host's platform when the workflow pins
+# one (linux).
+sh_test(
+    name = "workflow_pin_test",
+    size = "small",
+    srcs = ["workflow_pin_test.sh"],
+    data = [
+        _COSIGN,
+        "//:.github/workflows/grants.yml",
+    ],
+    env = {
+        "COSIGN_RLOCATIONPATH": "$(rlocationpath %s)" % _COSIGN,
+        "WORKFLOW_RLOCATIONPATH": "$(rlocationpath //:.github/workflows/grants.yml)",
+    },
+    deps = ["@bazel_tools//tools/bash/runfiles"],
+)

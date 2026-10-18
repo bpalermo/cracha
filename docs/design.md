@@ -1,6 +1,6 @@
 # Crachá: Workload AWS Credentials via SPIFFE Identity, a Credential Broker, a Pluggable Authorization Store and a Node Agent
 
-Project: Crachá (`cracha`, https://cracha.dev) · Status: Draft · Owner: Bruno (platform) · Last updated: 2026-10-17
+Project: Crachá (`cracha`, https://cracha.dev) · Status: Draft · Owner: Bruno (platform) · Last updated: 2026-10-18
 
 Naming: binaries and Kubernetes objects use the ASCII form `cracha-*`. Labels, annotations and any API groups live under `cracha.dev` (e.g. `cracha.dev/enabled`, `cracha.dev/credentials`).
 
@@ -188,6 +188,8 @@ CI (`grant-compiler`) pipeline:
 4. Size budget lint (2,048-char inline session policy + packed tag budget).
 5. Composition lint, for assignments known in Git: the union of an assignee's grants, from its own Assignments and from the Service it is a member of, stays within one shape, the size budget and the envelope. The broker re-checks all three at issuance, since assignments can also come from the approval flow.
 6. Compile → sign (KMS or cosign) → publish to S3.
+
+The grant tree is a repository of its own, not this one. Its CI runs the pipeline with a released `grantc`, verified against the signed checksums of its Crachá release, through the reusable workflow `.github/workflows/grants.yml`: lint and compile on a pull request; lint, compile, sign with a KMS key, verify and publish to S3 on a merge ([grants-repository.md](grants-repository.md)).
 
 Broker polls the bundle, verifies signature, swaps atomically, and **keeps the last good bundle on failure (never fails open).**
 
