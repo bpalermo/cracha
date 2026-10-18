@@ -4,7 +4,9 @@
 // the contract; no SpiceDB type leaves it.
 //
 // Objects are workload:<authz encoding of design 4.3>, grant:<name>,
-// service:<name> and team:<name>. Every permission query carries the caveat
+// service:<name> and team:<name>; every type, relation, permission and
+// context key is spelled as common/spicedb, the schema package the
+// reconciler shares, exports it. Every permission query carries the caveat
 // context the schema's conditions evaluate against: now, the broker's clock
 // as an RFC 3339 timestamp, and cluster, the cluster the broker serves. A
 // result SpiceDB reports as conditional therefore means context is missing,
@@ -33,26 +35,8 @@ import (
 
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 	"github.com/bpalermo/cracha/broker/internal/authz"
+	schema "github.com/bpalermo/cracha/common/spicedb"
 	"google.golang.org/protobuf/types/known/structpb"
-)
-
-// The names of the schema of design 6.4, as this adapter speaks them. A
-// follow-up points them at the schema package the reconciler shares.
-const (
-	typeWorkload = "workload"
-	typeGrant    = "grant"
-	typeService  = "service"
-
-	relationSuspended        = "suspended"
-	relationMember           = "member"
-	relationOwner            = "owner"
-	relationAssigneeService  = "assignee_service"
-	relationAssigneeWorkload = "assignee_workload"
-
-	permissionAssume = "assume"
-
-	contextNow     = "now"
-	contextCluster = "cluster"
 )
 
 // DefaultTimeout bounds one gRPC call when no Option sets another.
@@ -150,8 +134,8 @@ func (s *Store) Check(ctx context.Context, subject authz.Subject, grant string, 
 	defer cancel()
 	resp, err := s.perms.CheckPermission(ctx, &v1.CheckPermissionRequest{
 		Consistency: consistency,
-		Resource:    &v1.ObjectReference{ObjectType: typeGrant, ObjectId: grant},
-		Permission:  permissionAssume,
+		Resource:    &v1.ObjectReference{ObjectType: schema.TypeGrant, ObjectId: grant},
+		Permission:  schema.PermissionAssume,
 		Subject:     workloadSubject(subject),
 		Context:     s.caveatContext(subject),
 	})
@@ -175,9 +159,9 @@ func (s *Store) Check(ctx context.Context, subject authz.Subject, grant string, 
 // suspends it.
 func (s *Store) checkSuspended(ctx context.Context, subject authz.Subject, consistency *v1.Consistency, d *authz.Decision) error {
 	rels, token, err := s.readRelationships(ctx, consistency, &v1.RelationshipFilter{
-		ResourceType:       typeWorkload,
+		ResourceType:       schema.TypeWorkload,
 		OptionalResourceId: subject.ID,
-		OptionalRelation:   relationSuspended,
+		OptionalRelation:   schema.RelationSuspended,
 	})
 	if err != nil {
 		return fmt.Errorf("spicedb: suspension of %s: %w", subject.ID, err)
@@ -199,8 +183,8 @@ func (s *Store) lookupGrants(ctx context.Context, subject authz.Subject, consist
 	defer cancel()
 	stream, err := s.perms.LookupResources(ctx, &v1.LookupResourcesRequest{
 		Consistency:        consistency,
-		ResourceObjectType: typeGrant,
-		Permission:         permissionAssume,
+		ResourceObjectType: schema.TypeGrant,
+		Permission:         schema.PermissionAssume,
 		Subject:            workloadSubject(subject),
 		Context:            s.caveatContext(subject),
 	})
@@ -240,10 +224,10 @@ func (s *Store) lookupGrants(ctx context.Context, subject authz.Subject, consist
 // neither tag.
 func (s *Store) tagsOf(ctx context.Context, subject authz.Subject, consistency *v1.Consistency, d *authz.Decision) error {
 	rels, _, err := s.readRelationships(ctx, consistency, &v1.RelationshipFilter{
-		ResourceType:     typeService,
-		OptionalRelation: relationMember,
+		ResourceType:     schema.TypeService,
+		OptionalRelation: schema.RelationMember,
 		OptionalSubjectFilter: &v1.SubjectFilter{
-			SubjectType:       typeWorkload,
+			SubjectType:       schema.TypeWorkload,
 			OptionalSubjectId: subject.ID,
 		},
 	})
@@ -264,9 +248,9 @@ func (s *Store) tagsOf(ctx context.Context, subject authz.Subject, consistency *
 	d.Tags["service"] = service
 	d.Trace = append(d.Trace, "member of service "+service)
 	owners, _, err := s.readRelationships(ctx, consistency, &v1.RelationshipFilter{
-		ResourceType:       typeService,
+		ResourceType:       schema.TypeService,
 		OptionalResourceId: service,
-		OptionalRelation:   relationOwner,
+		OptionalRelation:   schema.RelationOwner,
 	})
 	if err != nil {
 		return fmt.Errorf("spicedb: owner of service %s: %w", service, err)
@@ -314,7 +298,7 @@ func (s *Store) Watch(ctx context.Context, since authz.Token) (<-chan authz.Chan
 	if s.watcher == nil {
 		return nil, errors.New("spicedb: watch: no watch client")
 	}
-	req := &v1.WatchRequest{OptionalObjectTypes: []string{typeGrant, typeService, typeWorkload}}
+	req := &v1.WatchRequest{OptionalObjectTypes: []string{schema.TypeGrant, schema.TypeService, schema.TypeWorkload}}
 	if since != "" {
 		req.OptionalStartCursor = &v1.ZedToken{Token: string(since)}
 	}
@@ -359,15 +343,15 @@ func (s *Store) forward(ctx context.Context, stream v1.WatchService_WatchClient,
 func changeOf(rel *v1.Relationship, token authz.Token) (authz.Change, bool) {
 	resource, relation := rel.GetResource(), rel.GetRelation()
 	switch {
-	case resource.GetObjectType() == typeGrant && relation == relationAssigneeWorkload:
+	case resource.GetObjectType() == schema.TypeGrant && relation == schema.RelationAssigneeWorkload:
 		return authz.Change{
 			Subject: authz.Subject{ID: rel.GetSubject().GetObject().GetObjectId()},
 			Grant:   resource.GetObjectId(),
 			Token:   token,
 		}, true
-	case resource.GetObjectType() == typeGrant && relation == relationAssigneeService,
-		resource.GetObjectType() == typeService && (relation == relationMember || relation == relationOwner),
-		resource.GetObjectType() == typeWorkload && relation == relationSuspended:
+	case resource.GetObjectType() == schema.TypeGrant && relation == schema.RelationAssigneeService,
+		resource.GetObjectType() == schema.TypeService && (relation == schema.RelationMember || relation == schema.RelationOwner),
+		resource.GetObjectType() == schema.TypeWorkload && relation == schema.RelationSuspended:
 		return authz.Change{Token: token}, true
 	}
 	return authz.Change{}, false
@@ -390,13 +374,13 @@ func consistencyOf(c authz.Consistency) (*v1.Consistency, error) {
 // caveats.
 func (s *Store) caveatContext(subject authz.Subject) *structpb.Struct {
 	return &structpb.Struct{Fields: map[string]*structpb.Value{
-		contextNow:     structpb.NewStringValue(s.now().UTC().Format(time.RFC3339)),
-		contextCluster: structpb.NewStringValue(subject.Cluster),
+		schema.ContextNow:     structpb.NewStringValue(s.now().UTC().Format(time.RFC3339)),
+		schema.ContextCluster: structpb.NewStringValue(subject.Cluster),
 	}}
 }
 
 func workloadSubject(subject authz.Subject) *v1.SubjectReference {
-	return &v1.SubjectReference{Object: &v1.ObjectReference{ObjectType: typeWorkload, ObjectId: subject.ID}}
+	return &v1.SubjectReference{Object: &v1.ObjectReference{ObjectType: schema.TypeWorkload, ObjectId: subject.ID}}
 }
 
 func tokenOf(t *v1.ZedToken) authz.Token {

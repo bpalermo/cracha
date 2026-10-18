@@ -9,6 +9,7 @@ import (
 	"time"
 
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+	schema "github.com/bpalermo/cracha/common/spicedb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -97,8 +98,8 @@ const (
 // evaluate is the caveat evaluation of the schema's three caveats; a
 // missing context value or an unknown caveat is conditional, as in SpiceDB.
 func (r rel) evaluate(ctx *structpb.Struct) outcome {
-	now, hasNow := ctx.GetFields()[contextNow]
-	cluster, hasCluster := ctx.GetFields()[contextCluster]
+	now, hasNow := ctx.GetFields()[schema.ContextNow]
+	cluster, hasCluster := ctx.GetFields()[schema.ContextCluster]
 	window := func() outcome {
 		if !hasNow {
 			return conditional
@@ -144,12 +145,12 @@ func (r rel) evaluate(ctx *structpb.Struct) outcome {
 func (f *fakeSpiceDB) assume(grant, workload string, ctx *structpb.Struct) outcome {
 	result := denied
 	for _, r := range f.rels {
-		if r.resourceType != typeGrant || r.resourceID != grant {
+		if r.resourceType != schema.TypeGrant || r.resourceID != grant {
 			continue
 		}
 		switch {
-		case r.relation == relationAssigneeWorkload && r.subjectID == workload:
-		case r.relation == relationAssigneeService && f.member(r.subjectID, workload):
+		case r.relation == schema.RelationAssigneeWorkload && r.subjectID == workload:
+		case r.relation == schema.RelationAssigneeService && f.member(r.subjectID, workload):
 		default:
 			continue
 		}
@@ -160,7 +161,7 @@ func (f *fakeSpiceDB) assume(grant, workload string, ctx *structpb.Struct) outco
 
 func (f *fakeSpiceDB) member(service, workload string) bool {
 	for _, r := range f.rels {
-		if r.resourceType == typeService && r.resourceID == service && r.relation == relationMember && r.subjectID == workload {
+		if r.resourceType == schema.TypeService && r.resourceID == service && r.relation == schema.RelationMember && r.subjectID == workload {
 			return true
 		}
 	}
@@ -197,7 +198,7 @@ func (f *fakeSpiceDB) LookupResources(ctx context.Context, in *v1.LookupResource
 	// Every assignment is a result of its own, as SpiceDB's lookup may
 	// return a resource more than once.
 	for _, r := range f.rels {
-		if r.resourceType != typeGrant || (r.relation != relationAssigneeWorkload && r.relation != relationAssigneeService) {
+		if r.resourceType != schema.TypeGrant || (r.relation != schema.RelationAssigneeWorkload && r.relation != schema.RelationAssigneeService) {
 			continue
 		}
 		resp := &v1.LookupResourcesResponse{LookedUpAt: f.zedtoken(), ResourceObjectId: r.resourceID}
