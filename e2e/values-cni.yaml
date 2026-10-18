@@ -1,0 +1,6 @@
+# What E2E_ENROL=cni adds to e2e/values.yaml: the agent enrols pods through
+# the cracha-cni plugin (design 7.2) instead of the cracha-enrol init
+# container the webhook injects in the default mode. Nothing else: the
+# chart renders what the mode needs.
+agent:
+  enrol: cni

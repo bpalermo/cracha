@@ -18,6 +18,18 @@
 # mode, the port-forward and the key from the environment (.bazelrc's
 # test:e2e); those that need SpiceDB skip in static mode.
 #
+# E2E_ENROL chooses how the agent enrols a pod (design 7.2): init (the
+# default, the chart's) has the webhook inject the cracha-enrol init
+# container; cni installs the chart with e2e/values-cni.yaml on top, which
+# switches the agent to the cracha-cni plugin. The tests learn the mode the
+# same way; those that look at one mode's wiring skip in the other.
+#
+# Nothing is trusted or mounted by the test workloads: the broker and the
+# webhook serve their X.509-SVIDs from SPIRE, the agent reaches the broker
+# over SPIFFE mTLS, and a pod sees only the loopback listener the agent
+# binds in its network namespace, over plain HTTP. There is no CA to hand
+# out.
+#
 # E2E_CHART=<version> runs the suite against a published chart instead of
 # the one built here: the package is pulled from the registry
 # bazel/registry.bzl names, at that version, with the same pinned helm, and
@@ -41,11 +53,19 @@ cd "$(dirname "$0")/.."
 
 cluster="${KIND_CLUSTER:-cracha-e2e}"
 authz="${E2E_AUTHZ:-static}"
+enrol="${E2E_ENROL:-init}"
 chart_version="${E2E_CHART:-}"
 case "${authz}" in
 static | spicedb) ;;
 *)
 	echo "e2e: E2E_AUTHZ must be static or spicedb, not '${authz}'" >&2
+	exit 2
+	;;
+esac
+case "${enrol}" in
+init | cni) ;;
+*)
+	echo "e2e: E2E_ENROL must be init or cni, not '${enrol}'" >&2
 	exit 2
 	;;
 esac
@@ -68,7 +88,6 @@ fi
 
 created=0
 kubeconfig="$(mktemp)"
-certs="$(mktemp -d)"
 bundle="$(mktemp -d)"
 spicedb="$(mktemp -d)"
 pulled="$(mktemp -d)"
@@ -77,7 +96,7 @@ cleanup() {
 	if [[ -n "${port_forward}" ]]; then
 		kill "${port_forward}" 2>/dev/null || true
 	fi
-	rm -rf "${kubeconfig}" "${certs}" "${bundle}" "${spicedb}" "${pulled}"
+	rm -rf "${kubeconfig}" "${bundle}" "${spicedb}" "${pulled}"
 	if [[ "${created}" == 1 && "${E2E_KEEP_CLUSTER:-0}" != 1 ]]; then
 		kind delete cluster --name "${cluster}"
 	fi
@@ -229,18 +248,23 @@ if [[ "${authz}" == spicedb ]]; then
 fi
 export E2E_AUTHZ="${authz}"
 
+# The enrolment mode: the chart's default is init; cni is one values file.
+enrol_values=()
+if [[ "${enrol}" == cni ]]; then
+	enrol_values=(--values e2e/values-cni.yaml)
+fi
+export E2E_ENROL="${enrol}"
+
 # Install the chart. e2e/values.yaml is the suite's configuration. The
 # release is created or upgraded in place, so a kept cluster is reused.
-#
-# The chart's TLS mode is left at generated: it makes a CA of its own and
-# issues the broker's and the webhook's certificates from it, and the test
-# workloads are handed that CA below (SSL_CERT_FILE, not AWS_CA_BUNDLE:
-# design 6.5). The CA lives in the Secret cracha-ca, which an upgrade keeps.
+# --wait holds until every workload is ready, which for the webhook means
+# it has published its trust bundle into its own configuration (design
+# 7.5): from here on the apiserver can reach it.
 "${helm}" upgrade --install cracha "${chart}" \
 	--namespace cracha-system --create-namespace \
 	--values e2e/values.yaml "${chart_values[@]}" \
 	--values "${bundle}/values.yaml" --set-file broker.bundle.verifyKey="${bundle}/pub.pem" \
-	"${authz_values[@]}" \
+	"${authz_values[@]}" "${enrol_values[@]}" \
 	--wait --timeout 300s
 
 # The STS stand-in the broker talks to: a fixture of the suite, not part of
@@ -259,12 +283,8 @@ for workload in "${workloads[@]}"; do
 	kubectl rollout status "${workload}" -n cracha-system --timeout=300s
 done
 
-# The test namespace, its identities and the CA its pods trust: the chart's,
-# from the Secret it keeps it in.
+# The test namespace and its identities.
 kubectl apply -f e2e/manifests/e2e.yaml
-kubectl get secret cracha-ca -n cracha-system -o jsonpath='{.data.tls\.crt}' | base64 -d >"${certs}/ca.crt"
-kubectl create configmap cracha-ca -n e2e --from-file=ca.crt="${certs}/ca.crt" \
-	--dry-run=client -o yaml | kubectl apply -f -
 
 # E2E_FILTER runs only the tests whose name matches, for working on one.
 tests=()
