@@ -13,7 +13,6 @@ go_library(
         "@com_github_spiffe_go_spiffe_v2//spiffetls/tlsconfig",
         "@com_github_spiffe_go_spiffe_v2//svid/jwtsvid",
         "@com_github_spiffe_go_spiffe_v2//svid/x509svid",
-        "@com_github_spiffe_go_spiffe_v2//workloadapi",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//backoff",
         "@org_golang_google_grpc//codes",

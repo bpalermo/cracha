@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "listener",
+    srcs = ["listener.go"],
+    importpath = "github.com/bpalermo/cracha/agent/internal/listener",
+    visibility = ["//agent:__subpackages__"],
+)
+
+go_test(
+    name = "listener_test",
+    srcs = ["listener_test.go"],
+    embed = [":listener"],
+)

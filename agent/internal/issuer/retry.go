@@ -9,9 +9,10 @@ import (
 )
 
 // RetryPolicy bounds the retries of one fetch. The deadline is per fetch, not
-// per attempt: kubelet retries a failed NodePublishVolume on its own backoff,
-// so the plugin only needs to absorb the seconds a new pod's entry takes to
-// reach the issuer's agent, not to wait indefinitely.
+// per attempt: it is the request's budget (design 7.3, agent.fetchDeadline),
+// under the SDKs' own request timeouts, so the agent only absorbs the seconds
+// a new pod's entry takes to reach the issuer's agent and then answers 503
+// for the SDK to retry.
 type RetryPolicy struct {
 	// Deadline bounds the whole fetch, attempts and waits included. Zero means
 	// DefaultDeadline.
@@ -27,7 +28,7 @@ type RetryPolicy struct {
 
 // Defaults of RetryPolicy.
 const (
-	DefaultDeadline = 30 * time.Second
+	DefaultDeadline = 3 * time.Second
 	DefaultInitial  = 250 * time.Millisecond
 	DefaultMax      = 5 * time.Second
 	DefaultJitter   = 0.2

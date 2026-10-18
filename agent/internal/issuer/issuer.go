@@ -1,8 +1,8 @@
 // Package issuer is the identity issuer adapter contract of cracha-agent
-// (docs/design.md, section 4.1): the one piece of the plugin that is not the
+// (docs/design.md, section 4.1): the one piece of the agent that is not the
 // standard Workload API, a per-pod JWT-SVID fetch on the pod's behalf.
 //
-// The plugin names a pod by its Kubernetes object reference and an audience;
+// The agent names a pod by its Kubernetes object reference and an audience;
 // the issuer resolves and attests the pod itself and answers only for pods its
 // own agent sees on this node. Crachá never attests a workload (section 11).
 // Issuer-specific types never leave their adapter: the reference SPIRE adapter
@@ -37,11 +37,11 @@ type Issuer interface {
 	// FetchJWTSVID returns the pod's JWT-SVID for the audience and the token's
 	// expiry, as the issuer reports it. The token is not verified here: it was
 	// just minted by the issuer over an authenticated channel, and verifying it
-	// is the broker's job. The plugin still parses its claims (internal/token)
-	// before writing it.
+	// is the broker's job; the agent only reads its expiry, to know when to
+	// fetch again.
 	//
 	// An error is classified with Classify: the caller retries NotFoundYet and
-	// Unavailable, and fails the publish on anything else.
+	// Unavailable, and fails the request on anything else.
 	FetchJWTSVID(ctx context.Context, ref PodRef, audience string) (token string, expiry time.Time, err error)
 }
 
@@ -55,13 +55,13 @@ const (
 	Permanent Kind = iota
 	// NotFoundYet: the issuer cannot resolve the pod, or has no entry for it
 	// yet. Benign for a brand new pod, whose registration entry takes seconds
-	// to reach the node's agent, so it is retried within the publish deadline.
+	// to reach the node's agent, so it is retried within the fetch deadline.
 	NotFoundYet
-	// Unavailable: the issuer's agent is restarting, or the plugin's own
+	// Unavailable: the issuer's agent is restarting, or the agent's own
 	// identity has not been issued yet, so the authenticated channel cannot be
 	// built. Retried.
 	Unavailable
-	// PermissionDenied: the issuer's access policy refuses the plugin for this
+	// PermissionDenied: the issuer's access policy refuses the agent for this
 	// pod. Retrying cannot help; the fix is the issuer's RBAC. Never retried.
 	PermissionDenied
 )
@@ -112,7 +112,7 @@ func Classify(err error) Kind {
 }
 
 // Retryable reports whether a fetch failure is worth retrying within the
-// publish deadline.
+// fetch deadline.
 func Retryable(err error) bool {
 	switch Classify(err) {
 	case NotFoundYet, Unavailable:

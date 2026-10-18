@@ -1,8 +1,9 @@
-// Package tokenreview is the context check of NodePublishVolume
-// (docs/design.md, section 7.3, step 2): the kubelet-supplied bound
-// ServiceAccount token is verified by the API server and its pod binding must
-// match the pod the volume context names. It is a check that the request is
-// about the pod kubelet says it is, not an attestation: that is the issuer's.
+// Package tokenreview is the context check of init-mode enrolment
+// (docs/design.md, section 7.2): the bound ServiceAccount token the
+// cracha-enrol init container presents is verified by the API server for
+// the agent's audience, and the pod it is bound to is read from the review's
+// extras. It is a check that the request is about the pod the token was
+// issued for, not an attestation: that is the issuer's.
 package tokenreview
 
 import (
@@ -10,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
@@ -17,16 +19,50 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-// PodUIDExtra is the TokenReview user extra the API server fills with the
-// UID of the pod a bound token was issued for.
-const PodUIDExtra = "authentication.kubernetes.io/pod-uid"
+// The TokenReview user extras the API server fills for a token bound to a
+// pod.
+const (
+	PodNameExtra = "authentication.kubernetes.io/pod-name"
+	PodUIDExtra  = "authentication.kubernetes.io/pod-uid"
+)
 
 // Result is what a successful review says about the token.
 type Result struct {
 	// Username is the authenticated user: system:serviceaccount:<ns>:<sa>.
 	Username string
-	// PodUID is the pod the token is bound to, empty for an unbound token.
-	PodUID string
+	// PodName and PodUID are the pod the token is bound to, empty for an
+	// unbound token.
+	PodName string
+	PodUID  string
+}
+
+// Namespace is the namespace of the service account the token belongs to,
+// from its username, or "" when the user is not a service account.
+func (r Result) Namespace() string {
+	ns, _, ok := splitServiceAccount(r.Username)
+	if !ok {
+		return ""
+	}
+	return ns
+}
+
+// ServiceAccount is the name of the service account the token belongs to.
+func (r Result) ServiceAccount() string {
+	_, sa, _ := splitServiceAccount(r.Username)
+	return sa
+}
+
+func splitServiceAccount(username string) (ns, sa string, ok bool) {
+	const prefix = "system:serviceaccount:"
+	rest, found := strings.CutPrefix(username, prefix)
+	if !found {
+		return "", "", false
+	}
+	ns, sa, found = strings.Cut(rest, ":")
+	if !found || ns == "" || sa == "" {
+		return "", "", false
+	}
+	return ns, sa, true
 }
 
 // Reviewer verifies a token for an audience. It returns an error when the
@@ -35,46 +71,12 @@ type Reviewer interface {
 	Review(ctx context.Context, token, audience string) (Result, error)
 }
 
-// Binding is the pod a token must be bound to.
-type Binding struct {
-	Namespace      string
-	ServiceAccount string
-	PodUID         string
-}
-
-// Username is the Kubernetes username of the binding's service account.
-func (b Binding) Username() string {
-	return fmt.Sprintf("system:serviceaccount:%s:%s", b.Namespace, b.ServiceAccount)
-}
-
-// Check reviews token for audience with r and requires it to be bound to
-// exactly want: the service account's username and the pod UID.
-func Check(ctx context.Context, r Reviewer, token, audience string, want Binding) error {
-	if token == "" {
-		return errors.New("no service account token for audience " + audience)
-	}
-	res, err := r.Review(ctx, token, audience)
-	if err != nil {
-		return err
-	}
-	if res.Username != want.Username() {
-		return fmt.Errorf("the service account token belongs to %q, not to %q", res.Username, want.Username())
-	}
-	if res.PodUID == "" {
-		return errors.New("the service account token is not bound to a pod")
-	}
-	if res.PodUID != want.PodUID {
-		return fmt.Errorf("the service account token is bound to pod %s, not to %s", res.PodUID, want.PodUID)
-	}
-	return nil
-}
-
 // Kubernetes reviews tokens with the API server's TokenReview.
 type Kubernetes struct {
 	client kubernetes.Interface
 }
 
-// NewKubernetes returns a Reviewer over client. The plugin's own service
+// NewKubernetes returns a Reviewer over client. The agent's own service
 // account needs `create` on tokenreviews.authentication.k8s.io.
 func NewKubernetes(client kubernetes.Interface) *Kubernetes {
 	return &Kubernetes{client: client}
@@ -99,6 +101,9 @@ func (k *Kubernetes) Review(ctx context.Context, token, audience string) (Result
 		return Result{}, fmt.Errorf("TokenReview: the token is not for audience %q (got %q)", audience, tr.Status.Audiences)
 	}
 	res := Result{Username: tr.Status.User.Username}
+	if names := tr.Status.User.Extra[PodNameExtra]; len(names) == 1 {
+		res.PodName = names[0]
+	}
 	if uids := tr.Status.User.Extra[PodUIDExtra]; len(uids) == 1 {
 		res.PodUID = uids[0]
 	}
