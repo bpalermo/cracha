@@ -1,0 +1,33 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "cabundle",
+    srcs = ["cabundle.go"],
+    importpath = "github.com/bpalermo/cracha/webhook/internal/cabundle",
+    visibility = ["//webhook:__subpackages__"],
+    deps = [
+        "@com_github_spiffe_go_spiffe_v2//bundle/x509bundle",
+        "@com_github_spiffe_go_spiffe_v2//spiffeid",
+        "@com_github_spiffe_go_spiffe_v2//svid/x509svid",
+        "@io_k8s_api//admissionregistration/v1:admissionregistration",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_apimachinery//pkg/types",
+        "@io_k8s_client_go//kubernetes",
+    ],
+)
+
+go_test(
+    name = "cabundle_test",
+    srcs = ["cabundle_test.go"],
+    embed = [":cabundle"],
+    deps = [
+        "@com_github_spiffe_go_spiffe_v2//bundle/x509bundle",
+        "@com_github_spiffe_go_spiffe_v2//spiffeid",
+        "@com_github_spiffe_go_spiffe_v2//svid/x509svid",
+        "@io_k8s_api//admissionregistration/v1:admissionregistration",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_apimachinery//pkg/runtime",
+        "@io_k8s_client_go//kubernetes/fake",
+        "@io_k8s_client_go//testing",
+    ],
+)
