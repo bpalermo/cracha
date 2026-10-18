@@ -31,7 +31,7 @@ const (
 	// (e2e/manifests/e2e.yaml), with the ServiceAccounts below.
 	systemNamespace = "cracha-system"
 	testNamespace   = "e2e"
-	// assignedSA holds one grant in the broker's assignments file;
+	// assignedSA holds one grant through the Service of e2e/grants;
 	// unassignedSA holds none. Both are registered with SPIRE and both opt
 	// in to the webhook.
 	assignedSA   = "client"

@@ -32,6 +32,9 @@ test:e2e --test_env=E2E_HELM
 test:e2e --test_env=E2E_CHART_PACKAGE
 test:e2e --test_env=E2E_SPICEDB_ENDPOINT
 test:e2e --test_env=E2E_SPICEDB_TOKEN_FILE
+# The key run.sh signed the publication with, for the test that republishes
+# the grant tree.
+test:e2e --test_env=E2E_BUNDLE_KEY
 test:e2e --test_timeout=1500
 # Each test by name, with its timing, in the test log.
 test:e2e --test_arg=-test.v
