@@ -10,6 +10,7 @@ go_library(
     visibility = ["//broker:__subpackages__"],
     deps = [
         "//broker/internal/authz",
+        "//common/spicedb",
         "@com_github_authzed_authzed_go//proto/authzed/api/v1:api",
         "@com_github_authzed_authzed_go//v1:authzed-go",
         "@org_golang_google_grpc//:grpc",
@@ -30,6 +31,7 @@ go_test(
     deps = [
         "//broker/internal/authz",
         "//broker/internal/authz/static",
+        "//common/spicedb",
         "@com_github_authzed_authzed_go//proto/authzed/api/v1:api",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//codes",

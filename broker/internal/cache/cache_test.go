@@ -469,6 +469,9 @@ func TestWatchInvalidates(t *testing.T) {
 	// One to the subject's grant drops its entry and nobody else's.
 	store.changes <- authz.Change{Subject: res.Subject, Grant: "ledger", Token: "t3"}
 	eventually(t, "the invalidation", func() bool { return f.cache.Stats().Invalidations == 1 })
+	if logs := f.logs.String(); !strings.Contains(logs, "invalidated cached credentials") || !strings.Contains(logs, `"grant":"ledger"`) {
+		t.Errorf("the invalidation was not logged with its grant: %s", logs)
+	}
 	f.issue(t, outbox, issuer.CacheHit, "AKIA2")
 	f.issue(t, ledger, issuer.CacheMiss, "AKIA3")
 

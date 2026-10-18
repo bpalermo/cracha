@@ -1,0 +1,15 @@
+# What E2E_AUTHZ=spicedb adds to e2e/values.yaml: the broker asks SpiceDB
+# (e2e/manifests/spicedb.yaml) instead of the static assignments document,
+# which the chart then leaves out. Plaintext gRPC inside the cluster, with
+# the preshared key from the Secret e2e/run.sh creates; the relationships
+# come from e2e/grants through cracha-reconciler, which run.sh runs from the
+# host.
+broker:
+  authz:
+    backend: spicedb
+    spicedb:
+      endpoint: cracha-spicedb.cracha-system.svc:50051
+      insecure: true
+      tokenSecret:
+        name: cracha-e2e-spicedb
+        key: token

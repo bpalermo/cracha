@@ -251,12 +251,19 @@ jobs:
   # else is unit tests. After `build`, so a change that does not compile never
   # gets as far as creating a cluster, and only when `diff` found something
   # the suite deploys or runs impacted: a documentation-only change pays for
-  # no cluster.
+  # no cluster. Once per authorization backend (E2E_AUTHZ of e2e/run.sh):
+  # static, the assignments document, and spicedb, which also deploys SpiceDB
+  # and reconciles the grant tree into it; each leg is its own cluster, and
+  # one failing does not stop the other.
   e2e:
-    name: e2e (kind)
+    name: e2e (kind, ${{ matrix.authz }})
     needs: [build, diff]
     if: needs.diff.outputs.has_e2e == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        authz: [static, spicedb]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -275,6 +282,8 @@ jobs:
           cluster_name: cracha-e2e
 
       - name: e2e/run.sh
+        env:
+          E2E_AUTHZ: ${{ matrix.authz }}
         run: e2e/run.sh --config=ci
 
   # The single check a ruleset should require. A required status check is
@@ -288,7 +297,11 @@ jobs:
   # `diff` said so, in so many words: `build` skipped with has_any `false`,
   # `e2e` skipped with has_e2e `false`. An output that was never set reads as
   # the empty string, skips the job exactly as `false` does, and is refused
-  # here. Everything else has to be `success`.
+  # here. Everything else has to be `success`. `e2e` is a matrix, and
+  # needs.e2e.result is the whole of it: `success` only when every leg
+  # succeeded, `failure` when any failed (fail-fast is off, so the others
+  # still ran), `skipped` when the gate skipped them all; so both backends
+  # are required when the gate is on and both are skipped when it is off.
   ci:
     name: ci
     needs: [lint, diff, build, e2e]

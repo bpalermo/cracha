@@ -19,9 +19,13 @@ broker:
         path: /run/spire/agent-sockets
         type: Directory
     socket: spire-agent.sock
-  # Subjects are the authz encoding <trust-domain label>/<ns>/<sa>. The e2e
-  # namespace's client holds one grant through its service; unassigned is
-  # not here at all.
+  # The static backend's assignments (E2E_AUTHZ=static, the default; in
+  # spicedb mode e2e/values-spicedb.yaml switches the backend and the chart
+  # leaves this out). Subjects are the authz encoding
+  # <trust-domain label>/<ns>/<sa>. The e2e namespace's client holds one
+  # grant through its service; unassigned is not here at all. The service
+  # is the one e2e/grants/services declares, which the reconciler writes to
+  # SpiceDB in spicedb mode: the suite checks that the two agree.
   assignments:
     document:
       services:

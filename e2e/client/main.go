@@ -8,7 +8,10 @@
 // broker's raw HTTP answer (status, Cracha-* headers, body) and the claims of
 // the token file, then keeps watching the token file and prints a line each
 // time the CSI plugin replaces it, which is how the suite observes rotation.
-// It exits only on a signal.
+// With E2E_FETCH_INTERVAL set to a duration it also asks the broker for
+// credentials again at that interval, the way the SDK would once a session
+// ran out, and prints a line per answer, which is how the suite observes
+// a revocation take effect. It exits only on a signal.
 package main
 
 import (
@@ -60,6 +63,15 @@ type Exchange struct {
 	Status  int                 `json:"status"`
 	Headers map[string][]string `json:"headers"`
 	Body    string              `json:"body"`
+}
+
+// Fetch is one answer of the broker to a fetch of its own, printed per
+// E2E_FETCH_INTERVAL: the exchange, or the error that prevented one.
+type Fetch struct {
+	Kind     string    `json:"kind"` // "fetch"
+	At       time.Time `json:"at"`
+	Exchange *Exchange `json:"exchange,omitempty"`
+	Error    string    `json:"error,omitempty"`
 }
 
 // Token is the token file's claims, read without verification: the broker
@@ -117,30 +129,7 @@ func main() {
 	report.Token = readToken(tokenPath)
 
 	rec := &recording{inner: http.Client{Timeout: 30 * time.Second}}
-	// Nothing but the environment chooses the provider; the option only
-	// swaps the HTTP client of the container-credentials provider for one
-	// that keeps the broker's answer, so the suite can assert on it.
-	cfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithEndpointCredentialOptions(func(o *endpointcreds.Options) {
-			o.HTTPClient = rec
-		}))
-	if err != nil {
-		report.Error = "load config: " + err.Error()
-	} else {
-		creds, err := cfg.Credentials.Retrieve(ctx)
-		if err != nil {
-			report.Error = "retrieve: " + err.Error()
-		} else {
-			report.Credentials = &Credentials{
-				AccessKeyID:     creds.AccessKeyID,
-				SecretAccessKey: creds.SecretAccessKey,
-				SessionToken:    creds.SessionToken,
-				Source:          creds.Source,
-				CanExpire:       creds.CanExpire,
-				Expires:         creds.Expires,
-			}
-		}
-	}
+	retrieve(ctx, rec, &report)
 	report.Exchange = rec.exchange()
 	if err := out.Encode(report); err != nil {
 		fmt.Fprintf(os.Stderr, "client: %v\n", err)
@@ -148,14 +137,20 @@ func main() {
 	}
 
 	// Watch the token file: a line per change, so the rotation is visible in
-	// the pod's log without an exec.
+	// the pod's log without an exec. And, when asked, fetch credentials again
+	// at an interval: a line per answer.
 	last := report.Token
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+	fetches, stopFetching := fetchTicker()
+	defer stopFetching()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-fetches:
+			_ = out.Encode(fetch(ctx, rec, tokenPath, os.Getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI")))
+			continue
 		case <-ticker.C:
 		}
 		cur := readToken(tokenPath)
@@ -166,6 +161,75 @@ func main() {
 		last = cur
 		_ = out.Encode(cur)
 	}
+}
+
+// retrieve has the SDK obtain credentials and records the outcome in the
+// report. Nothing but the environment chooses the provider; the option only
+// swaps the HTTP client of the container-credentials provider for one that
+// keeps the broker's answer, so the suite can assert on it.
+func retrieve(ctx context.Context, rec *recording, report *Report) {
+	cfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithEndpointCredentialOptions(func(o *endpointcreds.Options) {
+			o.HTTPClient = rec
+		}))
+	if err != nil {
+		report.Error = "load config: " + err.Error()
+		return
+	}
+	creds, err := cfg.Credentials.Retrieve(ctx)
+	if err != nil {
+		report.Error = "retrieve: " + err.Error()
+		return
+	}
+	report.Credentials = &Credentials{
+		AccessKeyID:     creds.AccessKeyID,
+		SecretAccessKey: creds.SecretAccessKey,
+		SessionToken:    creds.SessionToken,
+		Source:          creds.Source,
+		CanExpire:       creds.CanExpire,
+		Expires:         creds.Expires,
+	}
+}
+
+// fetchTicker is the ticker of the fetches E2E_FETCH_INTERVAL asks for: a
+// nil channel, which never fires, when it is unset.
+func fetchTicker() (<-chan time.Time, func()) {
+	interval := os.Getenv("E2E_FETCH_INTERVAL")
+	if interval == "" {
+		return nil, func() {}
+	}
+	d, err := time.ParseDuration(interval)
+	if err != nil || d <= 0 {
+		fmt.Fprintf(os.Stderr, "client: E2E_FETCH_INTERVAL %q is not a positive duration\n", interval)
+		os.Exit(1)
+	}
+	t := time.NewTicker(d)
+	return t.C, t.Stop
+}
+
+// fetch asks the broker for credentials the way the SDK's provider does:
+// the token file's contents as the Authorization header, nothing else.
+func fetch(ctx context.Context, rec *recording, tokenPath, uri string) Fetch {
+	f := Fetch{Kind: "fetch", At: time.Now().UTC()}
+	raw, err := os.ReadFile(tokenPath)
+	if err != nil {
+		f.Error = "token: " + err.Error()
+		return f
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
+	if err != nil {
+		f.Error = err.Error()
+		return f
+	}
+	req.Header.Set("Authorization", strings.TrimSpace(string(raw)))
+	resp, err := rec.Do(req)
+	if err != nil {
+		f.Error = err.Error()
+		return f
+	}
+	_ = resp.Body.Close()
+	f.Exchange = rec.exchange()
+	return f
 }
 
 // readToken reads the token file's claims without verifying anything.
