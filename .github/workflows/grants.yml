@@ -256,7 +256,7 @@ jobs:
           fi
           grantc compile "${flags[@]}" "${SOURCE}"
           echo "GRANTC_OUT=${out}" >> "${GITHUB_ENV}"
-          echo "GRANTC_SIGNED=bundle.json" >> "${GITHUB_ENV}"
+          echo "GRANTC_SIGNED=bundle.json assignments.json" >> "${GITHUB_ENV}"
           echo "version=${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
 
       - name: Sign with ${{ inputs.kms-key }}
@@ -288,9 +288,9 @@ jobs:
         run: |
           set -euo pipefail
           grantc publish -s3 "${DESTINATION}" -region "${AWS_REGION_INPUT}" \
-            -sig "${GRANTC_OUT}/bundle.json.sig" "${GRANTC_OUT}/bundle.json" | tee "${RUNNER_TEMP}/publish.log"
+            -sig "${GRANTC_OUT}/bundle.json.sig" "${GRANTC_OUT}/bundle.json" "${GRANTC_OUT}/assignments.json" | tee "${RUNNER_TEMP}/publish.log"
           {
-            echo "### Published grant bundle"
+            echo "### Published grant bundle and assignments"
             echo
             echo "\`$(tail -1 "${RUNNER_TEMP}/publish.log")\` to \`${DESTINATION}\`, signed with \`${KMS_KEY}\`, by grantc ${GRANTC_VERSION}."
           } >> "${GITHUB_STEP_SUMMARY}"
