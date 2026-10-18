@@ -149,11 +149,25 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   `internal/tokenreview`, the sandbox's namespace path through the CRI in
   `internal/cri`) and the `cracha-agent enrol` client; cni mode's server side
   is `internal/cni/server`, speaking `agent/cni/proto` (JSON over HTTP on a
-  Unix socket; the plugin itself is not built yet). `internal/recovery`
+  Unix socket the agent creates 0600 in a 0700 directory). `internal/recovery`
   rebinds the node's enrolled pods on start from a filtered pod informer and
   closes the listeners of pods that go. `agent/enrolapi` is the contract the
   webhook imports: the enrolment label, the endpoint, the init container's
   environment.
+- `agent/cni` is `cracha-cni`, the chained CNI plugin of cni mode (design
+  7.2), built from the agent's tree: `main.go` over `internal/plugin`
+  (ADD tells the agent the pod and its netns path and prints the previous
+  plugin's result byte for byte, failing closed when the agent is down or
+  refuses; DEL is best effort; CHECK, GC and STATUS do nothing) and
+  `netconf`, the conflist entry both the plugin and the installer import.
+  It has no image of its own: `//agent:image` carries it at
+  `/opt/cracha/cni/cracha-cni`, and `cracha-agent cni-install`
+  (`agent/internal/cni/install`, the DaemonSet's init container in cni
+  mode) copies it into the node's CNI bin directory and chains it after
+  the primary plugin of the lexically first conflist of the CNI conf
+  directory, with write-fsync-rename and nothing rewritten when already
+  there (`--uninstall` undoes it). `go_image` takes the extra file through
+  its `files` argument.
 - Code private to a binary goes under its `internal/`. The webhook's
   `internal/mutate` is the admission decision (design 7.5), pure over two
   interfaces: ServiceAccount lookups (`internal/sacache`, a Get remembered
@@ -268,12 +282,19 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 - The agent's values are `agent.*` with the design's names: `port`,
   `enrol` (`init` or `cni`), `enrolPort`, `enrolTimeout`, `fetchDeadline`,
   `brokerUrl`, `brokerSpiffeID` (empty: the broker ServiceAccount's path in
-  the agent's own trust domain), `criSocket`, `netnsDir`, `cni.socket`. The
-  DaemonSet is in the host network with `CAP_SYS_ADMIN` alone; its host
-  mounts are the CRI socket, the runtime's netns directory (read-only,
-  `HostToContainer`) and the issuer's sockets, and `agent_test.go` holds it
-  to that. `agent.enrol: cni` renders the socket's hostPath and no installer
-  yet.
+  the agent's own trust domain), `criSocket`, `netnsDir`, `cni.socket`,
+  `cni.binDir`, `cni.confDir`. The DaemonSet is in the host network with
+  `CAP_SYS_ADMIN` alone; its host mounts are the CRI socket, the runtime's
+  netns directory (read-only, `HostToContainer`) and the issuer's sockets,
+  and `agent_test.go` holds it to that. `agent.enrol: cni` renders the
+  socket's hostPath for the agent container and the `cni-install` init
+  container from the agent image, with `cni.binDir` and `cni.confDir`
+  mounted read-write in it alone (no capability, read-only root): on the
+  node it writes `<binDir>/cracha-cni` and rewrites the lexically first
+  conflist of `confDir` (kind: `10-kindnet.conflist`) with the entry
+  `{"type": "cracha-cni", "socket": <cni.socket>, "timeout": "5s"}`
+  appended to its `plugins`, and touches nothing else; `test/agent-cni.yaml`
+  renders it with non-default directories and `agent_test.go` checks them.
 - `broker.authz.backend` picks the authorization store: `static` (the
   default) renders the assignments ConfigMap and its mount; `spicedb` takes
   `broker.authz.spicedb` (endpoint, `tokenSecret` naming a Secret the
