@@ -1,0 +1,12 @@
+# The workload of the lookup grant: the reader holds the suite's two grants
+# of the shape, the one that names its bucket and the one that leaves it to
+# the Access documents (access/).
+kind: Service
+metadata:
+  name: e2e-reader
+spec:
+  team: platform
+  members: [cracha/e2e/reader]
+  grants:
+    - name: e2e-s3-reader
+    - name: e2e-s3-lookup

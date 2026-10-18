@@ -9,6 +9,7 @@ go_test(
         "main_test.go",
         "prewarm_test.go",
         "published_test.go",
+        "resources_test.go",
         "spicedb_test.go",
         "webhook_test.go",
     ],

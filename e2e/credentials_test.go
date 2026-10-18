@@ -89,6 +89,7 @@ func (e *exchange) reason() string {
 
 // stsRequest is one AssumeRole as e2e/stsstub recorded it.
 type stsRequest struct {
+	Received          time.Time         `json:"received"`
 	RoleArn           string            `json:"roleArn"`
 	RoleSessionName   string            `json:"roleSessionName"`
 	SourceIdentity    string            `json:"sourceIdentity"`

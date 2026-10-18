@@ -76,9 +76,30 @@ func grantc(ctx context.Context, t *testing.T, args ...string) {
 // its documents under the slot's keys, and its latest pointer.
 func publication(ctx context.Context, t *testing.T, tree string, current map[string]string) map[string]string {
 	t.Helper()
+	return mixedPublication(ctx, t, tree, tree, current)
+}
+
+// mixedPublication is publication with the bundle compiled from one tree
+// and the assignments from another, under the same version and signed
+// with the same key: assignments the lints of the bundle's tree never saw,
+// as a writer other than the Git pipeline could produce them, for the
+// tests of what the broker checks at issuance whatever the lints did.
+func mixedPublication(ctx context.Context, t *testing.T, bundleTree, assignmentsTree string, current map[string]string) map[string]string {
+	t.Helper()
 	dir := t.TempDir()
 	bundle, assignments := filepath.Join(dir, grant.BundleFile), filepath.Join(dir, grant.AssignmentsFile)
-	grantc(ctx, t, "compile", "-o", bundle, "-version", republishedVersion, tree)
+	grantc(ctx, t, "compile", "-o", bundle, "-version", republishedVersion, bundleTree)
+	if assignmentsTree != bundleTree {
+		other := t.TempDir()
+		grantc(ctx, t, "compile", "-o", filepath.Join(other, grant.BundleFile), "-version", republishedVersion, assignmentsTree)
+		data, err := os.ReadFile(filepath.Join(other, grant.AssignmentsFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(assignments, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	grantc(ctx, t, "sign", "-key", os.Getenv(bundleKeyEnv), bundle, assignments)
 	published := filepath.Join(dir, "published")
 	grantc(ctx, t, "publish", "-dir", published, bundle, assignments)

@@ -26,8 +26,9 @@ broker:
   # spicedb mode e2e/values-spicedb.yaml switches the backend): the ones
   # grantc compiled from the Services and Assignments of e2e/grants and
   # published with the bundle, as every cluster of a fleet would read them.
-  # The e2e namespace's client holds one grant through its service;
-  # unassigned is not there at all.
+  # The e2e namespace's client holds one grant through its service, the
+  # reader that grant and the lookup grant with the bucket its Access
+  # document gives; unassigned is not there at all.
   assignments:
     source: published
   # The grants come the production way: a bundle run.sh compiles from
