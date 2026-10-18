@@ -163,6 +163,8 @@ webhook:
     - kube-system
   namespaceLabels:
     cracha.dev/enabled: "true"
+  podLabels:
+    cracha.dev/enabled: "true"
   logLevel: error
   priorityClassName: system-cluster-critical
   nodeSelector:

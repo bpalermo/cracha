@@ -153,6 +153,10 @@ helm_template_test(
             "cni",
             REQUIRED_VALUES + ["test/agent-cni.yaml"],
         ),
+        (
+            "pod_labels",
+            REQUIRED_VALUES + ["test/pod-labels.yaml"],
+        ),
     ]
 ]
 
@@ -169,6 +173,7 @@ go_test(
         ":rendered_cni",
         ":rendered_defaults",
         ":rendered_overrides",
+        ":rendered_pod_labels",
     ],
     deps = [
         "@in_gopkg_yaml_v3//:yaml_v3",

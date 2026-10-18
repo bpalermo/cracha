@@ -7,6 +7,9 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: e2e
+  labels:
+    # The webhook covers only namespaces that opt in (e2e/values.yaml).
+    cracha.dev/enabled: "true"
 ---
 apiVersion: v1
 kind: ServiceAccount

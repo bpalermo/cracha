@@ -18,40 +18,67 @@ metadata:
     {{- include "cracha.labels" . | nindent 4 }}
     app.kubernetes.io/component: webhook
 webhooks:
-  - name: pods.cracha.dev
-    admissionReviewVersions: [v1]
-    sideEffects: None
-    # A pod must never be admitted unwired because the webhook was
-    # unreachable.
-    failurePolicy: Fail
-    timeoutSeconds: {{ .Values.webhook.timeoutSeconds }}
-    clientConfig:
-      service:
-        name: {{ include "cracha.name" . }}-webhook
-        namespace: {{ .Release.Namespace }}
-        path: /mutate
-        port: 443
-    rules:
-      - apiGroups: [""]
-        apiVersions: [v1]
-        operations: [CREATE]
-        resources: [pods]
-    # The release's own namespace is left out: a pod of the webhook's own
-    # namespace must not depend on the webhook to start. The identity
-    # issuer's namespaces (webhook.excludedNamespaces) are left out because
-    # the webhook's certificate comes from the issuer's agent, which must
-    # start without the webhook.
-    # webhook.namespaceLabels narrows it to the namespaces that opt in, so
-    # an unreachable webhook refuses only their pods.
-    namespaceSelector:
-      {{- with .Values.webhook.namespaceLabels }}
-      matchLabels:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      matchExpressions:
-        - key: kubernetes.io/metadata.name
-          operator: NotIn
-          values:
-            {{- range $excluded }}
-            - {{ . }}
-            {{- end }}
+{{- /*
+Which pods the webhook sees: by default every pod outside the excluded
+namespaces. webhook.namespaceLabels and webhook.podLabels make it opt-in:
+with either set, it sees only pods of a namespace carrying the namespace
+labels (entry pods.cracha.dev) or pods carrying the pod labels themselves
+(entry labelled-pods.cracha.dev), or both. A webhook's selectors are ANDed,
+so the two ways in are two entries on the same service; a pod both match
+is wired by the first and left as is by the second, which finds the
+cracha.dev/credentials label already on it. An unreachable webhook then
+refuses only the pods that opted in.
+*/ -}}
+{{- $nsLabels := .Values.webhook.namespaceLabels -}}
+{{- $podLabels := .Values.webhook.podLabels -}}
+{{- if hasKey ($podLabels | default dict) "cracha.dev/credentials" }}
+{{- fail "webhook.podLabels must not use cracha.dev/credentials: the webhook sets that label itself and leaves a pod carrying it unchanged" }}
+{{- end }}
+{{- if or $nsLabels (not $podLabels) }}
+  {{- include "cracha.podWebhook" (dict "root" . "name" "pods.cracha.dev" "excluded" $excluded "namespaceLabels" $nsLabels) | nindent 2 }}
+{{- end }}
+{{- with $podLabels }}
+  {{- include "cracha.podWebhook" (dict "root" $ "name" "labelled-pods.cracha.dev" "excluded" $excluded "podLabels" .) | nindent 2 }}
+{{- end }}
+{{- define "cracha.podWebhook" -}}
+- name: {{ .name }}
+  admissionReviewVersions: [v1]
+  sideEffects: None
+  # A pod must never be admitted unwired because the webhook was
+  # unreachable.
+  failurePolicy: Fail
+  timeoutSeconds: {{ .root.Values.webhook.timeoutSeconds }}
+  clientConfig:
+    service:
+      name: {{ include "cracha.name" .root }}-webhook
+      namespace: {{ .root.Release.Namespace }}
+      path: /mutate
+      port: 443
+  rules:
+    - apiGroups: [""]
+      apiVersions: [v1]
+      operations: [CREATE]
+      resources: [pods]
+  # The release's own namespace is left out: a pod of the webhook's own
+  # namespace must not depend on the webhook to start. The identity
+  # issuer's namespaces (webhook.excludedNamespaces) are left out because
+  # the webhook's certificate comes from the issuer's agent, which must
+  # start without the webhook.
+  namespaceSelector:
+    {{- with .namespaceLabels }}
+    matchLabels:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    matchExpressions:
+      - key: kubernetes.io/metadata.name
+        operator: NotIn
+        values:
+          {{- range .excluded }}
+          - {{ . }}
+          {{- end }}
+  {{- with .podLabels }}
+  objectSelector:
+    matchLabels:
+      {{- toYaml . | nindent 6 }}
+  {{- end }}
+{{- end -}}

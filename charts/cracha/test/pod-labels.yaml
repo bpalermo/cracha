@@ -1,0 +1,6 @@
+# The webhook opted into by pod label alone (webhook.podLabels without
+# webhook.namespaceLabels): render_test.go asserts a single entry,
+# labelled-pods.cracha.dev, with an objectSelector and no namespace labels.
+webhook:
+  podLabels:
+    cracha.dev/enabled: "true"

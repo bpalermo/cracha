@@ -294,7 +294,7 @@ func TestWebhookNamespaceRegion(t *testing.T) {
 	}
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
 		Name:        regionNamespace,
-		Labels:      map[string]string{suiteLabel: "true"},
+		Labels:      map[string]string{suiteLabel: "true", optInLabel: "true"},
 		Annotations: map[string]string{"cracha.dev/region": override},
 	}}
 	if _, err := client.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{}); err != nil {
@@ -486,4 +486,69 @@ func TestWebhookRolloutLosesNoPod(t *testing.T) {
 		}
 	}
 	t.Logf("%d pods created in the 15 s after the rollout, every one at the first attempt", n)
+}
+
+// optInLabel is the label e2e/values.yaml gives the webhook as both its
+// namespace and its pod opt-in (webhook.namespaceLabels, webhook.podLabels).
+const optInLabel = "cracha.dev/enabled"
+
+// TestWebhookOptIn: with webhook.namespaceLabels and webhook.podLabels set,
+// a pod of a namespace that does not opt in is wired only when it carries
+// the pod label itself. The service account is annotated in both cases, so
+// the label alone decides whether the webhook sees the pod. Only admission
+// is exercised, as in TestWebhookNamespaceRegion.
+func TestWebhookOptIn(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	const optInNamespace = "e2e-optin"
+
+	if err := deleteNamespace(ctx, optInNamespace, true); err != nil {
+		t.Fatalf("removing the namespace of a previous run: %v", err)
+	}
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name:   optInNamespace,
+		Labels: map[string]string{suiteLabel: "true"},
+	}}
+	if _, err := client.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating namespace %s: %v", optInNamespace, err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if err := deleteNamespace(ctx, optInNamespace, false); err != nil {
+			t.Logf("deleting namespace %s: %v", optInNamespace, err)
+		}
+	})
+	sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+		Name:        assignedSA,
+		Namespace:   optInNamespace,
+		Annotations: map[string]string{"cracha.dev/enabled": "true"},
+	}}
+	if _, err := client.CoreV1().ServiceAccounts(optInNamespace).Create(ctx, sa, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating service account %s/%s: %v", optInNamespace, assignedSA, err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		labels map[string]string
+		wired  bool
+	}{
+		{"pod without the label", nil, false},
+		{"pod with the label", map[string]string{optInLabel: "true"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := sleeper("", assignedSA)
+			pod.GenerateName = "optin-"
+			pod.Labels = tc.labels
+			got, err := createPodIn(ctx, optInNamespace, pod)
+			if err != nil {
+				t.Fatalf("creating the pod: %v", err)
+			}
+			_, hasURI := envValue(got.Spec.Containers[0], "AWS_CONTAINER_CREDENTIALS_FULL_URI")
+			_, hasLabel := got.Labels[enrolLabel]
+			if hasURI != tc.wired || hasLabel != tc.wired {
+				t.Errorf("pod %s: credentials URI %v, label %s %v; want both %v", got.Name, hasURI, enrolLabel, hasLabel, tc.wired)
+			}
+		})
+	}
 }
