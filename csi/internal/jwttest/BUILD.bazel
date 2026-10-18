@@ -1,8 +1,0 @@
-load("@rules_go//go:def.bzl", "go_library")
-
-go_library(
-    name = "jwttest",
-    srcs = ["jwttest.go"],
-    importpath = "github.com/bpalermo/cracha/csi/internal/jwttest",
-    visibility = ["//csi:__subpackages__"],
-)

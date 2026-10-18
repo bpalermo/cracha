@@ -57,13 +57,16 @@ broker:
       value: http://cracha-stsstub.cracha-system.svc:8080
     - name: AWS_EC2_METADATA_DISABLED
       value: "true"
-csi:
+agent:
+  # The SPIRE agent's sockets (e2e/spire.yaml), shared on the node, and
+  # kind's containerd.
   workloadAPI:
     hostPath: /run/spire/agent-sockets
     socket: spire-agent.sock
   brokerAPI:
     hostPath: /run/spire/broker-sockets
     socket: broker.sock
+  criSocket: /run/containerd/containerd.sock
   logLevel: debug
 webhook:
   replicas: 1

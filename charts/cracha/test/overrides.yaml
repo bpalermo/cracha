@@ -93,33 +93,31 @@ broker:
       memory: 128Mi
   podAnnotations:
     example.com/scrape: "true"
-csi:
+agent:
   image:
-    repository: registry.example.com/cracha/csi
+    repository: registry.example.com/cracha/agent
     digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     pullPolicy: Always
-  registrar:
-    image:
-      repository: registry.example.com/sig-storage/csi-node-driver-registrar
-      tag: v2.99.0
-      digest: ""
-      pullPolicy: Always
-    resources:
-      requests:
-        cpu: 10m
-        memory: 16Mi
-  kubeletDir: /var/lib/k0s/kubelet
+  port: 17171
+  # init with every knob; test/agent-cni.yaml renders the cni mode.
+  enrol: init
+  enrolPort: 17172
+  enrolTimeout: 30s
+  cni:
+    socket: /var/run/cracha/agent.sock
+  fetchDeadline: 1500ms
+  brokerUrl: https://credentials.example.org:9443
+  brokerSpiffeID: spiffe://prod.example.org/ns/cracha/sa/broker
+  brokerTimeout: 5s
+  criSocket: /var/run/crio/crio.sock
+  netnsDir: /run/netns
   workloadAPI:
     hostPath: /run/spiffe/agent
     socket: api.sock
   brokerAPI:
     hostPath: /run/spiffe/broker
     socket: api.sock
-  maxTokenTTL: 2m
-  publishDeadline: 10s
-  tokenUid: 1000
-  tokenGid: 1000
-  healthzPort: 9909
+  healthzPort: 17173
   logLevel: warn
   priorityClassName: ""
   tolerations: []
@@ -133,17 +131,6 @@ csi:
       memory: 128Mi
   podAnnotations:
     example.com/scrape: "true"
-# The values the webhook reads of the agent's (the agent slice owns the
-# block): the cni enrolment mode, which injects no init container.
-agent:
-  image:
-    repository: registry.example.com/cracha/agent
-    digest: sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
-    pullPolicy: Always
-  port: 9780
-  enrol: cni
-  enrolPort: 9781
-  enrolTimeout: 2m
 webhook:
   image:
     repository: registry.example.com/cracha/webhook

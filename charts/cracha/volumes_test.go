@@ -48,7 +48,7 @@ func sources(v map[string]any) []string {
 // Workload API, whose default is a hostPath), and the apiserver would refuse
 // the pod.
 func TestVolumesHaveOneSource(t *testing.T) {
-	for _, rendering := range []string{"defaults", "overrides"} {
+	for _, rendering := range []string{"defaults", "overrides", "cni"} {
 		t.Run(rendering, func(t *testing.T) {
 			checked := 0
 			for _, w := range rendered(t, rendering) {

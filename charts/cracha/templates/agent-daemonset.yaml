@@ -1,0 +1,171 @@
+{{- $selector := dict "root" . "component" "agent" -}}
+{{- $enrol := include "cracha.agentEnrol" . -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "cracha.name" . }}-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+spec:
+  selector:
+    matchLabels:
+      {{- include "cracha.selectorLabels" $selector | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cracha.labels" . | nindent 8 }}
+        app.kubernetes.io/component: agent
+      {{- with .Values.agent.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.agent.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      serviceAccountName: {{ include "cracha.name" . }}-agent
+      # The agent's pods live in the release namespace, which the webhook
+      # configuration's namespaceSelector leaves out: nothing wires them,
+      # and they do not depend on the webhook to start.
+      # Design 7.8: host network, because the init-mode enrolment endpoint
+      # listens on the node's address and the listeners the agent binds live
+      # in pods' namespaces, not its own. Not the host PID namespace: it
+      # enters a pod's namespace by the path the runtime reports.
+      hostNetwork: true
+      hostPID: false
+      # The broker's Service name must still resolve from the host network.
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if eq $enrol "cni" }}
+      # The cracha-cni plugin and the init container that installs it into
+      # the node's CNI directories (design 7.2, cni mode) are a later slice:
+      # this renders the agent's socket for the plugin to call and nothing
+      # that installs the plugin yet.
+      {{- end }}
+      containers:
+        - name: agent
+          image: {{ include "cracha.image" (dict "root" . "image" .Values.agent.image) }}
+          imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+          args:
+            - --port={{ int .Values.agent.port }}
+            - --enrol={{ $enrol }}
+            {{- if eq $enrol "init" }}
+            - --enrol-listen=:{{ int .Values.agent.enrolPort }}
+            {{- else }}
+            - --cni-socket={{ .Values.agent.cni.socket }}
+            {{- end }}
+            - --cri-socket={{ .Values.agent.criSocket }}
+            - --issuer-broker-socket=/run/spire/broker/{{ .Values.agent.brokerAPI.socket }}
+            - --workload-api=unix:///spiffe-workload-api/{{ .Values.agent.workloadAPI.socket }}
+            - --broker-url={{ include "cracha.agentBrokerUrl" . }}
+            - --broker-spiffe-id={{ include "cracha.agentBrokerSpiffeID" . }}
+            - --broker-timeout={{ .Values.agent.brokerTimeout }}
+            - --fetch-deadline={{ .Values.agent.fetchDeadline }}
+            - --healthz=:{{ int .Values.agent.healthzPort }}
+            - --log-level={{ include "cracha.logLevel" .Values.agent.logLevel }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            {{- if eq $enrol "init" }}
+            - name: enrol
+              containerPort: {{ int .Values.agent.enrolPort }}
+            {{- end }}
+            - name: healthz
+              containerPort: {{ int .Values.agent.healthzPort }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: healthz
+            periodSeconds: 5
+          securityContext:
+            # Root, because setns into a pod's network namespace needs
+            # CAP_SYS_ADMIN and the runtime grants a container's capabilities
+            # to uid 0 alone. Nothing more: one capability, no writable
+            # image.
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              add:
+                # setns into a network namespace (design 7.8). Not
+                # CAP_SYS_PTRACE: the namespace path comes from the runtime,
+                # never from /proc/<pid>.
+                - SYS_ADMIN
+          {{- with .Values.agent.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: cri-socket
+              mountPath: {{ .Values.agent.criSocket }}
+              readOnly: true
+            # The namespaces the runtime reports are paths under this
+            # directory, bind-mounted there as sandboxes come and go, so the
+            # mount must see the host's later mounts: HostToContainer, at
+            # the same path as on the host.
+            - name: netns-dir
+              mountPath: {{ .Values.agent.netnsDir }}
+              readOnly: true
+              mountPropagation: HostToContainer
+            - name: spire-workload-api
+              mountPath: /spiffe-workload-api
+              readOnly: true
+            - name: spire-broker-api
+              mountPath: /run/spire/broker
+              readOnly: true
+            {{- if eq $enrol "cni" }}
+            - name: cni-socket-dir
+              mountPath: {{ dir .Values.agent.cni.socket }}
+            {{- end }}
+      volumes:
+        - name: cri-socket
+          hostPath:
+            path: {{ .Values.agent.criSocket }}
+            type: Socket
+        - name: netns-dir
+          hostPath:
+            path: {{ .Values.agent.netnsDir }}
+            type: DirectoryOrCreate
+        # The identity issuer's sockets: the Workload API for the agent's
+        # own identity, the Broker API for the pods' tokens.
+        - name: spire-workload-api
+          hostPath:
+            path: {{ .Values.agent.workloadAPI.hostPath }}
+            type: Directory
+        - name: spire-broker-api
+          hostPath:
+            path: {{ .Values.agent.brokerAPI.hostPath }}
+            type: Directory
+        {{- if eq $enrol "cni" }}
+        # The directory of the agent's own socket, which the plugin calls.
+        - name: cni-socket-dir
+          hostPath:
+            path: {{ dir .Values.agent.cni.socket }}
+            type: DirectoryOrCreate
+        {{- end }}

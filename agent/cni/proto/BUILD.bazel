@@ -1,0 +1,8 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "proto",
+    srcs = ["proto.go"],
+    importpath = "github.com/bpalermo/cracha/agent/cni/proto",
+    visibility = ["//visibility:public"],
+)

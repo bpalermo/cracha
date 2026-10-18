@@ -13,7 +13,7 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- end -}}
 
 {{/*
-Selector labels of one component. Call with (dict "root" . "component" "csi").
+Selector labels of one component. Call with (dict "root" . "component" "agent").
 */}}
 {{- define "cracha.selectorLabels" -}}
 app.kubernetes.io/name: {{ include "cracha.name" .root }}
@@ -23,7 +23,7 @@ app.kubernetes.io/component: {{ .component }}
 
 {{/*
 An image reference: by digest when one is given, else by tag, else by the
-chart's appVersion. Call with (dict "root" . "image" .Values.csi.image).
+chart's appVersion. Call with (dict "root" . "image" .Values.agent.image).
 */}}
 {{- define "cracha.image" -}}
 {{- if .image.digest -}}
@@ -139,4 +139,34 @@ the apiserver refuses; only the chosen source is rendered. Call with
 {{- end -}}
 {{ $v.type }}:
   {{- toYaml $source | nindent 2 }}
+{{- end -}}
+
+{{/* The agent's enrolment mode (design 7.2), checked: init or cni. */}}
+{{- define "cracha.agentEnrol" -}}
+{{- if not (has .Values.agent.enrol (list "init" "cni")) -}}
+{{- fail (printf "agent.enrol must be init or cni, not %q" .Values.agent.enrol) -}}
+{{- end -}}
+{{ .Values.agent.enrol }}
+{{- end -}}
+
+{{/* The broker URL the agent calls (design 7.3): agent.brokerUrl, or the broker Service of this release. */}}
+{{- define "cracha.agentBrokerUrl" -}}
+{{- if .Values.agent.brokerUrl -}}
+{{ .Values.agent.brokerUrl }}
+{{- else -}}
+https://{{ include "cracha.serviceHost" (dict "root" . "component" "broker") }}:{{ .Values.broker.port }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The SPIFFE ID the agent verifies the broker by (design 7.3):
+agent.brokerSpiffeID, or the path of the broker's ServiceAccount in the
+agent's own trust domain, which the agent completes from its SVID.
+*/}}
+{{- define "cracha.agentBrokerSpiffeID" -}}
+{{- if .Values.agent.brokerSpiffeID -}}
+{{ .Values.agent.brokerSpiffeID }}
+{{- else -}}
+/ns/{{ .Release.Namespace }}/sa/{{ include "cracha.name" . }}-broker
+{{- end -}}
 {{- end -}}

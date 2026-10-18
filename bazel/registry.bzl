@@ -1,7 +1,7 @@
 """Where Crachá's images and chart are published: ONE setting.
 
 Every published coordinate is derived from the constants below: the
-`image_push` of each `go_image` (//broker:image_push, //csi:image_push,
+`image_push` of each `go_image` (//broker:image_push, //agent:image_push,
 //webhook:image_push), the chart push (//charts/cracha:cracha.push_registry)
 and the chart's default image repositories (charts/cracha/values.yaml, which
 takes each from its image_push). Shell and the workflows read it through
@@ -11,7 +11,7 @@ spelled out anywhere else. Nothing else may spell the registry out.
 The coordinates:
 
     <IMAGE_REGISTRY>/<IMAGE_NAMESPACE>/broker
-    <IMAGE_REGISTRY>/<IMAGE_NAMESPACE>/csi
+    <IMAGE_REGISTRY>/<IMAGE_NAMESPACE>/agent
     <IMAGE_REGISTRY>/<IMAGE_NAMESPACE>/webhook
     oci://<IMAGE_REGISTRY>/<IMAGE_NAMESPACE>/cracha        (the chart)
 
@@ -39,10 +39,10 @@ def image_repository(component):
     """Repository path (no host) of a component's image.
 
     Args:
-      component: "broker", "csi" or "webhook".
+      component: "broker", "agent" or "webhook".
 
     Returns:
-      e.g. "cracha/csi".
+      e.g. "cracha/agent".
     """
     return "{}/{}".format(IMAGE_NAMESPACE, component)
 
@@ -50,10 +50,10 @@ def image_reference(component):
     """Host-qualified image repository of a component.
 
     Args:
-      component: "broker", "csi" or "webhook".
+      component: "broker", "agent" or "webhook".
 
     Returns:
-      e.g. "quay.io/cracha/csi".
+      e.g. "quay.io/cracha/agent".
     """
     return "{}/{}".format(IMAGE_REGISTRY, image_repository(component))
 

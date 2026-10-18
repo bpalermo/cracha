@@ -1,0 +1,30 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "server",
+    srcs = ["server.go"],
+    importpath = "github.com/bpalermo/cracha/agent/internal/cni/server",
+    visibility = ["//agent:__subpackages__"],
+    deps = [
+        "//agent/cni/proto",
+        "//agent/internal/enrol",
+        "//agent/internal/listener",
+        "//agent/internal/serve",
+    ],
+)
+
+go_test(
+    name = "server_test",
+    srcs = ["server_test.go"],
+    embed = [":server"],
+    deps = [
+        "//agent/cni/proto",
+        "//agent/enrolapi",
+        "//agent/internal/enrol",
+        "//agent/internal/listener",
+        "@io_k8s_api//core/v1:core",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_apimachinery//pkg/types",
+        "@io_k8s_client_go//kubernetes/fake",
+    ],
+)

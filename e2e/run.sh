@@ -22,7 +22,7 @@
 # the one built here: the package is pulled from the registry
 # bazel/registry.bzl names, at that version, with the same pinned helm, and
 # installed as it is, with the images it pins (public, on the registry; the
-# node pulls them). The checkout's broker, csi and webhook images are then
+# node pulls them). The checkout's broker, agent and webhook images are then
 # neither built nor loaded and e2e/values-local.yaml is not passed; the
 # suite's own images (e2e/client, e2e/stsstub) still are. The log starts
 # with the chart's digest and the image references it pins, so it says what
@@ -60,7 +60,7 @@ images=(
 if [[ -z "${chart_version}" ]]; then
 	images=(
 		cracha-broker=//broker:image_load
-		cracha-csi=//csi:image_load
+		cracha-agent=//agent:image_load
 		cracha-webhook=//webhook:image_load
 		"${images[@]}"
 	)
@@ -115,7 +115,7 @@ if [[ -n "${chart_version}" ]]; then
 		exit 1
 	fi
 	echo "e2e: testing the published chart ${repository}:${chart_version}@${digest}"
-	for component in broker csi webhook; do
+	for component in broker agent webhook; do
 		ref="$(bazel/registry.sh ref "${component}")"
 		echo "e2e: the chart pins ${ref}@$(bazel/chart-pin.sh "${chart}" cracha "${ref}")"
 	done
@@ -251,7 +251,7 @@ kubectl apply -f e2e/manifests/stsstub.yaml
 # it pick up the images just loaded (against a published chart its workloads
 # are pinned by digest and the restart changes nothing). The STS stub starts
 # with an empty record either way.
-workloads=(daemonset/cracha-csi deployment/cracha-broker deployment/cracha-webhook deployment/cracha-stsstub)
+workloads=(daemonset/cracha-agent deployment/cracha-broker deployment/cracha-webhook deployment/cracha-stsstub)
 for workload in "${workloads[@]}"; do
 	kubectl rollout restart "${workload}" -n cracha-system
 done

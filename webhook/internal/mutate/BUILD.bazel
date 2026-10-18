@@ -10,6 +10,7 @@ go_library(
     importpath = "github.com/bpalermo/cracha/webhook/internal/mutate",
     visibility = ["//webhook:__subpackages__"],
     deps = [
+        "//agent/enrolapi",
         "@io_k8s_api//admission/v1:admission",
         "@io_k8s_api//core/v1:core",
         "@io_k8s_apimachinery//pkg/api/errors",

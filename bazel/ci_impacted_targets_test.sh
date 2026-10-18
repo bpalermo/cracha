@@ -27,11 +27,11 @@ cat >"${work}/rules.txt" <<'EOF'
 //charts/cracha:pin_test
 //common/idenc:idenc
 //common/idenc:idenc_test
-//csi:csi
-//csi:image_load
-//csi:image_push
-//csi/internal/driver:driver
-//csi/internal/driver:driver_test
+//agent:agent
+//agent:image_load
+//agent:image_push
+//agent/internal/listener:listener
+//agent/internal/listener:listener_test
 //e2e:e2e_test
 //e2e:scripts
 //e2e/stsstub:image_load
@@ -41,12 +41,12 @@ cat >"${work}/tests.txt" <<'EOF'
 //broker:broker_test
 //charts/cracha:pin_test
 //common/idenc:idenc_test
-//csi/internal/driver:driver_test
+//agent/internal/listener:listener_test
 EOF
 cat >"${work}/e2e.txt" <<'EOF'
 //broker:image_load
 //charts/cracha:cracha
-//csi:image_load
+//agent:image_load
 //e2e:e2e_test
 //e2e:scripts
 //e2e/stsstub:image_load
@@ -103,28 +103,28 @@ check_flag() { # case name got want
 # flag false, and it is the classification saying so, not a failure.
 expect nothing "" "" "" ""
 
-# A change under csi/: its library, binary, test and image, the chart that
+# A change under agent/: its library, binary, test and image, the chart that
 # pins the image, and the e2e test through the image. Source-file labels
-# (//csi:main.go) and a `manual` rule (//:gazelle) are in no candidate list
+# (//agent:main.go) and a `manual` rule (//:gazelle) are in no candidate list
 # and are dropped; the e2e test is a rule to build but not a test to run.
-expect csi "//:gazelle
+expect agent "//:gazelle
 //charts/cracha:cracha
-//csi:csi
-//csi:image_index
-//csi:image_load
-//csi:image_push
-//csi:main.go
-//csi/internal/driver:driver
-//csi/internal/driver:driver_test
+//agent:agent
+//agent:image_index
+//agent:image_load
+//agent:image_push
+//agent:main.go
+//agent/internal/listener:listener
+//agent/internal/listener:listener_test
 //e2e:e2e_test
 " "//charts/cracha:cracha
-//csi:csi
-//csi:image_load
-//csi:image_push
-//csi/internal/driver:driver
-//csi/internal/driver:driver_test
-//e2e:e2e_test" "//csi/internal/driver:driver_test" "//charts/cracha:cracha
-//csi:image_load
+//agent:agent
+//agent:image_load
+//agent:image_push
+//agent/internal/listener:listener
+//agent/internal/listener:listener_test
+//e2e:e2e_test" "//agent/internal/listener:listener_test" "//charts/cracha:cracha
+//agent:image_load
 //e2e:e2e_test"
 
 # A unit test and its library only: built and tested, no e2e.
@@ -159,7 +159,7 @@ expect whole "//broker:broker
 " "//broker:broker" "" ""
 
 # classify fails, rather than answering, when a candidate list is unreadable.
-if classify "${work}/csi/impacted.txt" "${work}/missing.txt" "${work}/tests.txt" "${work}/e2e.txt" "${work}/csi" 2>/dev/null; then
+if classify "${work}/agent/impacted.txt" "${work}/missing.txt" "${work}/tests.txt" "${work}/e2e.txt" "${work}/agent" 2>/dev/null; then
 	echo "FAIL: classify succeeded with a missing candidate list" >&2
 	fail=1
 fi

@@ -1,0 +1,25 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "tokenreview",
+    srcs = ["tokenreview.go"],
+    importpath = "github.com/bpalermo/cracha/agent/internal/tokenreview",
+    visibility = ["//agent:__subpackages__"],
+    deps = [
+        "@io_k8s_api//authentication/v1:authentication",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_client_go//kubernetes",
+    ],
+)
+
+go_test(
+    name = "tokenreview_test",
+    srcs = ["tokenreview_test.go"],
+    embed = [":tokenreview"],
+    deps = [
+        "@io_k8s_api//authentication/v1:authentication",
+        "@io_k8s_apimachinery//pkg/runtime",
+        "@io_k8s_client_go//kubernetes/fake",
+        "@io_k8s_client_go//testing",
+    ],
+)

@@ -1,0 +1,8 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "serve",
+    srcs = ["serve.go"],
+    importpath = "github.com/bpalermo/cracha/agent/internal/serve",
+    visibility = ["//agent:__subpackages__"],
+)

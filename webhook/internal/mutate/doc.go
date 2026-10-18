@@ -21,12 +21,14 @@
 // In the init enrolment mode (Config.Enrol) the pod also gets what enrolment
 // needs: the init container "cracha-enrol", first in the list so that it
 // holds every other init container too, running `enrol` from the agent image
-// against the node's address (NODE_IP, from status.hostIP) and the agent's
-// enrolment port (CRACHA_ENROL_PORT) for at most CRACHA_ENROL_TIMEOUT; and
+// against the node's address (CRACHA_HOST_IP, from status.hostIP) and the
+// agent's enrolment port (CRACHA_ENROL_PORT) for at most CRACHA_ENROL_TIMEOUT,
+// then confirming the listener on CRACHA_AGENT_PORT accepts a connection; and
 // the projected ServiceAccount token it authenticates with (audience
 // "cracha-agent", the shortest lifetime the API allows, bound to the pod), in
 // the volume "cracha-enrol" mounted into that container only, at
-// EnrolTokenPath (CRACHA_ENROL_TOKEN_FILE). The container runs under the
+// EnrolTokenPath (CRACHA_ENROL_TOKEN_FILE). The names are agent/enrolapi's,
+// the agent's definition of the contract. The container runs under the
 // restricted Pod Security standard: non-root, no privileges, no writable
 // filesystem, no capabilities. The pattern is aether's identity-gate init
 // container; the label, not the container, is the idempotency key. In the

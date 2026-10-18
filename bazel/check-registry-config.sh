@@ -40,19 +40,19 @@ bad() {
 }
 
 # --- 1. the setting parses ---------------------------------------------------
-if ! host="$(bazel/registry.sh host)" || ! csi="$(bazel/registry.sh ref csi)" ||
-	! ns_repo="$(bazel/registry.sh repo csi)" || [ -z "$host" ] || [ -z "$csi" ]; then
+if ! host="$(bazel/registry.sh host)" || ! agent="$(bazel/registry.sh ref agent)" ||
+	! ns_repo="$(bazel/registry.sh repo agent)" || [ -z "$host" ] || [ -z "$agent" ]; then
 	echo "::error::bazel/registry.sh cannot parse bazel/registry.bzl" >&2
 	exit 2
 fi
-namespace="${ns_repo%/csi}"
+namespace="${ns_repo%/agent}"
 echo "setting: ${host}/${namespace}"
 
 esc() { printf '%s' "$1" | sed -E 's/[][\.^$*+?(){}|/]/\\&/g'; }
 
 # --- 2. the chart's image defaults are derived --------------------------------
 values=charts/cracha/values.yaml
-for target in //broker:image_push //csi:image_push //webhook:image_push; do
+for target in //broker:image_push //agent:image_push //webhook:image_push; do
 	t="$(esc "$target")"
 	n_repo="$(grep -cE "^[[:space:]]*repository:[[:space:]]*\"\{@${t}\.repository\}\"[[:space:]]*\$" "$values" || true)"
 	n_digest="$(grep -cE "^[[:space:]]*digest:[[:space:]]*\"\{@${t}\.digest\}\"[[:space:]]*\$" "$values" || true)"
@@ -73,7 +73,7 @@ allow=(
 	':(exclude)README.md'
 )
 pattern="$(esc "${host}/${namespace}")(?![[:alnum:]_.-])"
-for probe in "registry: ${host}/${namespace}" "image=${csi}@sha256:0"; do
+for probe in "registry: ${host}/${namespace}" "image=${agent}@sha256:0"; do
 	if ! printf '%s\n' "$probe" | grep -qP -- "$pattern"; then
 		echo "::error::the literal hunt does not match '${probe}' -- the pattern is broken" >&2
 		exit 2

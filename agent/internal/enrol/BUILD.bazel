@@ -1,0 +1,45 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "enrol",
+    srcs = [
+        "client.go",
+        "enrol.go",
+        "server.go",
+    ],
+    importpath = "github.com/bpalermo/cracha/agent/internal/enrol",
+    visibility = ["//agent:__subpackages__"],
+    deps = [
+        "//agent/enrolapi",
+        "//agent/internal/cri",
+        "//agent/internal/listener",
+        "//agent/internal/serve",
+        "//agent/internal/tokenreview",
+        "@io_k8s_api//core/v1:core",
+        "@io_k8s_apimachinery//pkg/api/errors",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_client_go//kubernetes",
+        "@org_golang_x_time//rate",
+    ],
+)
+
+go_test(
+    name = "enrol_test",
+    srcs = [
+        "client_test.go",
+        "enrol_test.go",
+        "server_test.go",
+    ],
+    embed = [":enrol"],
+    deps = [
+        "//agent/enrolapi",
+        "//agent/internal/cri",
+        "//agent/internal/listener",
+        "//agent/internal/tokenreview",
+        "@io_k8s_api//core/v1:core",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_apimachinery//pkg/types",
+        "@io_k8s_client_go//kubernetes/fake",
+        "@org_golang_x_time//rate",
+    ],
+)

@@ -282,10 +282,10 @@ func TestWebhookDeployment(t *testing.T) {
 			"--workload-api-socket=unix:///spiffe-workload-api/spire-agent.sock",
 			"--webhook-config-name=cracha-webhook",
 			"--service-dns-name=cracha-webhook.default.svc",
-			"--agent-port=8780",
+			"--agent-port=9797",
 			"--enrol=init",
-			"--enrol-port=8781",
-			"--enrol-timeout=60s",
+			"--enrol-port=9798",
+			"--enrol-timeout=2m",
 			"--default-region=us-east-1",
 		} {
 			if !slices.Contains(args, want) {
@@ -313,10 +313,21 @@ func TestWebhookDeployment(t *testing.T) {
 			"--workload-api-socket=unix:///spiffe-workload-api/socket",
 			"--webhook-config-name=custom-webhook",
 			"--service-dns-name=custom-webhook.default.svc",
-			"--agent-port=9780",
-			"--enrol=cni",
+			"--agent-port=17171",
+			"--enrol=init",
+			"--agent-image=registry.example.com/cracha/agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			"--enrol-port=17172",
+			"--enrol-timeout=30s",
 			"--conflicting-env=strip",
 		} {
+			if !slices.Contains(args, want) {
+				t.Errorf("args %q lack %q", args, want)
+			}
+		}
+	})
+	t.Run("cni", func(t *testing.T) {
+		args := webhookArgs(t, "cni", "cracha-webhook")
+		for _, want := range []string{"--agent-port=9797", "--enrol=cni"} {
 			if !slices.Contains(args, want) {
 				t.Errorf("args %q lack %q", args, want)
 			}

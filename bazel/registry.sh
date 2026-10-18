@@ -16,7 +16,7 @@
 #       IMAGE_REGISTRY_HOST      the registry host
 #       IMAGE_NAMESPACE          the organization under it
 #       BROKER_IMAGE             image_reference("broker")
-#       CSI_IMAGE                image_reference("csi")
+#       AGENT_IMAGE              image_reference("agent")
 #       WEBHOOK_IMAGE            image_reference("webhook")
 #       CHART_REPOSITORY         chart_registry_url("cracha")
 #       IMAGE_SIGNATURE_LAYOUT   referrer | tag
@@ -65,7 +65,7 @@ env)
 	printf 'IMAGE_REGISTRY_HOST=%s\n' "$host"
 	printf 'IMAGE_NAMESPACE=%s\n' "$namespace"
 	printf 'BROKER_IMAGE=%s/%s/broker\n' "$host" "$namespace"
-	printf 'CSI_IMAGE=%s/%s/csi\n' "$host" "$namespace"
+	printf 'AGENT_IMAGE=%s/%s/agent\n' "$host" "$namespace"
 	printf 'WEBHOOK_IMAGE=%s/%s/webhook\n' "$host" "$namespace"
 	printf 'CHART_REPOSITORY=%s/%s/cracha\n' "$host" "$namespace"
 	printf 'IMAGE_SIGNATURE_LAYOUT=%s\n' "$layout"
