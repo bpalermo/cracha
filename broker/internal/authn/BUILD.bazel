@@ -9,7 +9,6 @@ go_library(
         "//common/idenc",
         "@com_github_spiffe_go_spiffe_v2//bundle/jwtbundle",
         "@com_github_spiffe_go_spiffe_v2//svid/jwtsvid",
-        "@com_github_spiffe_go_spiffe_v2//workloadapi",
     ],
 )
 

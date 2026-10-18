@@ -1,0 +1,26 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "mtls",
+    srcs = ["mtls.go"],
+    importpath = "github.com/bpalermo/cracha/broker/internal/mtls",
+    visibility = ["//broker:__subpackages__"],
+    deps = [
+        "@com_github_spiffe_go_spiffe_v2//bundle/x509bundle",
+        "@com_github_spiffe_go_spiffe_v2//spiffeid",
+        "@com_github_spiffe_go_spiffe_v2//spiffetls/tlsconfig",
+        "@com_github_spiffe_go_spiffe_v2//svid/x509svid",
+    ],
+)
+
+go_test(
+    name = "mtls_test",
+    srcs = ["mtls_test.go"],
+    embed = [":mtls"],
+    deps = [
+        "//broker/internal/mtls/mtlstest",
+        "@com_github_spiffe_go_spiffe_v2//spiffeid",
+        "@com_github_spiffe_go_spiffe_v2//spiffetls/tlsconfig",
+        "@com_github_spiffe_go_spiffe_v2//svid/x509svid",
+    ],
+)

@@ -14,6 +14,7 @@ import (
 	"github.com/bpalermo/cracha/broker/internal/cache"
 	"github.com/bpalermo/cracha/broker/internal/grants"
 	"github.com/bpalermo/cracha/common/idenc"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 )
 
 // config is the broker's configuration. Every flag has an environment
@@ -21,10 +22,10 @@ import (
 // wins when both are set.
 type config struct {
 	listen            string
-	tlsCert           string
-	tlsKey            string
-	insecurePlaintext bool
+	healthListen      string
 	workloadAPISocket string
+	namespace         string
+	agentSpiffeID     string
 	cluster           string
 	trustDomainLabels string
 	grantsFixture     string
@@ -62,6 +63,9 @@ type config struct {
 	labels       idenc.Labels
 	bundle       bundle.Location
 	pollInterval time.Duration
+	// agentID is --agent-spiffe-id parsed; zero when it is to be derived
+	// from the broker's own SVID and --namespace (mtls.DefaultAgentID).
+	agentID spiffeid.ID
 }
 
 // errVersion is returned by parseConfig when --version was asked for.
@@ -140,11 +144,11 @@ func (env envDefaults) integer(flag string, def int) int {
 
 // bindFlags declares the broker's flags on fs with their defaults from env.
 func (c *config) bindFlags(fs *flag.FlagSet, env envDefaults) {
-	fs.StringVar(&c.listen, "listen", env.str("listen", ":8443"), "address to listen on")
-	fs.StringVar(&c.tlsCert, "tls-cert", env.str("tls-cert", ""), "path to the TLS certificate (PEM); required unless --insecure-plaintext")
-	fs.StringVar(&c.tlsKey, "tls-key", env.str("tls-key", ""), "path to the TLS private key (PEM)")
-	fs.BoolVar(&c.insecurePlaintext, "insecure-plaintext", env.boolean("insecure-plaintext", false), "serve plain HTTP; for tests only, JWT-SVIDs travel in the clear")
-	fs.StringVar(&c.workloadAPISocket, "workload-api-socket", env.str("workload-api-socket", "unix:///run/spire/sockets/agent.sock"), "SPIFFE Workload API address, for the trust bundles")
+	fs.StringVar(&c.listen, "listen", env.str("listen", ":8443"), "address of the API listener, SPIFFE mTLS with the broker's own X.509-SVID")
+	fs.StringVar(&c.healthListen, "health-listen", env.str("health-listen", ":8081"), "address of the plaintext listener serving /healthz and /readyz for the kubelet's probes, and nothing else")
+	fs.StringVar(&c.workloadAPISocket, "workload-api-socket", env.str("workload-api-socket", "unix:///run/spire/sockets/agent.sock"), "SPIFFE Workload API address, for the broker's own X.509-SVID and the trust bundles")
+	fs.StringVar(&c.agentSpiffeID, "agent-spiffe-id", env.str("agent-spiffe-id", ""), "SPIFFE ID of the node agent, the only client the broker accepts; empty derives spiffe://<trust domain of the broker's own SVID>/ns/<--namespace>/sa/cracha-agent")
+	fs.StringVar(&c.namespace, "namespace", env.str("namespace", ""), "the broker's namespace, for the derived --agent-spiffe-id (the chart sets CRACHA_NAMESPACE from the downward API)")
 	fs.StringVar(&c.cluster, "cluster", env.str("cluster", ""), "name of the cluster this broker serves (required)")
 	fs.StringVar(&c.trustDomainLabels, "trust-domain-labels", env.str("trust-domain-labels", ""), "trust domain short labels, <trust-domain>=<label>,...; unmapped domains get td.<name>")
 	fs.StringVar(&c.grantsFixture, "grants-fixture", env.str("grants-fixture", ""), "path to a resolved-grants fixture file, for development; excludes --bundle-source")
@@ -259,9 +263,8 @@ func (c *config) validate() error {
 	if c.cluster == "" {
 		problems = append(problems, "--cluster is required")
 	}
-	if p := c.tlsProblem(); p != "" {
-		problems = append(problems, p)
-	}
+	problems = append(problems, c.listenProblems()...)
+	problems = append(problems, c.agentProblems()...)
 	problems = append(problems, c.authzProblems()...)
 	problems = append(problems, c.grantsProblems()...)
 	labels, err := idenc.ParseLabels(c.trustDomainLabels)
@@ -279,16 +282,41 @@ func (c *config) validate() error {
 	return nil
 }
 
-// tlsProblem is what is wrong with the TLS flags, or empty: plaintext
-// excludes a certificate and key, and TLS requires both.
-func (c *config) tlsProblem() string {
-	switch {
-	case c.insecurePlaintext && (c.tlsCert != "" || c.tlsKey != ""):
-		return "--insecure-plaintext excludes --tls-cert and --tls-key"
-	case !c.insecurePlaintext && (c.tlsCert == "" || c.tlsKey == ""):
-		return "--tls-cert and --tls-key are required (TLS is mandatory; --insecure-plaintext is for tests)"
+// listenProblems is what is wrong with the two listeners: each needs an
+// address, and they cannot share one.
+func (c *config) listenProblems() []string {
+	var problems []string
+	if c.listen == "" {
+		problems = append(problems, "--listen is required")
 	}
-	return ""
+	if c.healthListen == "" {
+		problems = append(problems, "--health-listen is required: the probes are not served on the mTLS listener")
+	}
+	if c.listen != "" && c.listen == c.healthListen {
+		problems = append(problems, "--listen and --health-listen cannot be the same address")
+	}
+	return problems
+}
+
+// agentProblems is what is wrong with the agent identity flags: a given
+// --agent-spiffe-id must be a SPIFFE ID (parsed into c.agentID); without
+// one, --namespace is needed to derive it.
+func (c *config) agentProblems() []string {
+	if c.agentSpiffeID == "" {
+		if c.namespace == "" {
+			return []string{"--namespace (CRACHA_NAMESPACE) is required to derive the agent's SPIFFE ID; or give --agent-spiffe-id"}
+		}
+		return nil
+	}
+	id, err := spiffeid.FromString(c.agentSpiffeID)
+	if err != nil {
+		return []string{fmt.Sprintf("--agent-spiffe-id %q: %v", c.agentSpiffeID, err)}
+	}
+	if id.Path() == "" {
+		return []string{fmt.Sprintf("--agent-spiffe-id %q names a trust domain, not a workload", c.agentSpiffeID)}
+	}
+	c.agentID = id
+	return nil
 }
 
 // grantsProblems is what is wrong with the grant source flags: exactly one

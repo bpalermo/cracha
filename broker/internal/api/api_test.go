@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
@@ -18,6 +20,7 @@ import (
 	"github.com/bpalermo/cracha/broker/internal/cache"
 	"github.com/bpalermo/cracha/broker/internal/grants"
 	"github.com/bpalermo/cracha/broker/internal/issuer"
+	"github.com/bpalermo/cracha/broker/internal/mtls/mtlstest"
 	"github.com/bpalermo/cracha/broker/internal/sts"
 	"github.com/bpalermo/cracha/common/idenc"
 )
@@ -84,6 +87,12 @@ type fixture struct {
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
+	return newFixtureWithLog(t, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// newFixtureWithLog is newFixture with the handler logging to log.
+func newFixtureWithLog(t *testing.T, log *slog.Logger) *fixture {
+	t.Helper()
 	ti := authntest.NewIssuer(t, "example.org")
 	labels, err := idenc.NewLabels(map[string]string{"example.org": "prod"})
 	if err != nil {
@@ -109,7 +118,7 @@ func newFixture(t *testing.T) *fixture {
 		Store: store, Grants: src, STS: assumer, Labels: labels, Cluster: "prod-a",
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	h := New(authn.New(ti.Bundle(t)), direct, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := New(authn.New(ti.Bundle(t)), direct, log)
 	return &fixture{issuer: ti, store: store, sts: assumer, direct: direct, handler: h, exp: exp}
 }
 
@@ -373,47 +382,68 @@ func TestMethodsAndPaths(t *testing.T) {
 			}
 		}
 	}
-	if rec := f.get(t, "/v1/other", token); rec.Code != http.StatusNotFound {
-		t.Errorf("unknown path: %d", rec.Code)
-	}
-	if rec := f.get(t, "/healthz", ""); rec.Code != http.StatusOK {
-		t.Errorf("healthz: %d", rec.Code)
+	// The probes are not here: they are served plaintext, apart from the
+	// API (broker/internal/health).
+	for _, path := range []string{"/v1/other", "/healthz", "/readyz"} {
+		if rec := f.get(t, path, token); rec.Code != http.StatusNotFound {
+			t.Errorf("%s: %d, want 404", path, rec.Code)
+		}
 	}
 	if f.sts.calls != 0 {
 		t.Error("sts called")
 	}
 }
 
-// readiness is a Readiness check with a settable answer.
-type readiness struct{ err error }
+// Every request is logged with the client SVID the TLS layer verified and
+// the token's subject (design 6.5).
+func TestRequestLog(t *testing.T) {
+	var logs bytes.Buffer
+	f := newFixtureWithLog(t, slog.New(slog.NewTextHandler(&logs, nil)))
+	ca := mtlstest.NewCA(t, "example.org")
+	agent := ca.SVID(t, "spiffe://example.org/ns/cracha-system/sa/cracha-agent")
+	req := httptest.NewRequest(http.MethodGet, "/v1/credentials", nil)
+	req.Header.Set("Authorization", f.issuer.ValidToken(t, subject))
+	req.TLS = &tls.ConnectionState{PeerCertificates: agent.Certificates}
+	rec := httptest.NewRecorder()
+	f.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	line := requestLine(t, logs.String())
+	for _, want := range []string{"client=" + agent.ID.String(), "subject=" + subject, "status=200", "path=/v1/credentials"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("request log %q lacks %q", line, want)
+		}
+	}
 
-func (r *readiness) Ready() error { return r.err }
+	// A refused token is logged with the client too, and without a subject.
+	logs.Reset()
+	req.Header.Set("Authorization", "not.a.jwt")
+	rec = httptest.NewRecorder()
+	f.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d", rec.Code)
+	}
+	line = requestLine(t, logs.String())
+	if !strings.Contains(line, "client="+agent.ID.String()) || !strings.Contains(line, "status=401") || !strings.Contains(line, `subject=""`) {
+		t.Errorf("request log %q", line)
+	}
+	if !strings.Contains(logs.String(), "msg=unauthenticated") || !strings.Contains(logs.String(), "client="+agent.ID.String()) {
+		t.Errorf("the refusal was not logged with the client: %q", logs.String())
+	}
+}
 
-func TestReadyz(t *testing.T) {
-	f := newFixture(t)
-	// Nothing registered: ready as soon as it serves.
-	if rec := f.get(t, "/readyz", ""); rec.Code != http.StatusOK || rec.Body.String() != "ok\n" {
-		t.Errorf("readyz with no checks: %d %q", rec.Code, rec.Body.String())
+// requestLine is the one "request" line of the log.
+func requestLine(t *testing.T, logs string) string {
+	t.Helper()
+	var lines []string
+	for _, l := range strings.Split(strings.TrimSpace(logs), "\n") {
+		if strings.Contains(l, "msg=request ") {
+			lines = append(lines, l)
+		}
 	}
-	bundle := &readiness{err: errors.New("no grant bundle loaded yet")}
-	f.handler.AddReadiness(bundle)
-	f.handler.AddReadiness(&readiness{})
-	rec := f.get(t, "/readyz", "")
-	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "no grant bundle loaded yet") {
-		t.Errorf("readyz while not ready: %d %q", rec.Code, rec.Body.String())
+	if len(lines) != 1 {
+		t.Fatalf("%d request lines in %q", len(lines), logs)
 	}
-	if rec.Header().Get("Cache-Control") != "no-store" {
-		t.Error("readiness answer is cacheable")
-	}
-	// Liveness is unaffected.
-	if rec := f.get(t, "/healthz", ""); rec.Code != http.StatusOK {
-		t.Errorf("healthz while not ready: %d", rec.Code)
-	}
-	bundle.err = nil
-	if rec := f.get(t, "/readyz", ""); rec.Code != http.StatusOK {
-		t.Errorf("readyz once ready: %d %q", rec.Code, rec.Body.String())
-	}
-	if rec := f.do(t, http.MethodHead, "/readyz", ""); rec.Code != http.StatusMethodNotAllowed {
-		t.Errorf("HEAD /readyz: %d", rec.Code)
-	}
+	return lines[0]
 }

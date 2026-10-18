@@ -87,10 +87,10 @@ helm_template_test(
     values = REQUIRED_VALUES,
 )
 
-# Every non-default knob: tls.mode existing with its Secrets and CA bundle,
-# the SpiceDB backend, existing ConfigMaps, every image overridden,
-# trust-domain labels, the env and envFrom, the scheduling knobs of each
-# component.
+# Every non-default knob: tls.mode existing with the webhook's Secret and CA
+# bundle, the broker's agent identity and health port, the SpiceDB backend,
+# existing ConfigMaps, every image overridden, trust-domain labels, the env
+# and envFrom, the scheduling knobs of each component.
 helm_template_test(
     name = "cracha_overrides_template_test",
     size = "small",
@@ -125,8 +125,8 @@ helm_lint_test(
     ]
 ]
 
-# The third TLS mode, which renders cert-manager resources instead of
-# Secrets.
+# The webhook's third TLS mode, which renders a cert-manager Certificate
+# instead of a Secret.
 helm_template_test(
     name = "cracha_cert_manager_template_test",
     size = "small",

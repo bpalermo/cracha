@@ -171,6 +171,17 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   is the in-memory SpiceDB its tests use). Like `grantc` it runs from CI or
   an operator's machine and has no container image; the e2e will run it
   from the host against a port-forwarded SpiceDB.
+- The broker's transport is `broker/internal/mtls` (design 6.5): the TLS
+  configuration over go-spiffe (`tlsconfig.MTLSServerConfig`, the agent's
+  ID the only one authorised, so any other client fails at the handshake),
+  the peer identity of a request, which `broker/internal/api` logs beside
+  the token's subject with every request, and the readiness check that
+  waits for the broker's SVID. `broker/spiffe.go` is the broker's one
+  Workload API connection, which the X.509 source (mTLS) and the JWT
+  source (token verification) share. The probes are `broker/internal/health`,
+  on their own plaintext listener (`--health-listen`); the API listener
+  serves nothing but `/v1/credentials` and `/v1/grants`. `mtls/mtlstest`
+  mints the X.509-SVIDs the tests use, as `authn/authntest` mints JWTs.
 - The broker gets its grants from one of two sources, exactly one of which
   is configured. In production it is the compiled bundle `grantc` publishes
   (`--bundle-source local:<dir>` or `s3://bucket/prefix`,
@@ -200,7 +211,7 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 ## Chart
 
 - `charts/cracha` is the Helm chart: the CSIDriver, the CSI DaemonSet, the
-  broker and the webhook with their TLS. It is built, linted, templated and
+  broker and the webhook with its TLS. It is built, linted, templated and
   installed with the helm that rules_helm pins (`@helm//:helm`, the version
   in `MODULE.bazel` and `.bazelrc`); never a helm from PATH.
   `bazel build //charts/cracha:cracha` packages it as
@@ -234,9 +245,18 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   source, and a helper renders the chosen one only
   (`cracha.workloadAPIVolumeSource`). `//charts/cracha:cracha_test` fails
   any rendered volume with two sources, in every rendering it has.
-- The default TLS mode generates a CA at render time, for development and
-  kind only: the broker's certificate must be trusted by the workload images
-  (design 6.5), so production uses `existing` or `cert-manager`.
+- The broker has no certificate from the chart: it serves SPIFFE mTLS with
+  its own X.509-SVID from the Workload API and admits one client, the node
+  agent, by SPIFFE ID (design 6.5). `broker.agentSpiffeID` names it; empty,
+  the default, leaves the broker to derive
+  `spiffe://<its own trust domain>/ns/<its namespace>/sa/cracha-agent`, the
+  namespace coming from `CRACHA_NAMESPACE`, which the Deployment sets from
+  the downward API. The kubelet's probes cannot present an SVID, so
+  `/healthz` and `/readyz` are served plaintext on `broker.healthPort`
+  (`--health-listen`), a port that serves nothing else and is not on the
+  Service. The `tls` block (generated, existing or cert-manager) is now the
+  webhook's serving certificate alone, and goes when the webhook serves its
+  SVID (design 7.5).
 - The chart is published to `chart_registry_url("cracha")` of
   `bazel/registry.bzl` by the publish workflow (below).
 

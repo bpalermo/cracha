@@ -1,5 +1,5 @@
-# The cert-manager TLS mode: Certificates instead of Secrets, and the CA
-# injector's annotation on the webhook configuration.
+# The webhook's cert-manager TLS mode: a Certificate instead of a Secret,
+# and the CA injector's annotation on the webhook configuration.
 tls:
   mode: cert-manager
   certManager:
