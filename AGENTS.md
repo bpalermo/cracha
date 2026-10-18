@@ -5,10 +5,11 @@ Guidance for agents working in this repository.
 ## What this is
 
 Crachá issues AWS credentials to Kubernetes workloads from their SPIFFE
-identity. Three binaries: the credential broker (`broker`), the node agent
-that serves each pod's credentials over a loopback listener bound inside the
-pod's network namespace (`agent`), and the mutating webhook that wires pods
-up (`webhook`). [docs/design.md](docs/design.md)
+identity. Four binaries with images: the credential broker (`broker`), the
+node agent that serves each pod's credentials over a loopback listener bound
+inside the pod's network namespace (`agent`), the mutating webhook that wires
+pods up (`webhook`), and, on an install whose authorization store is SpiceDB,
+the only writer of its relationships (`access`, design 6.9). [docs/design.md](docs/design.md)
 is the design; read it before changing behaviour, and update it in the same
 pull request when behaviour changes. Its invariants (section 11) must hold in
 every change.
@@ -167,7 +168,7 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 ## Layout
 
 - No `cmd/`. Each binary lives in a root-level directory with its `main.go`:
-  `broker/`, `agent/`, `webhook/`, `grantc/`, `reconciler/`.
+  `broker/`, `agent/`, `webhook/`, `access/`, `grantc/`, `reconciler/`.
 - `agent/` is `cracha-agent` (design 7). `internal/listener` is the registry
   of loopback listeners, one per enrolled pod, bound inside the pod's network
   namespace by `internal/netns` (setns on a dedicated locked thread) and
@@ -343,6 +344,24 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   a composition of two accounts is `accounts_mixed`, and one with neither
   a session policy nor managed policies is refused, since on a shared
   account role it would be the role's whole policy.
+- `access/` is `cracha-access` (design 6.9): `serve` is a gRPC API
+  (`cracha.access.v1.Access`, JSON messages in gRPC frames, so no protoc:
+  `internal/api`) over SPIFFE mTLS that any SPIFFE ID of the trust domain
+  may call, `watch-audit` logs SpiceDB's Watch, and the other subcommands
+  are its CLI, which calls it with the caller's SVID. `internal/store` is
+  its SpiceDB adapter (relationships as `Tuple`s, `manage`/`approve`
+  checks, the `sensitive` flag, pending requests as `pending_request`
+  relationships, Watch); `internal/check` the safeguards, which rebuild
+  the grant tree a write leaves from the bundle and SpiceDB's
+  relationships and run `common/grant`'s `LintComposition` on it, refusing
+  with the broker's reason codes; `internal/service` the write path
+  (authorization, expiry, approvals, break-glass, audit);
+  `internal/audit` the JSON audit lines on stdout. Its tests run against
+  `internal/store/storetest`, an in-memory SpiceDB, and a bundle
+  `internal/check/checktest` compiles with `common/grant`. It reads the
+  bundle with `common/publication`, the fetchers the broker uses
+  (`broker/internal/bundle` aliases them) and a verifying poller that
+  keeps the last good version.
 - `bazel/` holds build rules, and `bazel/spicedb` the third-party SpiceDB
   binary Crachá builds and publishes from its upstream module plus the
   patches beside it (below); `docs/` the design; `charts/cracha` the Helm
@@ -355,7 +374,7 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   may spell it out.
 - Images are built with the `go_image` macro in `bazel/image/defs.bzl`, from
   pure-Go binaries on a digest-pinned distroless base. Image repositories are
-  `broker`, `agent`, `webhook` and `spicedb`.
+  `broker`, `agent`, `webhook`, `access` and `spicedb`.
 - `spicedb` (`//bazel/spicedb`) is a third-party binary: SpiceDB built
   from a pinned upstream release (`github.com/authzed/spicedb` in `go.mod`, a
   `tool`, so nothing imports it) plus one reviewed patch,
@@ -383,8 +402,13 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 
 ## Chart
 
-- `charts/cracha` is the Helm chart: the agent DaemonSet, the broker and
-  the webhook. It is built, linted, templated and
+- `charts/cracha` is the Helm chart: the agent DaemonSet, the broker,
+  the webhook and, with `access.enabled` (off by default; it needs
+  `broker.authz.backend` spicedb and `broker.bundle.source`), cracha-access:
+  one replica with the `Recreate` strategy, since it serializes the writes
+  it checks, its ServiceAccount `<name>-access` (the SPIFFE ID the SpiceDB
+  gateway lets write) and Service, reading the broker's bundle source and
+  keys (`access_test.go` asserts its arguments). It is built, linted, templated and
   installed with the helm that rules_helm pins (`@helm//:helm`, the version
   in `MODULE.bazel` and `.bazelrc`); never a helm from PATH.
   `bazel build //charts/cracha:cracha` packages it as
