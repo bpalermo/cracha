@@ -312,6 +312,11 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   decodes the `helm_template` renderings of `BUILD.bazel`; an assertion
   on what a template renders goes there, since `helm_template_test` only
   renders).
+- The agent DaemonSet tolerates no taint by default
+  (`TestAgentTolerations`): it must run exactly where the identity issuer's
+  agent does, since its hostPath mounts of the issuer's sockets fail
+  anywhere else; an install mirrors the issuer agent's tolerations in
+  `agent.tolerations`.
 - The agent, the broker and the webhook have default resource requests and
   memory limits and no CPU limits (`TestDefaultResources`): a BestEffort pod
   on a busy node gets its probes starved and restarted, and a CPU limit

@@ -310,3 +310,27 @@ func TestNoCSIDriverRemains(t *testing.T) {
 		}
 	}
 }
+
+// TestAgentTolerations: by default the agent tolerates no taint, so it never
+// lands on a node the identity issuer's agent does not run on (a control
+// plane); the overrides give it the issuer agent's toleration.
+func TestAgentTolerations(t *testing.T) {
+	for _, tc := range []struct {
+		rendering, name string
+		want            int
+	}{
+		{"defaults", "cracha-agent", 0},
+		{"overrides", "custom-agent", 1},
+	} {
+		ds := object(t, rendered(t, tc.rendering), "DaemonSet", tc.name)
+		tols, _ := path(ds, "spec", "template", "spec", "tolerations").([]any)
+		if len(tols) != tc.want {
+			t.Errorf("%s: %d tolerations %v, want %d", tc.rendering, len(tols), tols, tc.want)
+		}
+		for _, tol := range tols {
+			if path(tol, "key") == nil && path(tol, "operator") == "Exists" {
+				t.Errorf("%s: a toleration of every taint", tc.rendering)
+			}
+		}
+	}
+}
