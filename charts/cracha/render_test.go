@@ -220,14 +220,35 @@ func stringListOf(v any, key string) []string {
 // The webhook configuration (design 7.5): rendered without a caBundle, which
 // the webhook publishes itself, with failurePolicy Fail, and excluding the
 // release's namespace and the namespaces the values list, each once.
+// webhookEntry is what TestWebhookConfiguration expects of one webhook of
+// the configuration.
+type webhookEntry struct {
+	name                    string
+	namespaceLabels, labels map[string]any
+}
+
 func TestWebhookConfiguration(t *testing.T) {
+	optIn := map[string]any{"cracha.dev/enabled": "true"}
 	for _, tc := range []struct {
 		rendering, name string
 		excluded        []string
-		labels          map[string]any
+		entries         []webhookEntry
 	}{
-		{"defaults", "cracha-webhook", []string{"default", "spire-system", "spire-server", "spire-mgmt", "kube-system"}, nil},
-		{"overrides", "custom-webhook", []string{"default", "spire", "kube-system"}, map[string]any{"cracha.dev/enabled": "true"}},
+		{
+			"defaults", "cracha-webhook",
+			[]string{"default", "spire-system", "spire-server", "spire-mgmt", "kube-system"},
+			[]webhookEntry{{name: "pods.cracha.dev"}},
+		},
+		{
+			"overrides", "custom-webhook",
+			[]string{"default", "spire", "kube-system"},
+			[]webhookEntry{{name: "pods.cracha.dev", namespaceLabels: optIn}, {name: "labelled-pods.cracha.dev", labels: optIn}},
+		},
+		{
+			"pod_labels", "cracha-webhook",
+			[]string{"default", "spire-system", "spire-server", "spire-mgmt", "kube-system"},
+			[]webhookEntry{{name: "labelled-pods.cracha.dev", labels: optIn}},
+		},
 	} {
 		t.Run(tc.rendering, func(t *testing.T) {
 			cfg := object(t, rendered(t, tc.rendering), "MutatingWebhookConfiguration", tc.name)
@@ -235,34 +256,48 @@ func TestWebhookConfiguration(t *testing.T) {
 				t.Errorf("annotations %v, want none (no CA injector)", ann)
 			}
 			hooks, _ := path(cfg, "webhooks").([]any)
-			if len(hooks) != 1 {
-				t.Fatalf("%d webhooks, want 1", len(hooks))
+			if len(hooks) != len(tc.entries) {
+				t.Fatalf("%d webhooks, want %d", len(hooks), len(tc.entries))
 			}
-			hook := hooks[0]
-			if _, ok := path(hook, "clientConfig", "caBundle").(string); ok {
-				t.Error("the configuration carries a caBundle; the webhook publishes it itself")
-			}
-			if got := path(hook, "failurePolicy"); got != "Fail" {
-				t.Errorf("failurePolicy %v, want Fail", got)
-			}
-			if got := path(hook, "clientConfig", "service", "name"); got != tc.name {
-				t.Errorf("clientConfig.service.name %v, want %s", got, tc.name)
-			}
-			exprs, _ := path(hook, "namespaceSelector", "matchExpressions").([]any)
-			if len(exprs) != 1 {
-				t.Fatalf("%d selector expressions, want 1", len(exprs))
-			}
-			if key, op := path(exprs[0], "key"), path(exprs[0], "operator"); key != "kubernetes.io/metadata.name" || op != "NotIn" {
-				t.Errorf("selector is %v %v, want kubernetes.io/metadata.name NotIn", key, op)
-			}
-			if got := stringList(path(exprs[0], "values")); !slices.Equal(got, tc.excluded) {
-				t.Errorf("excluded namespaces %q, want %q", got, tc.excluded)
-			}
-			got, _ := path(hook, "namespaceSelector", "matchLabels").(map[string]any)
-			if !maps.Equal(got, tc.labels) {
-				t.Errorf("namespaceSelector.matchLabels %v, want %v", got, tc.labels)
+			for i, want := range tc.entries {
+				checkWebhookEntry(t, hooks[i], want, tc.name, tc.excluded)
 			}
 		})
+	}
+}
+
+// checkWebhookEntry checks one webhook of the configuration.
+func checkWebhookEntry(t *testing.T, hook any, want webhookEntry, service string, excluded []string) {
+	t.Helper()
+	if got := path(hook, "name"); got != want.name {
+		t.Errorf("webhook %v, want %s", got, want.name)
+	}
+	if _, ok := path(hook, "clientConfig", "caBundle").(string); ok {
+		t.Errorf("%s carries a caBundle; the webhook publishes it itself", want.name)
+	}
+	if got := path(hook, "failurePolicy"); got != "Fail" {
+		t.Errorf("%s failurePolicy %v, want Fail", want.name, got)
+	}
+	if got := path(hook, "clientConfig", "service", "name"); got != service {
+		t.Errorf("%s clientConfig.service.name %v, want %s", want.name, got, service)
+	}
+	exprs, _ := path(hook, "namespaceSelector", "matchExpressions").([]any)
+	if len(exprs) != 1 {
+		t.Fatalf("%s: %d selector expressions, want 1", want.name, len(exprs))
+	}
+	if key, op := path(exprs[0], "key"), path(exprs[0], "operator"); key != "kubernetes.io/metadata.name" || op != "NotIn" {
+		t.Errorf("%s selector is %v %v, want kubernetes.io/metadata.name NotIn", want.name, key, op)
+	}
+	if got := stringList(path(exprs[0], "values")); !slices.Equal(got, excluded) {
+		t.Errorf("%s excluded namespaces %q, want %q", want.name, got, excluded)
+	}
+	nsLabels, _ := path(hook, "namespaceSelector", "matchLabels").(map[string]any)
+	if !maps.Equal(nsLabels, want.namespaceLabels) {
+		t.Errorf("%s namespaceSelector.matchLabels %v, want %v", want.name, nsLabels, want.namespaceLabels)
+	}
+	podLabels, _ := path(hook, "objectSelector", "matchLabels").(map[string]any)
+	if !maps.Equal(podLabels, want.labels) {
+		t.Errorf("%s objectSelector.matchLabels %v, want %v", want.name, podLabels, want.labels)
 	}
 }
 

@@ -82,3 +82,10 @@ webhook:
   # SPIRE's pods are nobody's workloads.
   excludedNamespaces:
     - spire
+  # Opt-in, as on a shared cluster: the webhook sees pods of namespaces
+  # labelled cracha.dev/enabled (e2e/manifests/e2e.yaml labels the suite's)
+  # and pods carrying that label anywhere else (TestWebhookOptIn).
+  namespaceLabels:
+    cracha.dev/enabled: "true"
+  podLabels:
+    cracha.dev/enabled: "true"

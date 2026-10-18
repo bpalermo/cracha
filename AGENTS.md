@@ -384,9 +384,14 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   The configuration's `namespaceSelector` excludes the release namespace
   and `webhook.excludedNamespaces` (a list that replaces the default of
   SPIRE's namespaces and `kube-system`), and, when
-  `webhook.namespaceLabels` is set, requires those labels: with
+  `webhook.namespaceLabels` or `webhook.podLabels` is set, sees only pods
+  whose namespace carries the namespace labels or which carry the pod
+  labels (two webhook entries, `pods.cracha.dev` and
+  `labelled-pods.cracha.dev`, since a webhook's selectors are ANDed): with
   `failurePolicy: Fail` an unreachable webhook refuses every pod it covers,
-  so a cluster shared with other workloads installs it opt-in. The webhook reads the agent's
+  so a cluster shared with other workloads installs it opt-in. The render
+  fails on `cracha.dev/credentials` as a pod label, which the webhook sets
+  itself; the e2e installs opt-in both ways (`TestWebhookOptIn`). The webhook reads the agent's
   values `agent.image`, `agent.port`, `agent.enrol` (`init` injects the
   `cracha-enrol` init container, `cni` nothing but env and label),
   `agent.enrolPort`, `agent.enrolTimeout` and `agent.enrolResources`;

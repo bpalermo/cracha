@@ -434,6 +434,16 @@ webhook:
   #     cracha.dev/enabled: "true"
   namespaceLabels: {}
 
+  # Labels a pod may carry to be seen by the webhook whatever its namespace
+  # (outside the exclusions above), for a workload that opts in on its own:
+  #   podLabels:
+  #     cracha.dev/enabled: "true"
+  # With namespaceLabels or podLabels set, the webhook sees a pod when its
+  # namespace carries the namespace labels OR the pod carries the pod
+  # labels; with neither, every pod. Do not use cracha.dev/credentials: the
+  # webhook sets that label itself and leaves a pod that has it unchanged.
+  podLabels: {}
+
   # The log level: debug, info, warn or error.
   logLevel: info
 
