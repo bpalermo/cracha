@@ -449,15 +449,22 @@ func (c *Cache) watch(ctx context.Context, since authz.Token) (authz.Token, erro
 
 // Invalidate drops the entries a change touches: those of its subject (any
 // subject when it names none) holding its grant (any grant when it names
-// none).
+// none). It logs what it dropped, so a flush from the Watch stream is
+// visible in the broker's log.
 func (c *Cache) Invalidate(change authz.Change) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	dropped := 0
 	for _, e := range c.entries {
 		if touches(change, e.resolution) {
 			c.remove(e)
 			c.stats.Invalidations++
+			dropped++
 		}
+	}
+	if dropped > 0 {
+		c.opts.Log.LogAttrs(context.Background(), slog.LevelInfo, "invalidated cached credentials from the authorization store's watch",
+			slog.Int("entries", dropped), slog.String("subject", change.Subject.ID), slog.String("grant", change.Grant))
 	}
 }
 
