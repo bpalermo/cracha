@@ -421,7 +421,7 @@ A mutating admission webhook on Pod CREATE. For pods whose ServiceAccount is ann
 - the CSI inline volume (`cracha`, driver `csi.cracha.dev`, read-only), mounted read-only at `/var/run/cracha`
 - `AWS_CONTAINER_CREDENTIALS_FULL_URI=https://<broker>/v1/credentials`
 - `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE=/var/run/cracha/token`
-- `AWS_REGION` from the cluster default, unless the container sets its own. The pod is not scheduled at admission, so the node's topology region is not available; a per-namespace override (`cracha.dev/region` on the Namespace) is the hook for anything finer.
+- `AWS_REGION` from the cluster default, unless the container sets its own. The pod is not scheduled at admission, so the node's topology region is not available; the Namespace annotation `cracha.dev/region` overrides the default for the namespace's pods. The webhook reads it from a watch on the Namespaces (it needs `get`, `list` and `watch` on them, cluster-wide), never from the API on the admission path: a namespace the watch has not seen yet, or an empty annotation, means the default, and an annotation that is not shaped like an AWS region refuses the pod as invalid rather than injecting it.
 
 The pod is marked `cracha.dev/injected: "true"`, and a pod that already carries the injection is left unchanged.
 

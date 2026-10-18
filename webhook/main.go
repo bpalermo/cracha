@@ -1,7 +1,8 @@
 // Command cracha-webhook is the mutating admission webhook that injects the
 // CSI volume and the AWS SDK environment into enabled pods (docs/design.md,
 // section 7.4). The decision is in internal/mutate, the HTTPS front in
-// internal/server, the ServiceAccount lookups in internal/sacache.
+// internal/server, the ServiceAccount lookups in internal/sacache and the
+// per-namespace region override in internal/nsregion.
 package main
 
 import (
@@ -23,6 +24,7 @@ import (
 
 	"github.com/bpalermo/cracha/common/version"
 	"github.com/bpalermo/cracha/webhook/internal/mutate"
+	"github.com/bpalermo/cracha/webhook/internal/nsregion"
 	"github.com/bpalermo/cracha/webhook/internal/sacache"
 	"github.com/bpalermo/cracha/webhook/internal/server"
 )
@@ -106,11 +108,16 @@ func run(ctx context.Context, opts options, logger *slog.Logger) error {
 		return fmt.Errorf("creating the Kubernetes client: %w", err)
 	}
 
+	// The per-namespace region overrides, watched for as long as the
+	// webhook runs. Until the first list the hook serves the default.
+	regions := nsregion.New(client)
+	go regions.Run(ctx)
+
 	mutator, err := mutate.New(mutate.Config{
 		BrokerURL:      opts.brokerURL,
 		DefaultRegion:  opts.defaultRegion,
 		ConflictingEnv: opts.conflictingEnv,
-	}, sacache.New(client, opts.saCacheTTL))
+	}, sacache.New(client, opts.saCacheTTL), mutate.WithRegions(regions))
 	if err != nil {
 		return err
 	}
@@ -120,17 +127,8 @@ func run(ctx context.Context, opts options, logger *slog.Logger) error {
 		CertFile:        opts.tlsCert,
 		KeyFile:         opts.tlsKey,
 		MaxRequestBytes: opts.maxRequestBytes,
-		// Ready when the apiserver answers: without it no ServiceAccount
-		// can be looked up and every enabled pod would be denied.
-		Ready: func(ctx context.Context) error {
-			ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			defer cancel()
-			if err := client.Discovery().RESTClient().Get().AbsPath("/readyz").Do(ctx).Error(); err != nil {
-				return fmt.Errorf("apiserver: %w", err)
-			}
-			return nil
-		},
-		Logger: logger,
+		Ready:           ready(client, regions),
+		Logger:          logger,
 	}, mutator)
 	if err != nil {
 		return err
@@ -141,6 +139,25 @@ func run(ctx context.Context, opts options, logger *slog.Logger) error {
 		"broker_url", cfg.BrokerURL, "default_region", cfg.DefaultRegion,
 		"conflicting_env", cfg.ConflictingEnv.String(), "sa_cache_ttl", opts.saCacheTTL)
 	return srv.Run(ctx)
+}
+
+// ready is the /readyz check: the apiserver answers, without which no
+// ServiceAccount can be looked up and every enabled pod would be denied,
+// and the namespaces have been listed, without which every pod would get
+// the default region, and a webhook that may not watch namespaces would
+// go unnoticed.
+func ready(client kubernetes.Interface, regions *nsregion.Regions) func(context.Context) error {
+	return func(ctx context.Context) error {
+		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		if err := client.Discovery().RESTClient().Get().AbsPath("/readyz").Do(ctx).Error(); err != nil {
+			return fmt.Errorf("apiserver: %w", err)
+		}
+		if !regions.HasSynced() {
+			return errors.New("namespaces not listed yet")
+		}
+		return nil
+	}
 }
 
 // restConfig is the in-cluster configuration, or the kubeconfig when one is

@@ -10,6 +10,7 @@ go_library(
     deps = [
         "//common/version",
         "//webhook/internal/mutate",
+        "//webhook/internal/nsregion",
         "//webhook/internal/sacache",
         "//webhook/internal/server",
         "@com_github_go_logr_logr//:logr",

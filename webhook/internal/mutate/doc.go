@@ -1,7 +1,7 @@
 // Package mutate turns a Pod admission request into the JSON Patch that wires
 // the pod up to Crachá (docs/design.md, section 7.4). It is pure: everything
-// it needs from the cluster comes through the ServiceAccounts interface, so
-// the whole decision can be unit tested with a fake clientset.
+// it needs from the cluster comes through the ServiceAccounts and Regions
+// interfaces, so the whole decision can be unit tested with a fake clientset.
 //
 // # What is injected
 //
@@ -26,9 +26,11 @@
 // The design says the region comes from the node's topology region, or the
 // cluster default. The webhook runs at admission, before the pod is
 // scheduled, so the node is not known and the cluster default (the
-// --default-region flag) is what it has. The Regions hook lets a deployment
-// override the default per namespace, meant for the namespace's
-// "cracha.dev/region" annotation; the binary does not wire the hook yet. A
+// --default-region flag) is what it has. The Regions hook overrides the
+// default per namespace: the binary serves it from the Namespace annotation
+// "cracha.dev/region" (webhook/internal/nsregion), read from an informer's
+// cache, so a namespace the cache does not hold yet keeps the default, and
+// an annotation that is not an AWS region denies the pod as invalid. A
 // container that sets AWS_REGION itself keeps its own value: choosing a
 // region is the workload's business, only the credentials are Crachá's.
 //

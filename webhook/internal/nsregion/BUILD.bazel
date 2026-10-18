@@ -1,0 +1,30 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "nsregion",
+    srcs = ["nsregion.go"],
+    importpath = "github.com/bpalermo/cracha/webhook/internal/nsregion",
+    visibility = ["//webhook:__subpackages__"],
+    deps = [
+        "//webhook/internal/mutate",
+        "@io_k8s_apimachinery//pkg/api/errors",
+        "@io_k8s_client_go//informers",
+        "@io_k8s_client_go//kubernetes",
+        "@io_k8s_client_go//listers/core/v1:core",
+        "@io_k8s_client_go//tools/cache",
+    ],
+)
+
+go_test(
+    name = "nsregion_test",
+    srcs = ["nsregion_test.go"],
+    embed = [":nsregion"],
+    deps = [
+        "//webhook/internal/mutate",
+        "@io_k8s_api//core/v1:core",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_apimachinery//pkg/runtime",
+        "@io_k8s_client_go//kubernetes/fake",
+        "@io_k8s_client_go//tools/cache",
+    ],
+)

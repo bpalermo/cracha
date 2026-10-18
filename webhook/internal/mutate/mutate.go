@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"regexp"
 	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -27,8 +28,8 @@ const (
 	// AnnotationStrippedEnv records, as a JSON list of StrippedEnv, the
 	// variables the strip policy removed from a pod.
 	AnnotationStrippedEnv = "cracha.dev/stripped-env"
-	// AnnotationRegion on a Namespace is the intended key for a per-namespace
-	// AWS_REGION override, served through the Regions hook.
+	// AnnotationRegion on a Namespace overrides AWS_REGION for its pods,
+	// served through the Regions hook (webhook/internal/nsregion).
 	AnnotationRegion = "cracha.dev/region"
 )
 
@@ -133,9 +134,35 @@ type ServiceAccounts interface {
 }
 
 // Regions is the hook for a per-namespace AWS_REGION override. An empty
-// region means no override; an error denies the admission.
+// region means no override; an error denies the admission, as invalid when
+// it is an InvalidRegionError and as unavailable otherwise.
 type Regions interface {
 	Region(ctx context.Context, namespace string) (string, error)
+}
+
+// InvalidRegionError is what a Regions hook returns for an override that is
+// not an AWS region: the pod is denied as invalid, naming the annotation,
+// rather than as a lookup failure.
+type InvalidRegionError struct {
+	Namespace string
+	Value     string
+}
+
+func (e *InvalidRegionError) Error() string {
+	return fmt.Sprintf("annotation %s of namespace %s is %q, not an AWS region such as us-east-1",
+		AnnotationRegion, e.Namespace, e.Value)
+}
+
+// regionPattern is the shape of every AWS region: a two-letter partition
+// prefix, one or more words and a number (us-east-1, eu-central-2,
+// ap-southeast-3, us-gov-west-1, cn-north-1, il-central-1).
+var regionPattern = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]+$`)
+
+// IsRegion reports whether s is shaped like an AWS region. It does not know
+// which regions exist: the SDK's own validation of AWS_REGION is as loose,
+// and a new region must not need a webhook release.
+func IsRegion(s string) bool {
+	return regionPattern.MatchString(s)
 }
 
 // Mutator admits Pod CREATE requests.
@@ -278,12 +305,17 @@ func (m *Mutator) serviceAccount(ctx context.Context, uid types.UID, namespace, 
 }
 
 // region is the AWS_REGION to inject in namespace: the Regions hook's
-// override when there is one, otherwise the default. A failing hook denies.
+// override when there is one, otherwise the default. A failing hook denies:
+// an override that is not a region as invalid, anything else as unavailable.
 func (m *Mutator) region(ctx context.Context, uid types.UID, namespace string) (string, *admissionv1.AdmissionResponse) {
 	if m.regions == nil {
 		return m.cfg.DefaultRegion, nil
 	}
 	override, err := m.regions.Region(ctx, namespace)
+	var invalid *InvalidRegionError
+	if errors.As(err, &invalid) {
+		return "", denied(uid, http.StatusUnprocessableEntity, metav1.StatusReasonInvalid, "cracha: "+err.Error())
+	}
 	if err != nil {
 		return "", denied(uid, http.StatusServiceUnavailable, metav1.StatusReasonServiceUnavailable,
 			fmt.Sprintf("cracha: resolving the region of namespace %s: %v", namespace, err))

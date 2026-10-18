@@ -1,4 +1,5 @@
-load("@rules_helm//helm:defs.bzl", "helm_chart", "helm_lint_test", "helm_template_test")
+load("@rules_go//go:def.bzl", "go_test")
+load("@rules_helm//helm:defs.bzl", "helm_chart", "helm_lint_test", "helm_template", "helm_template_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel:registry.bzl", "chart_push_url", "chart_registry_url", "image_reference")
 
@@ -131,6 +132,41 @@ helm_template_test(
     size = "small",
     chart = ":cracha",
     values = REQUIRED_VALUES + ["test/cert-manager.yaml"],
+)
+
+# The chart rendered with the pinned helm, for the assertions the Go tests
+# below make on the objects (render_test.go decodes them): helm_template_test
+# only renders. One rendering per values set the tests look at.
+[
+    helm_template(
+        name = "rendered_%s" % name,
+        chart = ":cracha",
+        values = values,
+    )
+    for name, values in [
+        ("defaults", REQUIRED_VALUES),
+        (
+            "overrides",
+            ["test/overrides.yaml"],
+        ),
+    ]
+]
+
+go_test(
+    name = "cracha_test",
+    size = "small",
+    srcs = [
+        "rbac_test.go",
+        "render_test.go",
+    ],
+    data = [
+        ":rendered_defaults",
+        ":rendered_overrides",
+    ],
+    deps = [
+        "@in_gopkg_yaml_v3//:yaml_v3",
+        "@rules_go//go/runfiles",
+    ],
 )
 
 # The chart packs the pins the way a publish workflow relies on: every

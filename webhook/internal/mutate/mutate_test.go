@@ -305,6 +305,14 @@ func TestAdmit(t *testing.T) {
 			want:    want{denied: []string{"namespace lister down"}, code: 503},
 		},
 		{
+			name: "an override that is not a region denies as invalid",
+			pod:  pod("enabled", plainApp),
+			regions: regionsFunc(func(_ context.Context, ns string) (string, error) {
+				return "", &InvalidRegionError{Namespace: ns, Value: "nowhere"}
+			}),
+			want: want{denied: []string{`cracha: annotation cracha.dev/region of namespace apps is "nowhere", not an AWS region`}, code: 422},
+		},
+		{
 			name: "valueFrom conflicts are rejected",
 			pod:  pod("enabled", container("app", secretEnv("AWS_ACCESS_KEY_ID"), secretEnv("AWS_SECRET_ACCESS_KEY"))),
 			want: want{denied: []string{`container "app" sets AWS_ACCESS_KEY_ID`, `container "app" sets AWS_SECRET_ACCESS_KEY`}, code: 422},
@@ -666,6 +674,19 @@ func TestNewRejectsBadConfig(t *testing.T) {
 	}
 	if got := m.Config().BrokerURL; got != "https://broker/v1/credentials" {
 		t.Errorf("Config().BrokerURL = %q", got)
+	}
+}
+
+func TestIsRegion(t *testing.T) {
+	for _, s := range []string{"us-east-1", "eu-central-2", "ap-southeast-3", "us-gov-west-1", "cn-north-1", "il-central-1", "eu-isoe-west-1"} {
+		if !IsRegion(s) {
+			t.Errorf("IsRegion(%q) = false", s)
+		}
+	}
+	for _, s := range []string{"", "us-east", "us-east-", "US-EAST-1", "us east 1", "us-east-1 ", "useast1", "u-east-1", "us-east-1-lax-1a", "aws-global", "nowhere"} {
+		if IsRegion(s) {
+			t.Errorf("IsRegion(%q) = true", s)
+		}
 	}
 }
 
