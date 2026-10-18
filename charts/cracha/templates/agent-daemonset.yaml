@@ -53,10 +53,37 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       {{- if eq $enrol "cni" }}
-      # The cracha-cni plugin and the init container that installs it into
-      # the node's CNI directories (design 7.2, cni mode) are a later slice:
-      # this renders the agent's socket for the plugin to call and nothing
-      # that installs the plugin yet.
+      initContainers:
+        # cni mode (design 7.2): before the agent serves, the plugin is put
+        # on the node. cracha-agent cni-install copies cracha-cni from this
+        # image into the node's CNI bin directory and chains it after the
+        # node's primary plugin in its conflist, naming the agent's socket;
+        # a second run on a node that has it changes nothing. These two
+        # host directories are the only ones the agent image ever writes,
+        # and only here: the agent container does not mount them.
+        - name: cni-install
+          image: {{ include "cracha.image" (dict "root" . "image" .Values.agent.image) }}
+          imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+          args:
+            - cni-install
+            - --bin-dir={{ .Values.agent.cni.binDir }}
+            - --conf-dir={{ .Values.agent.cni.confDir }}
+            - --socket={{ .Values.agent.cni.socket }}
+            - --log-level={{ include "cracha.logLevel" .Values.agent.logLevel }}
+          securityContext:
+            # Root, to write where the node's root owns; no capability: a
+            # file copy and a conflist rewrite need none.
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: cni-bin-dir
+              mountPath: {{ .Values.agent.cni.binDir }}
+            - name: cni-conf-dir
+              mountPath: {{ .Values.agent.cni.confDir }}
       {{- end }}
       containers:
         - name: agent
@@ -168,4 +195,15 @@ spec:
           hostPath:
             path: {{ dir .Values.agent.cni.socket }}
             type: DirectoryOrCreate
+        # The node's CNI directories, for the installer alone. They exist
+        # on any node with a CNI; a node without one has nothing to chain
+        # into.
+        - name: cni-bin-dir
+          hostPath:
+            path: {{ .Values.agent.cni.binDir }}
+            type: Directory
+        - name: cni-conf-dir
+          hostPath:
+            path: {{ .Values.agent.cni.confDir }}
+            type: Directory
         {{- end }}

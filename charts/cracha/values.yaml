@@ -251,9 +251,14 @@ agent:
   #         the agent.
   #   cni   a chained CNI plugin, cracha-cni, tells the agent over its Unix
   #         socket on every sandbox's ADD and DEL. Nothing enters the pod
-  #         spec but the env and the label. THE PLUGIN AND ITS INSTALLER
-  #         ARE NOT PART OF THIS CHART YET: cni renders the agent's socket
-  #         and no installer, so until they land it enrols nothing.
+  #         spec but the env and the label; the node's CNI configuration
+  #         is changed instead: an init container of the DaemonSet,
+  #         cni-install, copies the plugin from the agent image into
+  #         cni.binDir and chains it after the node's primary plugin in
+  #         the lexically first conflist of cni.confDir, the one the
+  #         runtime uses (kind: 10-kindnet.conflist). From then on every
+  #         new pod of the node, enrolled or not, waits for the agent
+  #         when it is down (design 7.2).
   enrol: init
 
   # With enrol init: the port of the enrolment endpoint on every node's
@@ -263,9 +268,16 @@ agent:
   enrolPort: 9798
   enrolTimeout: 2m
 
-  # With enrol cni: the agent's Unix socket, in a host directory it owns.
+  # With enrol cni: the agent's Unix socket, in a host directory it owns
+  # (created 0700, the socket 0600, so only the node's root, which execs the
+  # plugin, reaches it), and the node's CNI bin and conf directories the
+  # installer writes to: the only host paths the agent image ever writes,
+  # and only in the cni-install init container. The entry it chains is
+  # {"type": "cracha-cni", "socket": <cni.socket>, "timeout": "5s"}.
   cni:
     socket: /run/cracha/cni.sock
+    binDir: /opt/cni/bin
+    confDir: /etc/cni/net.d
 
   # How long one credential request retries a pod the issuer does not know
   # yet (its entry on its way to the node's issuer agent) or an issuer that

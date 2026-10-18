@@ -24,7 +24,10 @@ func TestAgentDaemonSetHardening(t *testing.T) {
 	}
 	containers, _ := path(spec, "containers").([]any)
 	if len(containers) != 1 {
-		t.Fatalf("%d containers, want the agent alone (the CNI installer is a later slice)", len(containers))
+		t.Fatalf("%d containers, want the agent alone", len(containers))
+	}
+	if init, _ := path(spec, "initContainers").([]any); len(init) != 0 {
+		t.Errorf("initContainers = %v, want none in init mode", init)
 	}
 	sc := path(containers[0], "securityContext")
 	if got := stringList(path(sc, "capabilities", "add")); !slices.Equal(got, []string{"SYS_ADMIN"}) {
@@ -125,18 +128,62 @@ func TestAgentArgs(t *testing.T) {
 	})
 }
 
-// In cni mode the agent's socket directory is mounted for the plugin, and
-// nothing else changes: no installer yet (a later slice), no TokenReview.
+// In cni mode the agent's socket directory is mounted for the plugin, the
+// cni-install init container puts the plugin on the node from the agent
+// image with the CNI directories mounted read-write in it alone, and there
+// is no TokenReview.
 func TestAgentCNIMode(t *testing.T) {
 	docs := rendered(t, "cni")
 	ds := object(t, docs, "DaemonSet", "cracha-agent")
 	spec := path(ds, "spec", "template", "spec")
-	socketDir, _ := path(volumes(t, ds)["cni-socket-dir"], "hostPath", "path").(string)
-	if socketDir != "/run/cracha" {
-		t.Errorf("cni-socket-dir = %q, want the socket's directory", socketDir)
+	vols := volumes(t, ds)
+	hostPath := func(name string) string {
+		p, _ := path(vols[name], "hostPath", "path").(string)
+		return p
 	}
-	if init, _ := path(spec, "initContainers").([]any); len(init) != 0 {
-		t.Errorf("initContainers = %v, want none until the installer slice lands", init)
+	if hostPath("cni-socket-dir") != "/run/cracha" {
+		t.Errorf("cni-socket-dir = %q, want the socket's directory", hostPath("cni-socket-dir"))
+	}
+	if hostPath("cni-bin-dir") != "/usr/libexec/cni" || hostPath("cni-conf-dir") != "/etc/kubernetes/cni/net.d" {
+		t.Errorf("CNI directories = %q, %q, want the values'", hostPath("cni-bin-dir"), hostPath("cni-conf-dir"))
+	}
+	containers, _ := path(spec, "containers").([]any)
+	init, _ := path(spec, "initContainers").([]any)
+	if len(init) != 1 || path(init[0], "name") != "cni-install" {
+		t.Fatalf("initContainers = %v, want cni-install alone", init)
+	}
+	if path(init[0], "image") != path(containers[0], "image") {
+		t.Errorf("cni-install runs %v, not the agent image %v", path(init[0], "image"), path(containers[0], "image"))
+	}
+	args := stringList(path(init[0], "args"))
+	for _, want := range []string{"cni-install", "--bin-dir=/usr/libexec/cni", "--conf-dir=/etc/kubernetes/cni/net.d", "--socket=/run/cracha/cni.sock"} {
+		if !slices.Contains(args, want) {
+			t.Errorf("cni-install args lack %q: %v", want, args)
+		}
+	}
+	sc := path(init[0], "securityContext")
+	if got := stringList(path(sc, "capabilities", "drop")); !slices.Equal(got, []string{"ALL"}) || path(sc, "capabilities", "add") != nil {
+		t.Errorf("cni-install capabilities = %v", path(sc, "capabilities"))
+	}
+	if path(sc, "readOnlyRootFilesystem") != true || path(sc, "allowPrivilegeEscalation") != false {
+		t.Errorf("cni-install securityContext = %v", sc)
+	}
+	// The installer mounts the two directories read-write, at their host
+	// paths; the agent container mounts neither.
+	mounted := map[string]string{}
+	for _, m := range mountsOf(init[0]) {
+		if path(m, "readOnly") == true {
+			t.Errorf("cni-install mounts %v read-only", path(m, "name"))
+		}
+		mounted[path(m, "name").(string)], _ = path(m, "mountPath").(string)
+	}
+	if mounted["cni-bin-dir"] != "/usr/libexec/cni" || mounted["cni-conf-dir"] != "/etc/kubernetes/cni/net.d" || len(mounted) != 2 {
+		t.Errorf("cni-install mounts = %v", mounted)
+	}
+	for _, m := range mountsOf(containers[0]) {
+		if name := path(m, "name"); name == "cni-bin-dir" || name == "cni-conf-dir" {
+			t.Errorf("the agent container mounts %v, which only the installer may", name)
+		}
 	}
 	role := object(t, docs, "ClusterRole", "cracha-agent")
 	for _, rule := range path(role, "rules").([]any) {
@@ -144,9 +191,12 @@ func TestAgentCNIMode(t *testing.T) {
 			t.Error("cni mode grants TokenReview, which only init mode uses")
 		}
 	}
-	if _, ok := object(t, docs, "DaemonSet", "cracha-agent")["kind"]; !ok {
-		t.Fatal("no DaemonSet")
-	}
+}
+
+// mountsOf is a container's volume mounts.
+func mountsOf(container any) []any {
+	mounts, _ := path(container, "volumeMounts").([]any)
+	return mounts
 }
 
 // The agent's ClusterRole grants exactly design 7.8: pods get, list and

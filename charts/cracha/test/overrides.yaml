@@ -105,6 +105,8 @@ agent:
   enrolTimeout: 30s
   cni:
     socket: /var/run/cracha/agent.sock
+    binDir: /usr/libexec/cni
+    confDir: /etc/kubernetes/cni/net.d
   fetchDeadline: 1500ms
   brokerUrl: https://credentials.example.org:9443
   brokerSpiffeID: spiffe://prod.example.org/ns/cracha/sa/broker
