@@ -24,8 +24,8 @@ go_test(
         "//broker/internal/cache",
         "//broker/internal/grants",
         "//broker/internal/issuer",
-        "//broker/internal/mtls/mtlstest",
         "//broker/internal/sts",
         "//common/idenc",
+        "//common/spiffetest",
     ],
 )

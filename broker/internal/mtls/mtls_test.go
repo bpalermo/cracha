@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bpalermo/cracha/broker/internal/mtls/mtlstest"
+	"github.com/bpalermo/cracha/common/spiffetest"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
@@ -29,7 +29,7 @@ const (
 
 // server serves handler over the broker's TLS configuration on loopback and
 // returns its URL. The handler is wrapped in Require, as the broker's is.
-func server(t *testing.T, ca *mtlstest.CA, log *slog.Logger, handler http.Handler) string {
+func server(t *testing.T, ca *spiffetest.CA, log *slog.Logger, handler http.Handler) string {
 	t.Helper()
 	agent := spiffeid.RequireFromString(agentID)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -61,7 +61,7 @@ func (h *peerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func TestAgentAccepted(t *testing.T) {
-	ca := mtlstest.NewCA(t, "example.org")
+	ca := spiffetest.NewCA(t, "example.org")
 	var logs bytes.Buffer
 	handler := &peerHandler{}
 	url := server(t, ca, slog.New(slog.NewTextHandler(&logs, nil)), handler)
@@ -91,8 +91,8 @@ func TestAgentAccepted(t *testing.T) {
 }
 
 func TestRefusedAtHandshake(t *testing.T) {
-	ca := mtlstest.NewCA(t, "example.org")
-	foreign := mtlstest.NewCA(t, "other.org")
+	ca := spiffetest.NewCA(t, "example.org")
+	foreign := spiffetest.NewCA(t, "other.org")
 	anyBroker := tlsconfig.AuthorizeAny()
 	tests := map[string]*tls.Config{
 		// Another workload of the same trust domain, with a valid SVID.
@@ -122,7 +122,7 @@ func TestRefusedAtHandshake(t *testing.T) {
 }
 
 func TestRequire(t *testing.T) {
-	ca := mtlstest.NewCA(t, "example.org")
+	ca := spiffetest.NewCA(t, "example.org")
 	agent := spiffeid.RequireFromString(agentID)
 	withPeer := func(svid *x509svid.SVID) *http.Request {
 		r := httptest.NewRequest(http.MethodGet, "/v1/credentials", nil)
@@ -172,7 +172,7 @@ func TestRequire(t *testing.T) {
 }
 
 func TestDefaultAgentID(t *testing.T) {
-	ca := mtlstest.NewCA(t, "example.org")
+	ca := spiffetest.NewCA(t, "example.org")
 	id, err := DefaultAgentID(ca.SVID(t, brokerID), "cracha-system")
 	if err != nil {
 		t.Fatal(err)
@@ -205,7 +205,7 @@ func TestSVIDReadiness(t *testing.T) {
 	if err := r.Ready(); err == nil || !strings.Contains(err.Error(), "not yet") {
 		t.Fatalf("ready with a source that has no SVID: %v", err)
 	}
-	ca := mtlstest.NewCA(t, "example.org")
+	ca := spiffetest.NewCA(t, "example.org")
 	r.Set(ca.SVID(t, brokerID))
 	if err := r.Ready(); err != nil {
 		t.Fatal(err)
@@ -215,7 +215,7 @@ func TestSVIDReadiness(t *testing.T) {
 // The configuration rotates with the source: a new SVID in the source is
 // what the next handshake presents.
 func TestServerConfigFollowsSource(t *testing.T) {
-	ca := mtlstest.NewCA(t, "example.org")
+	ca := spiffetest.NewCA(t, "example.org")
 	src := &rotatingSource{svid: ca.SVID(t, brokerID)}
 	agent := spiffeid.RequireFromString(agentID)
 	cfg := ServerConfig(src, ca.Bundle(), agent)

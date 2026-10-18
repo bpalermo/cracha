@@ -1,10 +1,10 @@
 load("@rules_go//go:def.bzl", "go_library")
 
 go_library(
-    name = "mtlstest",
-    srcs = ["mtlstest.go"],
-    importpath = "github.com/bpalermo/cracha/broker/internal/mtls/mtlstest",
-    visibility = ["//broker:__subpackages__"],
+    name = "spiffetest",
+    srcs = ["spiffetest.go"],
+    importpath = "github.com/bpalermo/cracha/common/spiffetest",
+    visibility = ["//visibility:public"],
     deps = [
         "@com_github_spiffe_go_spiffe_v2//bundle/x509bundle",
         "@com_github_spiffe_go_spiffe_v2//spiffeid",

@@ -20,7 +20,7 @@ import (
 	"github.com/bpalermo/cracha/broker/internal/cache"
 	"github.com/bpalermo/cracha/broker/internal/grants"
 	"github.com/bpalermo/cracha/broker/internal/issuer"
-	"github.com/bpalermo/cracha/broker/internal/mtls/mtlstest"
+	"github.com/bpalermo/cracha/common/spiffetest"
 	"github.com/bpalermo/cracha/broker/internal/sts"
 	"github.com/bpalermo/cracha/common/idenc"
 )
@@ -399,7 +399,7 @@ func TestMethodsAndPaths(t *testing.T) {
 func TestRequestLog(t *testing.T) {
 	var logs bytes.Buffer
 	f := newFixtureWithLog(t, slog.New(slog.NewTextHandler(&logs, nil)))
-	ca := mtlstest.NewCA(t, "example.org")
+	ca := spiffetest.NewCA(t, "example.org")
 	agent := ca.SVID(t, "spiffe://example.org/ns/cracha-system/sa/cracha-agent")
 	req := httptest.NewRequest(http.MethodGet, "/v1/credentials", nil)
 	req.Header.Set("Authorization", f.issuer.ValidToken(t, subject))

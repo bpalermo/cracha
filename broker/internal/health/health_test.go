@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/bpalermo/cracha/broker/internal/mtls"
-	"github.com/bpalermo/cracha/broker/internal/mtls/mtlstest"
+	"github.com/bpalermo/cracha/common/spiffetest"
 )
 
 func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -81,7 +81,7 @@ func TestReadyzWaitsForSVID(t *testing.T) {
 	if rec := do(h, http.MethodGet, "/readyz"); rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "X.509-SVID") {
 		t.Errorf("readyz before the SVID: %d %q", rec.Code, rec.Body.String())
 	}
-	svid.Set(mtlstest.NewCA(t, "example.org").SVID(t, "spiffe://example.org/ns/cracha-system/sa/cracha-broker"))
+	svid.Set(spiffetest.NewCA(t, "example.org").SVID(t, "spiffe://example.org/ns/cracha-system/sa/cracha-broker"))
 	if rec := do(h, http.MethodGet, "/readyz"); rec.Code != http.StatusOK {
 		t.Errorf("readyz with the SVID: %d %q", rec.Code, rec.Body.String())
 	}

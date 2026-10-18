@@ -1,7 +1,0 @@
-kind: Assignment
-metadata:
-  name: ledger-outbox
-spec:
-  subject: prod/payments/ledger
-  grants: [outbox-r]
-  clusters: [prod-us-east-1]
