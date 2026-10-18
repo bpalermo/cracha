@@ -5,9 +5,10 @@ Guidance for agents working in this repository.
 ## What this is
 
 Crachá issues AWS credentials to Kubernetes workloads from their SPIFFE
-identity. Three binaries: the credential broker (`broker`), the CSI node plugin
-that writes a pod's JWT-SVID where the AWS SDK reads it (`csi`), and the
-mutating webhook that wires pods up (`webhook`). [docs/design.md](docs/design.md)
+identity. Three binaries: the credential broker (`broker`), the node agent
+that serves each pod's credentials over a loopback listener bound inside the
+pod's network namespace (`agent`), and the mutating webhook that wires pods
+up (`webhook`). [docs/design.md](docs/design.md)
 is the design; read it before changing behaviour, and update it in the same
 pull request when behaviour changes. Its invariants (section 11) must hold in
 every change.
@@ -64,7 +65,7 @@ is until it is deleted.
 the one built from the checkout: run.sh pulls
 `oci://$(bazel/registry.sh chart-ref cracha)` at that version with the
 pinned helm, installs it with the images it pins (the node pulls them from
-the registry; the checkout's broker, csi and webhook images are neither
+the registry; the checkout's broker, agent and webhook images are neither
 built nor loaded and `values-local.yaml` is not passed) and prints the
 chart's digest and its image pins first, so the log says what was tested.
 The suite, SPIRE, the bundle, the STS stand-in and the suite's own images
@@ -131,7 +132,28 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 ## Layout
 
 - No `cmd/`. Each binary lives in a root-level directory with its `main.go`:
-  `broker/`, `csi/`, `webhook/`, `grantc/`, `reconciler/`.
+  `broker/`, `agent/`, `webhook/`, `grantc/`, `reconciler/`.
+- `agent/` is `cracha-agent` (design 7). `internal/listener` is the registry
+  of loopback listeners, one per enrolled pod, bound inside the pod's network
+  namespace by `internal/netns` (setns on a dedicated locked thread) and
+  multiplexed into one `http.Server`; the pod a request is answered for is
+  the listener it arrived on, nothing in the request. `internal/credentials`
+  is the endpoint (`GET /v1/credentials` and `/v1/grants`): the pod's
+  JWT-SVID through the issuer adapter (`internal/issuer`, SPIRE's Broker API
+  in `internal/issuer/spire`), cached in memory until a minute before expiry,
+  then the broker's answer relayed unchanged over SPIFFE mTLS
+  (`internal/broker`, the agent's own SVID from `internal/identity`, the
+  broker verified by SPIFFE ID). Enrolment (design 7.2) is `internal/enrol`:
+  the label check and bind both modes share, the init-mode endpoint
+  (`POST /v1/enrol`, TokenReview of the init container's bound token in
+  `internal/tokenreview`, the sandbox's namespace path through the CRI in
+  `internal/cri`) and the `cracha-agent enrol` client; cni mode's server side
+  is `internal/cni/server`, speaking `agent/cni/proto` (JSON over HTTP on a
+  Unix socket; the plugin itself is not built yet). `internal/recovery`
+  rebinds the node's enrolled pods on start from a filtered pod informer and
+  closes the listeners of pods that go. `agent/enrolapi` is the contract the
+  webhook imports: the enrolment label, the endpoint, the init container's
+  environment.
 - Code private to a binary goes under its `internal/`. The webhook's
   `internal/mutate` is the admission decision (design 7.5), pure over two
   interfaces: ServiceAccount lookups (`internal/sacache`, a Get remembered
@@ -218,14 +240,14 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   may spell it out.
 - Images are built with the `go_image` macro in `bazel/image/defs.bzl`, from
   pure-Go binaries on a digest-pinned distroless base. Image repositories are
-  `broker`, `csi` and `webhook`.
+  `broker`, `agent` and `webhook`.
 - `VERSION` holds the release being worked towards. Binaries report the commit
   they were built from, stamped by `bazel/workspace_status.sh`.
 
 ## Chart
 
-- `charts/cracha` is the Helm chart: the CSIDriver, the CSI DaemonSet, the
-  broker and the webhook. It is built, linted, templated and
+- `charts/cracha` is the Helm chart: the agent DaemonSet, the broker and
+  the webhook. It is built, linted, templated and
   installed with the helm that rules_helm pins (`@helm//:helm`, the version
   in `MODULE.bazel` and `.bazelrc`); never a helm from PATH.
   `bazel build //charts/cracha:cracha` packages it as
@@ -237,11 +259,19 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   renders).
 - The chart's version and image pins are stamped at package time: the
   version from `STABLE_CHART_VERSION`, each image's repository and digest
-  from its `image_push` target (`{@//csi:image_push.digest}` in
+  from its `image_push` target (`{@//agent:image_push.digest}` in
   `values.yaml`). Do not write a version or a digest into `Chart.yaml.in` or
   `values.yaml` by hand; `//charts/cracha:pin_test` checks the result with
-  `bazel/chart-pin.sh`. The registrar sidecar is the one image pinned by
-  hand, by tag and digest.
+  `bazel/chart-pin.sh`.
+- The agent's values are `agent.*` with the design's names: `port`,
+  `enrol` (`init` or `cni`), `enrolPort`, `enrolTimeout`, `fetchDeadline`,
+  `brokerUrl`, `brokerSpiffeID` (empty: the broker ServiceAccount's path in
+  the agent's own trust domain), `criSocket`, `netnsDir`, `cni.socket`. The
+  DaemonSet is in the host network with `CAP_SYS_ADMIN` alone; its host
+  mounts are the CRI socket, the runtime's netns directory (read-only,
+  `HostToContainer`) and the issuer's sockets, and `agent_test.go` holds it
+  to that. `agent.enrol: cni` renders the socket's hostPath and no installer
+  yet.
 - `broker.authz.backend` picks the authorization store: `static` (the
   default) renders the assignments ConfigMap and its mount; `spicedb` takes
   `broker.authz.spicedb` (endpoint, `tokenSecret` naming a Secret the
@@ -290,7 +320,7 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 - Every published coordinate comes from `bazel/registry.bzl`: the registry
   host, the organization, the three image repositories and the chart's.
   Bazel loads it; shell and the workflows read it through `bazel/registry.sh`
-  (`bazel/registry.sh` prints `KEY=VALUE` lines, `bazel/registry.sh ref csi`
+  (`bazel/registry.sh` prints `KEY=VALUE` lines, `bazel/registry.sh ref agent`
   one reference). `bazel/check-registry-config.sh`, run by the `lint` job of
   `ci.yml`, fails a change that spells the registry out anywhere else; the
   README is the one file allowed to, because people copy install commands
@@ -331,9 +361,9 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   the signature is a referrer as `SIGNATURE_LAYOUT` promises) or the chart:
 
   ```bash
-  bazel run //bazel/cosign:verify_image -- "$(bazel/registry.sh ref csi)@sha256:<digest>"
+  bazel run //bazel/cosign:verify_image -- "$(bazel/registry.sh ref agent)@sha256:<digest>"
   bazel run //bazel/cosign:verify_image -- --single "$(bazel/registry.sh chart-ref cracha)@sha256:<digest>"
-  bazel run //bazel/cosign -- verify "$(bazel/registry.sh ref csi)@sha256:<digest>" \
+  bazel run //bazel/cosign -- verify "$(bazel/registry.sh ref agent)@sha256:<digest>" \
     --certificate-identity-regexp '^https://github.com/bpalermo/cracha/.github/workflows/publish.yml@refs/(heads/main|tags/v.*)$' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```
