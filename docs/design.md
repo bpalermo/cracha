@@ -52,12 +52,12 @@ flowchart TB
         issuer -->|"per-pod JWT-SVIDs, own X.509-SVID"| agent
     end
     broker["cracha-broker (per cluster, stateless, ≥3 replicas)<br/>SPIFFE mTLS: client must be the agent<br/>verify JWT-SVID → authz Check → grant bundle lookup<br/>→ render + envelope-validate session policy<br/>→ cache/singleflight → sts:AssumeRole (regional STS)"]
-    authz["authz store<br/>(SpiceDB reference)"]
+    authz["authz store<br/>(SpiceDB reference, behind its<br/>SPIFFE gateway, 6.4)"]
     bundle["grant bundle<br/>(signed, from Git)"]
     sts["STS"]
     shapes["Account roles (or dedicated shape roles)<br/>in target accounts<br/>(permission boundary + SCP ceiling)"]
     agent -->|"mTLS (agent SVID) + JWT-SVID of the pod"| broker
-    broker -->|Check| authz
+    broker -->|"Check (mTLS, broker SVID)"| authz
     bundle -->|poll + verify| broker
     broker -->|"AssumeRole (broker's own credentials, 5)"| sts
     sts --> shapes
@@ -168,7 +168,7 @@ spec:
 
 An **Account** document names one AWS account (`spec.id`, 12 digits; one document per account), its **account role** (`spec.role`, a role ARN in that account), optionally the default envelope of its grants (`spec.envelope`), and optionally its **access table** (`spec.access`). A Grant of an account with an Account document may leave out `baseRole`, and is then issued on the account role, and `envelope`, which is then the account's; a Grant without `baseRole` whose account has no Account document is refused by the lint. `baseRole` is the override: a grant that names one is issued on that dedicated shape role. The role a workload's credential is issued on, the account role or a dedicated one, is its **shape** below, and `Cracha-Shape` names it.
 
-Who holds a grant is recorded beside it, in the same tree, as a `kind: Service` (a team's workloads and the grants they share) and `kind: Assignment` (one workload's own grants, or its suspension) documents, and which resources a lookup grant reaches as `kind: Access` documents (below). They are not part of the bundle: the authorization store answers who holds what (6.1). For SpiceDB the `authz-reconciler` of 6.4 writes it there from these documents; for the static backend the compiler publishes them, beside the bundle, as the assignments document (below). They also let the composition lint (step 5) check what each workload will hold.
+Who holds a grant is recorded beside it, in the same tree, as a `kind: Service` (a team's workloads and the grants they share) and `kind: Assignment` (one workload's own grants, or its suspension) documents, and which resources a lookup grant reaches as `kind: Access` documents (below). They are not part of the bundle: the authorization store answers who holds what (6.1). For the static backend the compiler publishes them, beside the bundle, as the assignments document (below). They also let the composition lint (step 5) check what each workload will hold. With the SpiceDB backend these documents do not reach the store: relationships live only in SpiceDB, written by the access service (6.4).
 
 ```yaml
 kind: Service
@@ -250,7 +250,7 @@ The grant tree is a repository of its own, not this one. Its CI runs the pipelin
 One compilation is one published version, of two artifacts:
 
 - `bundle.json`, the grants: what each grant is.
-- `assignments.json`, who holds them, for the static backend (6.3): every Service with its team, members and bounded grants, and every subject's Assignments merged into one workload, suspended when any of them suspends it and holding each grant once, with the union of the bounds its Assignments give it; and `access`, every Access document's relation, those that relate one holder to one resource by one relation merged the same way. The mapping is one pair of functions (`grant.ResolveAssignments`, `grant.ResolveAccess`), the same the reconciler writes SpiceDB from, so the two backends hold the same tree the same way; a union no single bound can express is refused by both.
+- `assignments.json`, who holds them, for the static backend (6.3): every Service with its team, members and bounded grants, and every subject's Assignments merged into one workload, suspended when any of them suspends it and holding each grant once, with the union of the bounds its Assignments give it; and `access`, every Access document's relation, those that relate one holder to one resource by one relation merged the same way. The mapping is one pair of functions (`grant.ResolveAssignments`, `grant.ResolveAccess`); a union no single bound can express is refused.
 
 Both documents are decoded strictly, so a field a broker does not know is a rejected version, never an ignored one. The lookup and account fields are therefore absent when unused: a tree without lookup grants compiles to a bundle without `lookup`, one without Account documents to a bundle without `accounts` or `implicit` (a grant that names its `baseRole` and `envelope` compiles as it always did), and one without Access documents to assignments without `access`, byte for byte (and version for version) what they were before them, which a broker that predates them keeps reading. A tree that uses them is refused by such a broker, which keeps its last good version: it could not render a lookup grant or apply an implicit one, and must not hand out the grant's shape without its policy. A grant that leaves out `baseRole` compiles with the account role written in, but needs an Account document, so its bundle carries `accounts` as well.
 
@@ -284,18 +284,23 @@ Rules:
 - Consistency tokens are opaque outside the adapter. SpiceDB's zedToken is one implementation; a static backend may use a file hash. Callers may ask for minimize-latency or at-least-as-fresh(token).
 - Any failure to answer is a deny. Backends never fail open.
 - Time-bounded and cluster-bounded assignments are part of the model, not of one backend's caveat feature. A backend without native conditions evaluates them in its adapter. So are resource relations (Level 3): a workload's own and its service's, with the same bounds, and nothing for a suspended workload. LookupResources answers with resource names (a bucket's name), never a backend's object IDs, and the parity test holds both backends to the same answers for direct and service relations, expired ones and those of another cluster.
-- Backends: `static` (assignments held in memory, for bootstrap, air-gapped or small fleets) and `spicedb` (reference). The static backend's assignments come from one of two sources (`--assignments-source`): `published`, the signed assignments document of the version the bundle source serves (6.2), swapped with its bundle, so that every cluster reading one publication holds the same assignments without a database; or `file`, a document of the install's own read once (development, single clusters). Its consistency token is the SHA-256 of the document it holds, so every swap is a new token, and its Watch reports every swap as a change of every subject (6.7). OpenFGA or a Cedar-based store would be further adapters, not design changes. The broker's `--authz-backend` chooses one: `static` is `broker/internal/authz/static`, `spicedb` is `broker/internal/authz/spicedb`, the adapter over 6.4.
+- Backends: `static` (assignments held in memory, for bootstrap, air-gapped or small fleets) and `spicedb` (reference: relationships live only in SpiceDB, written by the access service, and every client reaches SpiceDB through its SPIFFE gateway, 6.4). The static backend's assignments come from one of two sources (`--assignments-source`): `published`, the signed assignments document of the version the bundle source serves (6.2), swapped with its bundle, so that every cluster reading one publication holds the same assignments without a database; or `file`, a document of the install's own read once (development, single clusters). Its consistency token is the SHA-256 of the document it holds, so every swap is a new token, and its Watch reports every swap as a change of every subject (6.7). OpenFGA or a Cedar-based store would be further adapters, not design changes. The broker's `--authz-backend` chooses one: `static` is `broker/internal/authz/static`, `spicedb` is `broker/internal/authz/spicedb`, the adapter over 6.4.
 
 ### 6.4 Reference backend: SpiceDB
 
-The model below is the reference. Another backend must express the same concepts (team, service, workload, grant, account, time-bounded and cluster-bounded assignment, suspension) and give equivalent answers to the questions in 6.3. The schema lives in `common/spicedb/schema.zed`, with the names in it exported as constants, so the broker's adapter and the reconciler share one spelling of every type, relation, permission, caveat and context key.
+The model below is the reference. Another backend must express the same concepts (team, service, workload, grant, account, time-bounded and cluster-bounded assignment, suspension) and give equivalent answers to the questions in 6.3. The schema lives in `common/spicedb/schema.zed`, with the names in it exported as constants, so the broker's adapter, the access service and the reconciler share one spelling of every type, relation, permission, caveat and context key.
 
 ```zed
 definition team {}
 
 definition service {
-  relation owner: team
+  relation team: team
   relation member: workload
+  relation owner: workload | service#member
+  relation approver: workload | service#member
+  relation sensitive: workload:*
+  permission manage = owner
+  permission approve = approver + owner
 }
 
 definition workload {
@@ -329,6 +334,11 @@ definition s3_bucket {
   relation writer: workload | workload with within_window | workload with in_clusters | workload with bounded | service#member | service#member with within_window | service#member with in_clusters | service#member with bounded
   permission write = writer
   permission read = reader + writer
+  relation owner: workload | service#member
+  relation approver: workload | service#member
+  relation sensitive: workload:*
+  permission manage = owner
+  permission approve = approver + owner
 }
 
 definition dynamodb_table {
@@ -336,6 +346,19 @@ definition dynamodb_table {
   relation writer: workload | workload with within_window | workload with in_clusters | workload with bounded | service#member | service#member with within_window | service#member with in_clusters | service#member with bounded
   permission write = writer
   permission read = reader + writer
+  relation owner: workload | service#member
+  relation approver: workload | service#member
+  relation sensitive: workload:*
+  permission manage = owner
+  permission approve = approver + owner
+}
+
+caveat pending_payload(request string) {
+  request != ""
+}
+
+definition pending_request {
+  relation target: s3_bucket with pending_payload | dynamodb_table with pending_payload | service with pending_payload
 }
 ```
 
@@ -343,27 +366,28 @@ Why it is shaped so:
 - `workload#suspended` and `is_suspended` let SpiceDB express the suspension the contract reports as `ErrSubjectSuspended` (6.3): a workload with the permission holds nothing, whatever `grant#assume` would say. The relation's subject is the team of the workload's service, or `team:none` when it has no service, so the relationship has a subject and a suspension stays attributable.
 - A SpiceDB relationship carries at most one caveat, and a Git assignment may carry both bounds, so `bounded` takes both; `within_window` and `in_clusters` stay for a relationship bound in only one way. Every assignee relation admits all four forms. The broker sends `now` (RFC 3339) and `cluster` as the caveat context of every query; the relationship carries `expires_at` and/or `allowed`.
 - Resources (Level 3) are related to a workload, or to a service's members (`service#member`), with the same caveats as a grant's assignees, so an Access document bounded in time or to clusters means what an Assignment bounded so means. The resource type's name is the kind of a lookup parameter, and its object ID the resource's name in the resource encoding of 4.3, since a bucket name may hold a dot. The adapter's `LookupResources` is SpiceDB's on that type and permission, with the same caveat context, after the same suspension check.
+- The write path (who may change the relationships of an object, below) is in the same schema, on every managed type (`service`, `s3_bucket`, `dynamodb_table`): `owner` and `approver` are workloads or a service's members, `manage = owner`, and `approve = approver + owner`, so an owner may approve a change of its own object (the access service may still demand a second, distinct approver, for a sensitive object say). A service's owning team, its tag, is `service#team`, so `owner` means the same on every type. `sensitive` flags an object the idiomatic SpiceDB way for a boolean: a wildcard relationship (`s3_bucket:<id>#sensitive@workload:*`) read with ReadRelationships, a property of the object, not of any workload. A change waiting for approval is a `pending_request`, one relationship to its target carrying the request in its `pending_payload` caveat's context. The broker reads none of these, and its Watch ignores them.
 - Object IDs: `workload:<authz encoding of 4.3>` (the encoding's charset is a subset of SpiceDB's), `grant:<name>`, `service:<name>`, `team:<name>`, `aws_account:<id>`, `s3_bucket:<resource encoding of 4.3>`. Names in Git are DNS labels for this reason.
 
 Integration levels:
 - **L1 (v1):** `Store.Check(subject, grant)` gates issuance (SpiceDB: `CheckPermission(grant#assume, workload)`).
 - **L2 (v1):** service/team returned in `Decision.Tags` become session tags for ABAC.
-- **L3:** a grant's lookup parameter is filled at issuance by `Store.LookupResources` with the resources the workload is related to (6.2); every rendered ARN is validated against the grant's envelope at runtime, and a violation rejects the request (`resource_outside_envelope`). The relations come from Git, as `kind: Access` documents, through the reconciler (SpiceDB) or the published assignments (static). An account's implicit grants (6.2) are filled the same way and are never relationships: nothing assigns them, so neither the schema nor the reconciler knows them, and the account a resource is in is the bundle's, not the store's.
+- **L3:** a grant's lookup parameter is filled at issuance by `Store.LookupResources` with the resources the workload is related to (6.2); every rendered ARN is validated against the grant's envelope at runtime, and a violation rejects the request (`resource_outside_envelope`). The relations come from the access service (SpiceDB) or from Git, as `kind: Access` documents, through the published assignments (static). An account's implicit grants (6.2) are filled the same way and are never relationships: nothing assigns them, so neither the schema nor the access service knows them, and the account a resource is in is the bundle's, not the store's.
 
-Relationship writers (write access to the authz store is security-critical, whatever the backend). What Crachá requires is that the writer is trusted and that no relationship is derived from anything the workload controls:
+Relationship writers (write access to the authz store is security-critical, whatever the backend). What Crachá requires is that the writer is trusted and that no relationship is derived from anything the workload controls. With the SpiceDB backend the relationships live **only** in SpiceDB: Git keeps the signed definitions (the bundle of 6.2), not who holds them, and SpiceDB has one writer:
 
-| Relationship | Source of truth | Writer |
+| Relationships | Source of truth | Writer |
 |---|---|---|
-| `grant#account`, `service#owner`, `service#member`, `grant#assignee_service`, `grant#assignee_workload`, `workload#suspended`, `s3_bucket#reader`, `s3_bucket#writer` (and `dynamodb_table`'s) | Git: the grant source tree of 6.2 (CODEOWNERS), the Access documents included. **Never** workload-controlled annotations, never a direct write | `authz-reconciler` (`cracha-reconciler apply`) |
-| The static backend's published assignments (6.3) | The same tree | The grant pipeline of 6.2: `grantc compile`, `sign`, `publish`, with the signing key |
-| Temporary / break-glass | Approval flow | `access-approver`, with caveat/expiry |
+| Every relationship of the SpiceDB backend: `grant#account`, `grant#assignee_service`, `grant#assignee_workload`, `service#team`, `service#member`, `workload#suspended`, the resource relations (`reader`, `writer`), the write path's (`owner`, `approver`, `sensitive`) and `pending_request#target` | SpiceDB itself | the access service (`cracha-access`), alone: an approved change, written with its consistency token and its caveat (time and cluster bounds) |
+| The schema | `common/spicedb/schema.zed` | `cracha-reconciler schema`, from CI or an operator, idempotent, read back to confirm. The reconciler writes no relationship: its former `apply`, which wrote them from a Git tree, refuses and names the access service |
+| The static backend's published assignments (6.3) | Git: the Service, Assignment and Access documents of 6.2 (CODEOWNERS) | The grant pipeline of 6.2: `grantc compile`, `sign`, `publish`, with the signing key |
 
-The reconciler's mapping, from the documents of 6.2 to relationships. A grant bounded in time alone carries `within_window{expires_at}`, in clusters alone `in_clusters{allowed}`, in both `bounded{expires_at, allowed}`, in neither no caveat:
+What a relationship means is what the Git document of the static backend that says the same thing means, so the parity test can hold the two backends to the same answers (a grant bounded in time alone carries `within_window{expires_at}`, in clusters alone `in_clusters{allowed}`, in both `bounded{expires_at, allowed}`, in neither no caveat):
 
-| Source | Relationship | Caveat |
+| Static backend's document | SpiceDB relationship | Caveat |
 |---|---|---|
 | Grant `g` with `spec.account` | `grant:g#account@aws_account:<account>` | none |
-| Service `s` with `spec.team` | `service:s#owner@team:<team>` | none |
+| Service `s` with `spec.team` | `service:s#team@team:<team>` | none |
 | Service `s`, each `spec.members` | `service:s#member@workload:<member>` | none |
 | Service `s`, each `spec.grants` `g` | `grant:g#assignee_service@service:s` | by the grant's bounds |
 | Assignment of `subject`, each `spec.grants` `g` | `grant:g#assignee_workload@workload:<subject>` | by the assignment's bounds |
@@ -371,9 +395,18 @@ The reconciler's mapping, from the documents of 6.2 to relationships. A grant bo
 | Access of `subject` to `{kind, name}` by `relation` | `<kind>:<resource ID of name>#<relation>@workload:<subject>` | by the access's bounds |
 | Access of `service` `s` to `{kind, name}` by `relation` | `<kind>:<resource ID of name>#<relation>@service:s#member` | by the access's bounds |
 
-Two Assignments that give one subject the same grant are one relationship, with the bounds that allow what either allows; when one caveat cannot express that union (one bound in time, the other in clusters, say) the reconciler refuses the tree. Access documents that relate one holder to one resource by one relation are one relationship, merged the same way. The reconciler owns every relationship whose resource is a `grant`, a `service`, a `workload`, an `s3_bucket` or a `dynamodb_table` (the schema must hold the resource types before an apply reads them: run `cracha-reconciler schema` first after an upgrade): it refuses a tree the loader or the lints of 6.2 reject, reads what SpiceDB holds, writes the difference (touches and deletes, in batches of at most 1,000) and reads back at least as fresh as its last write to confirm; a second run is a no-op, and a dry run writes nothing. It writes the schema with `cracha-reconciler schema`, which is idempotent.
+**The gateway.** Open-source SpiceDB authenticates a client only by a preshared key that grants everything, so no client holds it. Every client reaches SpiceDB over SPIFFE mTLS through a gateway that authorizes the client's SPIFFE ID **and** the gRPC method it calls, and adds the key itself. The chart (`spicedb.*`, rendered with the `spicedb` backend) runs SpiceDB and the gateway as two containers of one pod: SpiceDB listens in plaintext on the pod's loopback only, with the key from a Secret only that pod mounts; the gateway, Envoy, is the pod's one listener on its network. Envoy gets the pod's X.509-SVID (`default`) and its trust domain's bundle (`ROOTCA`) from the SPIRE agent's SDS on the Workload API socket, requires a client certificate (no certificate, no handshake), runs its RBAC filter on the peer's URI SAN (`authenticated.principal_name`, exact) and the request's `:path` (exact), and forwards what it admits with `authorization: Bearer <key>`, replacing anything the client sent. Anything else is answered `PERMISSION_DENIED` before SpiceDB sees it:
 
-Deployment (SpiceDB): one instance per region on its own Postgres. The reconciler writes to every region through the backend adapter (regions stay independent).
+| Client SPIFFE ID (chart default) | Methods |
+|---|---|
+| `spiffe://<td>/ns/<ns>/sa/cracha-broker` | `authzed.api.v1.PermissionsService/CheckPermission`, `/LookupResources`, `/ReadRelationships`; `authzed.api.v1.WatchService/Watch` |
+| `spiffe://<td>/ns/<ns>/sa/cracha-access` | the broker's, and `PermissionsService/WriteRelationships`, `/DeleteRelationships` |
+| `spiffe://<td>/ns/<ns>/sa/cracha-reconciler` | `authzed.api.v1.SchemaService/WriteSchema`, `/ReadSchema` |
+| any other ID, any other method | `PERMISSION_DENIED` |
+
+Clients dial the gateway with `common/spicedb/conn`: their own SVID presented, the gateway verified by its SPIFFE ID (`/ns/<ns>/sa/cracha-spicedb` by default; the broker's `--spicedb-server-spiffe-id`), no key, no CA. The gateway is a sidecar, not a Deployment in front of a SpiceDB Service, because a Service of SpiceDB would be reachable by any pod holding the key wherever NetworkPolicy is not enforced; in the pod, SpiceDB's port is not on the network at all (9).
+
+Deployment (SpiceDB): one SpiceDB deployment per cluster, every cluster's on one shared datastore (MySQL or Postgres; the memory engine for development and kind only), so every cluster's broker reads the same relationships. The datastore's URI comes from a Secret, with an optional private CA (`SSL_CERT_FILE`, so `tls=true` verifies it) and, for Postgres, an optional client certificate. A migration Job (`spicedb migrate head`, a Helm pre-install and pre-upgrade hook) is the one migration owner; SpiceDB never migrates itself. After an upgrade whose schema changed, `cracha-reconciler schema` writes it through the gateway, with an SVID from the Workload API or from files the issuer minted.
 
 ### 6.5 Broker API
 
@@ -452,7 +485,7 @@ Authentication:
 
 ### 6.8 Revocation
 
-1. Stop issuance: remove the relationship (or suspend the grant in the bundle) and flush the cache via Watch. The kind suite exercises this (`E2E_AUTHZ=spicedb e2e/run.sh`): the reconciler removes the assignment, the next fetch is refused within seconds and the broker's log shows the flush came from Watch.
+1. Stop issuance: remove the relationship (or suspend the grant in the bundle) and flush the cache via Watch. The kind suite exercises this (`E2E_AUTHZ=spicedb e2e/run.sh`): the suite deletes the assignment's relationship as the access service, the next fetch is refused within seconds and the broker's log shows the flush came from Watch.
 2. Kill live sessions: `revoke-tool` attaches an inline deny to the role the workload's sessions are on (its account role, or its dedicated shape role), scoped to one workload, and removes it after 1h:
 
 ```json
@@ -643,7 +676,7 @@ A workload on an SDK that ignores the variables and needs more room sets it in t
 |---|---|
 | Broker down | Running pods keep their SDK-cached session until it expires (≤1h); a refresh gets 503 `Cracha-Reason: broker_unavailable` from the agent and the SDK retries. New pods enrol and start, their prewarm fails (logged, nothing else), and they fail their first credential fetch until the broker returns. |
 | STS throttle/outage | Broker serves cache, retries with jitter, alerts on cache age. |
-| Authz store down | Fail closed for new keys; bounded-staleness cache hits (<10 min since last check). |
+| Authz store down | Fail closed for new keys; bounded-staleness cache hits (<10 min since last check). For SpiceDB the gateway is part of the store: a gateway without its SVID (issuer agent down) refuses every handshake, and the broker serves the same way. |
 | Identity issuer agent down | The Broker API is unavailable: the agent answers 503 `issuer_unavailable` once the pod's in-memory token has expired, and pods run on their SDK-cached session until it expires. New pods enrol (enrolment does not wait for the issuer; their prewarm retries for up to 30 s and then gives up with a log line) and fail their first fetch until it returns. |
 | cracha-agent down | New pods wait at enrolment: the init container retries, or the CNI `ADD` fails and kubelet retries (in `cni` mode every new pod of the node, 7.2). Running pods' requests are refused until it returns; the SDKs retry and keep their cached session. On return it re-binds every enrolled pod (7.4). |
 | CRI socket unavailable | Recovery and `init` enrolment cannot resolve a network namespace: new `init`-mode pods wait, listeners not yet re-bound stay down. `cni` mode still enrols new pods, since the plugin hands the agent the namespace path. |
@@ -661,7 +694,9 @@ A workload on an SDK that ignores the variables and needs more room sets it in t
 | Anything reaching the broker (bearer replay, flooding) | Denial of service; replay limited to the victim pod's grants within token TTL | The broker accepts only the agent's SVID, so a stolen JWT-SVID is useless without an agent's identity; strict JWT validation, per-identity rate limits at the broker and per-pod bounds at the agent, network policy |
 | Broker | The account roles of its environment (each capped by its identity policy, permission boundary and SCPs; a dedicated shape by its own policy) | Dedicated nodes, per-env roles, alert on account-role or shape-role assumption without `SourceIdentity` / by other principals, ABAC on the account role's identity policy (6.6) |
 | Grant repo | Misuse within envelopes, an account's envelope and access table reaching every workload related to its resources | CODEOWNERS, `CheckNoNewAccess`, signed bundles |
-| Authz store writes | Misassignment and misrelation within envelopes | Restricted writers, change-feed audit log, envelope check |
+| Authz store writes | Misassignment and misrelation within envelopes | One writer (the access service), change-feed audit log, envelope check |
+| SpiceDB gateway (the authorization point for the store) | What the gateway admits: any method of SpiceDB with its key | Only the gateway and SpiceDB's own pod hold the key; every client is authorized by SPIFFE ID and method there, the broker to reads only, so a compromised broker cannot write; the gateway is a sidecar, SpiceDB listening on the pod's loopback, so nothing depends on a NetworkPolicy being enforced |
+| SpiceDB or its datastore | Any relationship: who holds which grant, which resources a lookup reaches | Bounded by the signed definitions: a relationship can only name a grant of the signed bundle, and every rendered policy, lookup resources included, is checked against the grant's signed envelope before STS is called (11), so a store compromise is misassignment and misrelation within envelopes, never a wider grant |
 | Identity issuer (e.g. SPIRE server) | Mint any identity | Tier-0 controls, KMS/HSM keys |
 
 ## 10. Open questions
@@ -669,7 +704,7 @@ A workload on an SDK that ignores the variables and needs more room sets it in t
 - Q1: Approval flow for temporary access. The model already has the primitive: a time-bounded assignment (`grant#assignee_workload` with the `within_window` condition) written by a trusted `access-approver` (6.4), which the broker picks up at the next fetch and which expires on its own. What is undecided is the human side:
   - Who may request, and who approves: the owning team from `service#owner` is the natural approver, with a second approver for production shapes.
   - Where the request and approval are recorded, so the decision log can point at an attributable approval, and how break-glass (pre-approved, short expiry, loud audit) differs from planned access.
-  - Options: (a) a Git change carrying `expiresAt`, approved through CODEOWNERS and applied by the reconciler. Reuses existing review tooling, no new service, minutes of latency. (b) Integration with an existing access-request or just-in-time tool that calls the `access-approver` writer. Fastest for users, one more integration to secure. (c) A small purpose-built approver (CLI or chat bot). Most flexible, most to build and to harden, since it holds write access to the authorization store.
+  - Options: (a) a Git change carrying `expiresAt`, approved through CODEOWNERS and published with the static backend's assignments (with SpiceDB, relationships do not come from Git). Reuses existing review tooling, no new service, minutes of latency. (b) Integration with an existing access-request or just-in-time tool that calls the `access-approver` writer. Fastest for users, one more integration to secure. (c) A small purpose-built approver (CLI or chat bot). Most flexible, most to build and to harden, since it holds write access to the authorization store.
   - Constraints whichever is chosen: the writer is the only path to a temporary relationship, every relationship carries an expiry, and revocation (6.8) must be able to end it early.
 
 ## 11. Invariants
@@ -688,4 +723,5 @@ These hold regardless of backend, issuer or platform. Any implementation must be
 - The cache never returns credentials with less than 20 minutes remaining.
 - All identity encodings come from the single shared encoding library. Nothing hand-formats a SourceIdentity or an authz subject ID.
 - Backend-specific and issuer-specific types never leave their adapter.
+- SpiceDB is reached only through its gateway, over SPIFFE mTLS, each client authorized by SPIFFE ID and gRPC method; no client holds SpiceDB's key, and the broker cannot write.
 - Diagrams in this document are Mermaid.
