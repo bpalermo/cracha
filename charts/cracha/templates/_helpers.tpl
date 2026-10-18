@@ -215,3 +215,23 @@ Secret holding its preshared key, and takes at most one of a CA and insecure.
 {{- end -}}
 {{ $a.backend }}
 {{- end -}}
+
+{{/*
+The broker's Workload API volume source (broker.workloadAPI.volume): the one
+of hostPath and csi that `type` names. Helm merges an install's values into
+the defaults, so rendering the whole map would give a volume that sets the
+default hostPath beside the csi source an install chose, which the apiserver
+refuses; only the chosen source is rendered.
+*/}}
+{{- define "cracha.workloadAPIVolumeSource" -}}
+{{- $v := .Values.broker.workloadAPI.volume -}}
+{{- if not (has $v.type (list "hostPath" "csi")) -}}
+{{- fail (printf "broker.workloadAPI.volume.type must be hostPath or csi, not %q" $v.type) -}}
+{{- end -}}
+{{- $source := index $v $v.type -}}
+{{- if not $source -}}
+{{- fail (printf "broker.workloadAPI.volume.%s is required with broker.workloadAPI.volume.type %s" $v.type $v.type) -}}
+{{- end -}}
+{{ $v.type }}:
+  {{- toYaml $source | nindent 2 }}
+{{- end -}}

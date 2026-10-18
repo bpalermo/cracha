@@ -130,18 +130,24 @@ broker:
     staleCheckMax: 10m
 
   # The SPIFFE Workload API the broker reads the trust bundles from (design
-  # 6.5): the volume holding the socket, as a Kubernetes volume source, and
-  # the socket's file name in it. The default is a SPIRE agent sharing its
-  # socket directory on the node; with the SPIFFE CSI driver:
-  #   volume:
-  #     csi:
-  #       driver: csi.spiffe.io
-  #       readOnly: true
+  # 6.5): the volume holding the socket and the socket's file name in it.
+  # `type` chooses the volume's source, and only that source is rendered:
+  #   hostPath  a SPIRE agent sharing its socket directory on the node, the
+  #             directory under `hostPath` (the default);
+  #   csi       the SPIFFE CSI driver, with the driver named under `csi`.
+  # The other source's map is ignored, so switching is `type` alone:
+  #   workloadAPI:
+  #     volume:
+  #       type: csi
   workloadAPI:
     volume:
+      type: hostPath
       hostPath:
         path: /run/spire/agent-sockets
         type: Directory
+      csi:
+        driver: csi.spiffe.io
+        readOnly: true
     socket: spire-agent.sock
 
   # The authorization backend (design 6.3): which workloads hold which

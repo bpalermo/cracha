@@ -29,8 +29,11 @@ broker:
     refreshAt: 0.5
     maxEntries: 500
     staleCheckMax: 5m
+  # The SPIFFE CSI driver as the Workload API volume; the default hostPath
+  # stays in the merged values and must not be rendered beside it.
   workloadAPI:
     volume:
+      type: csi
       csi:
         driver: csi.spiffe.io
         readOnly: true

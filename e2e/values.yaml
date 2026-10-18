@@ -15,6 +15,7 @@ broker:
   # The SPIRE agent's sockets (e2e/spire.yaml), shared on the node.
   workloadAPI:
     volume:
+      type: hostPath
       hostPath:
         path: /run/spire/agent-sockets
         type: Directory
