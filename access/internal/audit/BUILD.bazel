@@ -1,0 +1,9 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "audit",
+    srcs = ["audit.go"],
+    importpath = "github.com/bpalermo/cracha/access/internal/audit",
+    visibility = ["//access:__subpackages__"],
+    deps = ["//access/internal/check"],
+)

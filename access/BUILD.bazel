@@ -1,0 +1,48 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "access_lib",
+    srcs = [
+        "cli.go",
+        "config.go",
+        "main.go",
+        "serve.go",
+    ],
+    importpath = "github.com/bpalermo/cracha/access",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//access/internal/api",
+        "//access/internal/audit",
+        "//access/internal/check",
+        "//access/internal/service",
+        "//access/internal/store",
+        "//common/grant",
+        "//common/idenc",
+        "//common/publication",
+        "//common/version",
+        "@com_github_authzed_authzed_go//v1:authzed-go",
+        "@com_github_aws_aws_sdk_go_v2//aws",
+        "@com_github_aws_aws_sdk_go_v2_config//:config",
+        "@com_github_aws_aws_sdk_go_v2_service_accessanalyzer//:accessanalyzer",
+        "@com_github_aws_aws_sdk_go_v2_service_kms//:kms",
+        "@com_github_aws_aws_sdk_go_v2_service_s3//:s3",
+        "@com_github_spiffe_go_spiffe_v2//spiffegrpc/grpccredentials",
+        "@com_github_spiffe_go_spiffe_v2//spiffeid",
+        "@com_github_spiffe_go_spiffe_v2//spiffetls/tlsconfig",
+        "@com_github_spiffe_go_spiffe_v2//workloadapi",
+        "@org_golang_google_grpc//:grpc",
+    ],
+)
+
+go_binary(
+    name = "access",
+    embed = [":access_lib"],
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "access_test",
+    srcs = ["main_test.go"],
+    embed = [":access_lib"],
+    deps = ["//access/internal/api"],
+)
