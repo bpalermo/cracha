@@ -64,14 +64,28 @@ type report struct {
 		CanExpire       bool      `json:"canExpire"`
 		Expires         time.Time `json:"expires"`
 	} `json:"credentials"`
-	Error    string `json:"error"`
-	Exchange *struct {
-		URL     string              `json:"url"`
-		Status  int                 `json:"status"`
-		Headers map[string][]string `json:"headers"`
-		Body    string              `json:"body"`
-	} `json:"exchange"`
-	Token *tokenLine `json:"token"`
+	Error    string     `json:"error"`
+	Exchange *exchange  `json:"exchange"`
+	Token    *tokenLine `json:"token"`
+}
+
+// exchange is one HTTP answer of the broker as e2e/client recorded it.
+type exchange struct {
+	URL     string              `json:"url"`
+	Status  int                 `json:"status"`
+	Headers map[string][]string `json:"headers"`
+	Body    string              `json:"body"`
+}
+
+// reason decodes the body of a refusal (design 6.5).
+func (e *exchange) reason() string {
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(e.Body), &body); err != nil {
+		return ""
+	}
+	return body.Reason
 }
 
 // tokenLine is what e2e/client prints about the token file: in the report,
@@ -115,7 +129,7 @@ const (
 // the suite's CA through SSL_CERT_FILE, which Go honours, and nothing else
 // about AWS is configured: the environment the webhook injects is all it
 // has.
-func workloadPod(name, serviceAccount string) *corev1.Pod {
+func workloadPod(name, serviceAccount string, env ...corev1.EnvVar) *corev1.Pod {
 	grace := int64(0)
 	uid, gid, fsGroup := workloadUID, workloadGID, workloadFSGroup
 	nonRoot := true
@@ -140,7 +154,7 @@ func workloadPod(name, serviceAccount string) *corev1.Pod {
 				Name:            "client",
 				Image:           image("cracha-e2e-client"),
 				ImagePullPolicy: corev1.PullNever,
-				Env:             []corev1.EnvVar{{Name: "SSL_CERT_FILE", Value: "/etc/cracha-ca/ca.crt"}},
+				Env:             append([]corev1.EnvVar{{Name: "SSL_CERT_FILE", Value: "/etc/cracha-ca/ca.crt"}}, env...),
 				VolumeMounts:    []corev1.VolumeMount{{Name: "ca", MountPath: "/etc/cracha-ca", ReadOnly: true}},
 			}},
 			Volumes: []corev1.Volume{{
@@ -154,9 +168,9 @@ func workloadPod(name, serviceAccount string) *corev1.Pod {
 }
 
 // runWorkload creates a workload pod, waits for it to run and for its report.
-func runWorkload(ctx context.Context, t *testing.T, name, serviceAccount string) (*corev1.Pod, *report) {
+func runWorkload(ctx context.Context, t *testing.T, name, serviceAccount string, env ...corev1.EnvVar) (*corev1.Pod, *report) {
 	t.Helper()
-	pod := mustCreatePod(ctx, t, workloadPod(name, serviceAccount))
+	pod := mustCreatePod(ctx, t, workloadPod(name, serviceAccount, env...))
 	if _, err := waitForPodPhase(ctx, pod.Name, corev1.PodRunning); err != nil {
 		t.Fatal(err)
 	}
@@ -394,10 +408,7 @@ func TestUnassignedWorkloadIsRefused(t *testing.T) {
 	if ex.Status != 403 {
 		t.Errorf("broker answered %d, want 403: %s", ex.Status, ex.Body)
 	}
-	var body struct {
-		Reason string `json:"reason"`
-	}
-	if err := json.Unmarshal([]byte(ex.Body), &body); err != nil || body.Reason != "no_grant" {
+	if ex.reason() != "no_grant" {
 		t.Errorf("body = %q, want {\"reason\": \"no_grant\"}", ex.Body)
 	}
 	session := fmt.Sprintf("w.cracha.%s.%s", testNamespace, unassignedSA)
