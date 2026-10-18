@@ -243,3 +243,32 @@ func TestParseTemplate(t *testing.T) {
 		t.Errorf("template without params: %v", err)
 	}
 }
+
+// TestLoadSkipsHiddenDirectories: a grant tree at the root of its own
+// repository has .github/workflows/*.yml beside it, which are not grant
+// documents and must not be read as such.
+func TestLoadSkipsHiddenDirectories(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.CopyFS(dir, os.DirFS("testdata/good")); err != nil {
+		t.Fatal(err)
+	}
+	wf := filepath.Join(dir, ".github", "workflows")
+	if err := os.MkdirAll(wf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wf, "publish.yml"), []byte("name: publish\non: push\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want, err := Load("testdata/good")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load with a .github directory: %v", err)
+	}
+	if len(got.Grants) != len(want.Grants) || len(got.Services) != len(want.Services) || len(got.Assignments) != len(want.Assignments) {
+		t.Errorf("loaded %d grants, %d services, %d assignments; want %d, %d, %d",
+			len(got.Grants), len(got.Services), len(got.Assignments), len(want.Grants), len(want.Services), len(want.Assignments))
+	}
+}

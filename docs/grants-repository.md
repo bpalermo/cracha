@@ -74,7 +74,7 @@ which the roles' trust policies below refuse.
 Pin the reusable workflow by the commit SHA of a Crachá release tag, with the
 tag in a comment, and give the same release as `grantc-version`. Moving to a
 new release is changing both together. `<sha>` is
-`gh api repos/bpalermo/cracha/git/ref/tags/<tag> --jq .object.sha`.
+`gh api repos/bpalermo/cracha/commits/<tag> --jq .sha`, the commit the tag points at (release tags are annotated, so `git/ref/tags/<tag>` names the tag object, which `uses:` does not accept). `grantc` skips hidden directories under `source`, so the tree can be the repository's root beside `.github/`.
 
 The workflow needs a `grantc` that writes the KMS key's public-key hash as
 the signature's `keyId` and verifies `-kms-key` locally after

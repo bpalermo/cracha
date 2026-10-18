@@ -81,7 +81,8 @@ const (
 
 // Load reads a source tree (see the package documentation): every *.yaml and
 // *.yml file under dir is a Grant, an Assignment or a Service, and every *.json file
-// under dir/templates is a template. It reports every problem it finds, not
+// under dir/templates is a template. Hidden directories under dir (.git,
+// .github) are skipped. It reports every problem it finds, not
 // only the first.
 func Load(dir string) (*Source, error) {
 	l := newLoader(dir)
@@ -129,6 +130,12 @@ func (l *loader) visit(path string, d fs.DirEntry, err error) error {
 		return err
 	}
 	if d.IsDir() {
+		// A hidden directory below the root (.git, .github with its
+		// workflows) is the repository's, not the tree's: the grant tree is
+		// usually the root of a repository of its own.
+		if path != l.dir && strings.HasPrefix(d.Name(), ".") {
+			return filepath.SkipDir
+		}
 		return nil
 	}
 	rel := l.rel(path)
