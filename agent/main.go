@@ -10,6 +10,9 @@
 //
 // `cracha-agent enrol` is the cracha-enrol init container: it enrols the pod
 // it runs in and exits 0 once the listener accepts a connection.
+// `cracha-agent cni-install` is the cni-install init container of the
+// DaemonSet in cni mode: it puts the cracha-cni plugin on the node
+// (internal/cni/install) and exits 0.
 package main
 
 import (
@@ -31,6 +34,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 
+	cniinstall "github.com/bpalermo/cracha/agent/internal/cni/install"
 	cniserver "github.com/bpalermo/cracha/agent/internal/cni/server"
 	"github.com/bpalermo/cracha/agent/internal/enrol"
 	"github.com/bpalermo/cracha/agent/internal/serve"
@@ -38,8 +42,13 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "enrol" {
-		os.Exit(enrolMain(os.Args[2:]))
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "enrol":
+			os.Exit(enrolMain(os.Args[2:]))
+		case "cni-install":
+			os.Exit(cniInstallMain(os.Args[2:]))
+		}
 	}
 	os.Exit(serveMain(os.Args[1:]))
 }
@@ -170,6 +179,37 @@ func enrolMain(args []string) int {
 	defer stop()
 	if err := enrol.Run(ctx, *cfg); err != nil {
 		log.Error("enrolment failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
+// cniInstallMain is `cracha-agent cni-install`, the init container of cni
+// mode.
+func cniInstallMain(args []string) int {
+	fs := flag.NewFlagSet("cracha-agent cni-install", flag.ContinueOnError)
+	var cfg cniinstall.Config
+	fs.StringVar(&cfg.Plugin, "plugin", cniinstall.DefaultPlugin, "the cracha-cni binary in the image")
+	fs.StringVar(&cfg.BinDir, "bin-dir", cniinstall.DefaultBinDir, "the node's CNI bin directory, as mounted (agent.cni.binDir)")
+	fs.StringVar(&cfg.ConfDir, "conf-dir", cniinstall.DefaultConfDir, "the node's CNI conf directory, as mounted (agent.cni.confDir)")
+	fs.StringVar(&cfg.Socket, "socket", DefaultCNISocket, "the agent's socket the plugin's entry names (agent.cni.socket)")
+	uninstall := fs.Bool("uninstall", false, "remove the entry and the binary instead")
+	logLevel := fs.String("log-level", "info", "log level: debug, info, warn or error")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	log, err := logger(*logLevel)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cracha-agent cni-install: %v\n", err)
+		return 2
+	}
+	cfg.Logger = log
+	run := cniinstall.Run
+	if *uninstall {
+		run = cniinstall.Uninstall
+	}
+	if err := run(cfg); err != nil {
+		log.Error("cni-install failed", "error", err)
 		return 1
 	}
 	return 0

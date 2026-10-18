@@ -48,10 +48,16 @@ func Run(ctx context.Context, srv *http.Server, serve func() error, what string,
 
 // ListenUnix listens on path after clearing a stale socket a previous
 // instance left behind. It refuses to delete anything at path that is not a
-// socket. The socket is created 0660 in a directory the agent owns.
+// socket. The directory is the agent's own (agent.cni.socket's, design
+// 7.8): it is created, or kept, 0700, and the socket is 0600, so only root
+// on the node (the runtime, which execs the plugin) reaches it.
 func ListenUnix(path string) (net.Listener, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		return nil, fmt.Errorf("creating %s: %w", filepath.Dir(path), err)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", dir, err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("chmod %s: %w", dir, err)
 	}
 	if fi, err := os.Lstat(path); err == nil {
 		if fi.Mode().Type() != fs.ModeSocket {
@@ -67,7 +73,7 @@ func ListenUnix(path string) (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listening on %s: %w", path, err)
 	}
-	if err := os.Chmod(path, 0o660); err != nil {
+	if err := os.Chmod(path, 0o600); err != nil {
 		_ = lis.Close()
 		return nil, fmt.Errorf("chmod %s: %w", path, err)
 	}

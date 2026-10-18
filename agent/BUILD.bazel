@@ -13,6 +13,7 @@ go_library(
     deps = [
         "//agent/enrolapi",
         "//agent/internal/broker",
+        "//agent/internal/cni/install",
         "//agent/internal/cni/server",
         "//agent/internal/credentials",
         "//agent/internal/cri",
@@ -47,6 +48,10 @@ go_image(
     name = "image",
     base = "@distroless_static",
     binary = ":agent",
+    # The cracha-cni plugin rides in the agent image, at the path
+    # `cracha-agent cni-install` copies it from (DefaultPlugin of
+    # agent/internal/cni/install).
+    files = {"/opt/cracha/cni/cracha-cni": "//agent/cni"},
     load_tag = "localhost/cracha-agent:e2e",
     path = "/cracha-agent",
     registry = IMAGE_REGISTRY,
