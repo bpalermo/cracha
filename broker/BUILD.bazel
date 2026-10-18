@@ -54,6 +54,10 @@ go_image(
 
 go_test(
     name = "broker_test",
-    srcs = ["config_test.go"],
+    srcs = [
+        "authz_test.go",
+        "config_test.go",
+    ],
     embed = [":broker_lib"],
+    deps = ["//broker/internal/authz"],
 )

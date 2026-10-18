@@ -10,7 +10,10 @@ import (
 )
 
 // authzStore is the broker's authorization store with whatever the backend
-// holds open: SpiceDB's connection; nothing for the static one.
+// holds open: SpiceDB's connection; nothing for the static one. What the
+// issuer and the cache get is Store itself, never this wrapper: the cache
+// finds Watch on the store by type assertion (cache.New), and a wrapper
+// would hide it and leave the cache in TTL mode.
 type authzStore struct {
 	authz.Store
 	close func() error

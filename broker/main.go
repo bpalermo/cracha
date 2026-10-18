@@ -91,14 +91,14 @@ func run(ctx context.Context, cfg config) error {
 	log.Info("connected to the workload api", "socket", cfg.workloadAPISocket)
 
 	direct := &issuer.Direct{
-		Store:   store,
+		Store:   store.Store,
 		Grants:  src,
 		STS:     sts.NewFromConfig(awsCfg),
 		Labels:  cfg.labels,
 		Cluster: cfg.cluster,
 		Log:     log,
 	}
-	iss := newIssuer(ctx, cfg, direct, store, log)
+	iss := newIssuer(ctx, cfg, direct, store.Store, log)
 	handler := api.New(authn.New(bundles), iss, log)
 	if src.ready != nil {
 		handler.AddReadiness(src.ready)
