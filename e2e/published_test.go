@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"maps"
 	"os"
 	"os/exec"
@@ -17,6 +18,58 @@ import (
 
 	"github.com/bpalermo/cracha/common/grant"
 )
+
+const (
+	// grantSource is the tree run.sh compiled and published, relative to
+	// the package directory the test runs in.
+	grantSource = "grants"
+	// serviceDocument is the document of grantSource that assigns the
+	// client its grant.
+	serviceDocument = "services/e2e-client.yaml"
+)
+
+// modifiedSource copies the suite's grant source tree into a temporary
+// directory and applies edit to it, for a publication that changes one thing.
+// The copy is of the files' contents: in the runfiles the tree is symbolic
+// links to the checkout, and os.CopyFS would reproduce the links, so an
+// edit would go through to the checkout.
+func modifiedSource(t *testing.T, edit func(dir string) error) string {
+	t.Helper()
+	dir := t.TempDir()
+	src := os.DirFS(grantSource)
+	err := fs.WalkDir(src, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return os.MkdirAll(filepath.Join(dir, path), 0o755)
+		}
+		data, err := fs.ReadFile(src, path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(dir, path), data, 0o644)
+	})
+	if err != nil {
+		t.Fatalf("copying %s: %v", grantSource, err)
+	}
+	if err := edit(dir); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// withoutGrant is the tree with the client's service holding no grant: the
+// assignment removed, the membership and so the tags kept.
+func withoutGrant(dir string) error {
+	return os.WriteFile(filepath.Join(dir, serviceDocument), []byte(`kind: Service
+metadata:
+  name: e2e-client
+spec:
+  team: platform
+  members: [cracha/e2e/client]
+`), 0o644)
+}
 
 // The static mode of the suite (E2E_AUTHZ=static, the default): the
 // broker's assignments are the ones grantc compiled from e2e/grants and

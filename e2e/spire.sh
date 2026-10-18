@@ -41,7 +41,11 @@ register "spiffe://${trust_domain}/node" -node -selector k8s_psat:cluster:cracha
 # (e2e/spire.yaml authorises that one ID as a broker) and to the broker over
 # mTLS; the broker admits the agent's ID and nothing else, and verifies the
 # pods' JWT-SVIDs against the trust bundle its Workload API serves.
-for sa in cracha-agent cracha-broker; do
+# The SpiceDB gateway (spicedb mode) serves SPIFFE mTLS with the SVID of
+# its pods' service account, over the SPIRE agent's SDS; the broker
+# verifies it by that ID. Registered in both modes: in static mode nothing
+# runs as it.
+for sa in cracha-agent cracha-broker cracha-spicedb; do
 	register "spiffe://${trust_domain}/ns/cracha-system/sa/${sa}" \
 		-parentID "spiffe://${trust_domain}/node" \
 		-selector k8s:ns:cracha-system \

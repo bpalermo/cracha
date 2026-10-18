@@ -4,46 +4,32 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/bazelbuild/rules_go/go/runfiles"
+	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // The SpiceDB mode of the suite (E2E_AUTHZ=spicedb in e2e/run.sh): the
-// broker's authorization backend is the SpiceDB run.sh deployed, with the
-// relationships cracha-reconciler wrote from e2e/grants. The tests here run
-// only in that mode; the rest of the suite runs in both. They change the
-// relationships through the reconciler, the writer of design 6.4, against
-// the port-forward run.sh keeps open, and put them back when they are
-// done, so the tests after them and a reused cluster see the tree as
-// run.sh wrote it.
+// broker's authorization backend is the SpiceDB the chart deployed, with the
+// relationships the suite writes at its start (spicedb_access_test.go)
+// through the chart's gateway, with the access identity, the one writer of
+// design 6.4. The tests here run only in that mode; the rest of the suite
+// runs in both. They change the relationships the same way and put them
+// back when they are done, so the tests after them see what the suite
+// wrote.
 
 const (
 	// authzEnv names the mode run.sh ran the suite in; spicedbEndpointEnv
-	// and spicedbTokenEnv are how to reach the SpiceDB it deployed from the
-	// host: the port-forward's address and the file with the preshared key.
+	// is how to reach the chart's SpiceDB gateway from the host, the
+	// port-forward's address.
 	authzEnv           = "E2E_AUTHZ"
 	spicedbEndpointEnv = "E2E_SPICEDB_ENDPOINT"
-	spicedbTokenEnv    = "E2E_SPICEDB_TOKEN_FILE"
 	spicedbMode        = "spicedb"
-
-	// reconcilerRlocation is the reconciler built from this checkout, in
-	// the test's runfiles (data of //e2e:e2e_test).
-	reconcilerRlocation = "_main/reconciler/reconciler_/cracha-reconciler"
-	// grantSource is the tree run.sh compiled and reconciled, relative to
-	// the package directory the test runs in.
-	grantSource = "grants"
-	// serviceDocument is the document of grantSource that assigns the
-	// client its grant.
-	serviceDocument = "services/e2e-client.yaml"
 
 	// fetchInterval is how often a fetching workload asks the broker for
 	// credentials again; revocationBudget is how long after the write a
@@ -76,7 +62,7 @@ func requireSpiceDB(t *testing.T) {
 	if mode := os.Getenv(authzEnv); mode != spicedbMode {
 		t.Skipf("%s=%q: the authorization backend is not SpiceDB; run E2E_AUTHZ=spicedb e2e/run.sh", authzEnv, mode)
 	}
-	for _, name := range []string{spicedbEndpointEnv, spicedbTokenEnv} {
+	for _, name := range []string{spicedbEndpointEnv, spicedbSVIDsEnv} {
 		if os.Getenv(name) == "" {
 			t.Fatalf("%s is not set; e2e/run.sh sets it in spicedb mode", name)
 		}
@@ -133,90 +119,22 @@ func brokerLogs(ctx context.Context) ([]brokerLine, error) {
 	return out, nil
 }
 
-// reconcile runs cracha-reconciler apply on a tree against the SpiceDB
-// run.sh deployed, and fails the test when it does not converge.
-func reconcile(ctx context.Context, t *testing.T, tree string) {
+// revoke applies op to the relationships and, when the test ends, the
+// opposite, on its own clock: the test's context may be spent.
+func revoke(ctx context.Context, t *testing.T, op v1.RelationshipUpdate_Operation, rels ...*v1.Relationship) {
 	t.Helper()
-	bin, err := runfiles.Rlocation(reconcilerRlocation)
-	if err != nil {
-		t.Fatalf("the reconciler is not in the runfiles: %v", err)
+	undo := v1.RelationshipUpdate_OPERATION_TOUCH
+	if op == v1.RelationshipUpdate_OPERATION_TOUCH {
+		undo = v1.RelationshipUpdate_OPERATION_DELETE
 	}
-	cmd := exec.CommandContext(ctx, bin, "apply", "-source", tree,
-		"-endpoint", os.Getenv(spicedbEndpointEnv), "-token-file", os.Getenv(spicedbTokenEnv), "-insecure")
-	out, err := cmd.CombinedOutput()
-	t.Logf("cracha-reconciler apply -source %s:\n%s", tree, strings.TrimSpace(string(out)))
-	if err != nil {
-		t.Fatalf("reconciling %s: %v", tree, err)
-	}
-}
-
-// restoreSource puts the relationships back as run.sh wrote them, whatever
-// happened, on its own clock: the test's context may be spent.
-func restoreSource(t *testing.T) {
-	t.Helper()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
-		reconcile(ctx, t, grantSource)
+		if _, err := write(ctx, undo, rels...); err != nil {
+			t.Errorf("putting the relationships back: %v", err)
+		}
 	})
-}
-
-// modifiedSource copies the suite's grant source tree into a temporary
-// directory and applies edit to it, for a reconcile that changes one thing.
-// The copy is of the files' contents: in the runfiles the tree is symbolic
-// links to the checkout, and os.CopyFS would reproduce the links, so an
-// edit would go through to the checkout.
-func modifiedSource(t *testing.T, edit func(dir string) error) string {
-	t.Helper()
-	dir := t.TempDir()
-	src := os.DirFS(grantSource)
-	err := fs.WalkDir(src, ".", func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return os.MkdirAll(filepath.Join(dir, path), 0o755)
-		}
-		data, err := fs.ReadFile(src, path)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(filepath.Join(dir, path), data, 0o644)
-	})
-	if err != nil {
-		t.Fatalf("copying %s: %v", grantSource, err)
-	}
-	if err := edit(dir); err != nil {
-		t.Fatal(err)
-	}
-	return dir
-}
-
-// withoutGrant is the tree with the client's service holding no grant: the
-// assignment removed, the membership and so the tags kept.
-func withoutGrant(dir string) error {
-	return os.WriteFile(filepath.Join(dir, serviceDocument), []byte(`kind: Service
-metadata:
-  name: e2e-client
-spec:
-  team: platform
-  members: [cracha/e2e/client]
-`), 0o644)
-}
-
-// withSuspension is the tree with the client suspended: an Assignment that
-// gives nothing and takes everything away, until it is removed.
-func withSuspension(dir string) error {
-	if err := os.MkdirAll(filepath.Join(dir, "assignments"), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(dir, "assignments", "suspend-client.yaml"), []byte(`kind: Assignment
-metadata:
-  name: suspend-client
-spec:
-  subject: cracha/e2e/client
-  suspended: true
-`), 0o644)
+	mustWrite(ctx, t, op, rels...)
 }
 
 // runFetchingWorkload starts the assigned workload with fetches at
@@ -298,8 +216,8 @@ func TestSpiceDBCacheWatchMode(t *testing.T) {
 	}
 }
 
-// Revocation, design 6.8 step 1: the assignment is removed in Git, the
-// reconciler writes the difference, and the next fetch is refused, long
+// Revocation, design 6.8 step 1: the access service deletes the
+// assignment's relationship, and the next fetch is refused, long
 // before the session or the cache's floor would have run out; the Watch
 // stream flushed the entry, which a TTL-only cache would have kept and
 // served again once the assignment was back.
@@ -314,8 +232,7 @@ func TestSpiceDBRevocationViaWatch(t *testing.T) {
 	})
 
 	revokedAt := time.Now()
-	restoreSource(t)
-	reconcile(ctx, t, modifiedSource(t, withoutGrant))
+	revoke(ctx, t, v1.RelationshipUpdate_OPERATION_DELETE, clientAssignment)
 	denied := waitForFetch(ctx, t, pod, revokedAt, "a refusal", status(403))
 	if r := denied.Exchange.reason(); r != reasonNoGrant {
 		t.Errorf("refused with %q, want %q: %s", r, reasonNoGrant, denied.Exchange.Body)
@@ -345,14 +262,15 @@ func TestSpiceDBRevocationViaWatch(t *testing.T) {
 	// Back: the first credentials are issued anew. A cache that had only
 	// aged the entry out would have served it as a hit.
 	restoredAt := time.Now()
-	reconcile(ctx, t, grantSource)
+	mustWrite(ctx, t, v1.RelationshipUpdate_OPERATION_TOUCH, clientAssignment)
 	back := waitForFetch(ctx, t, pod, restoredAt, "credentials again", status(200))
 	if got := strings.Join(back.Exchange.Headers[headerCache], ","); got != cacheOutcomeMiss {
 		t.Errorf("%s = %q after the assignment came back, want %q: the Watch flush did not drop the entry", headerCache, got, cacheOutcomeMiss)
 	}
 }
 
-// A suspended workload holds nothing, whatever its assignments say, and is
+// A suspended workload (the relationship workload#suspended, written by
+// the access service) holds nothing, whatever its assignments say, and is
 // refused with subject_suspended (design 6.4, 6.5); lifting the suspension
 // gives it its grant back.
 func TestSpiceDBSuspension(t *testing.T) {
@@ -362,8 +280,7 @@ func TestSpiceDBSuspension(t *testing.T) {
 	pod := runFetchingWorkload(ctx, t, "suspended")
 
 	suspendedAt := time.Now()
-	restoreSource(t)
-	reconcile(ctx, t, modifiedSource(t, withSuspension))
+	revoke(ctx, t, v1.RelationshipUpdate_OPERATION_TOUCH, clientSuspension)
 	denied := waitForFetch(ctx, t, pod, suspendedAt, "a refusal", status(403))
 	if r := denied.Exchange.reason(); r != reasonSuspended {
 		t.Errorf("refused with %q, want %q: %s", r, reasonSuspended, denied.Exchange.Body)
@@ -373,7 +290,7 @@ func TestSpiceDBSuspension(t *testing.T) {
 	}
 
 	liftedAt := time.Now()
-	reconcile(ctx, t, grantSource)
+	mustWrite(ctx, t, v1.RelationshipUpdate_OPERATION_DELETE, clientSuspension)
 	back := waitForFetch(ctx, t, pod, liftedAt, "credentials again", status(200))
 	if got := strings.Join(back.Exchange.Headers["Cracha-Grants"], ","); got != grantName {
 		t.Errorf("Cracha-Grants = %q after the suspension was lifted, want %q", got, grantName)

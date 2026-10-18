@@ -1,18 +1,30 @@
-# What E2E_AUTHZ=spicedb adds to e2e/values.yaml: the broker asks SpiceDB
-# (e2e/manifests/spicedb.yaml) instead of the static backend, which takes
+# What E2E_AUTHZ=spicedb adds to e2e/values.yaml: the broker asks the
+# chart's SpiceDB (design 6.4) instead of the static backend, which takes
 # the published assignments; the assignments.source a SpiceDB install
-# leaves at its default. Plaintext gRPC inside the cluster, with
-# the preshared key from the Secret e2e/run.sh creates; the relationships
-# come from e2e/grants through cracha-reconciler, which run.sh runs from the
-# host.
+# leaves at its default. SpiceDB runs on its memory datastore, so one
+# replica, behind the gateway, whose SVID comes from the SPIRE agent's SDS
+# like every component's (e2e/spire.sh registers its service account). The
+# preshared key is the Secret e2e/run.sh creates with a random value, which
+# only the SpiceDB pod mounts; the broker reaches the gateway with its own
+# SVID. run.sh has cracha-reconciler write the schema and the suite writes
+# its relationships as the access identity.
 broker:
   assignments:
     source: file
   authz:
     backend: spicedb
-    spicedb:
-      endpoint: cracha-spicedb.cracha-system.svc:50051
-      insecure: true
-      tokenSecret:
-        name: cracha-e2e-spicedb
-        key: token
+spicedb:
+  replicas: 1
+  presharedKeySecret:
+    name: cracha-e2e-spicedb
+    key: token
+  gateway:
+    trustDomain: cracha.test
+    logLevel: debug
+  workloadAPI:
+    volume:
+      type: hostPath
+      hostPath:
+        path: /run/spire/agent-sockets
+        type: Directory
+    socket: spire-agent.sock
