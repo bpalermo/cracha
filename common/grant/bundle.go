@@ -63,7 +63,7 @@ func Compile(ctx context.Context, src *Source, opts CompileOptions) (*Compiled, 
 	}
 	version := opts.Version
 	if version == "" {
-		if version, err = ContentVersion(b.Grants, a); err != nil {
+		if version, err = ContentVersion(b.Grants, b.Accounts, a); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -80,8 +80,9 @@ func Compile(ctx context.Context, src *Source, opts CompileOptions) (*Compiled, 
 	return &Compiled{Bundle: b, Assignments: a}, report, nil
 }
 
-// compileBundle compiles the grants of a source the lints passed, with the
-// policies they rendered.
+// compileBundle compiles the grants of a source the lints passed
+// (Source.CompiledGrants), with the policies they rendered, and its
+// accounts.
 func compileBundle(src *Source, report *Report) *Bundle {
 	rendered := map[string]string{}
 	lookups := map[string]*BundleLookup{}
@@ -89,8 +90,8 @@ func compileBundle(src *Source, report *Report) *Bundle {
 		rendered[r.Grant] = r.Rendered
 		lookups[r.Grant] = r.Lookup
 	}
-	b := &Bundle{Grants: []BundleGrant{}}
-	for _, g := range src.Grants {
+	b := &Bundle{Grants: []BundleGrant{}, Accounts: bundleAccounts(src)}
+	for _, g := range src.CompiledGrants() {
 		b.Grants = append(b.Grants, BundleGrant{
 			Name:              g.Name(),
 			Account:           g.Spec.Account,
@@ -101,6 +102,7 @@ func compileBundle(src *Source, report *Report) *Bundle {
 			Duration:          g.Spec.EffectiveDuration(),
 			Envelope:          nonNil(g.Spec.Envelope),
 			Lookup:            lookups[g.Name()],
+			Implicit:          g.Implicit(),
 		})
 	}
 	sort.Slice(b.Grants, func(i, j int) bool { return b.Grants[i].Name < b.Grants[j].Name })
@@ -112,17 +114,19 @@ func compileBundle(src *Source, report *Report) *Bundle {
 func ValidVersion(v string) bool { return versionRE.MatchString(v) }
 
 // ContentVersion is the SHA-256, in hex, of the canonical JSON of the
-// grants and of who holds them (the services, workloads and access of the
-// assignments; their version and generatedAt are not part of it): the
-// version of a compilation whose sources carry no version of their own. A
-// change to either, the assignments alone included, is a new version.
-func ContentVersion(grants []BundleGrant, a *Assignments) (string, error) {
+// grants, the accounts, and who holds them (the services, workloads and
+// access of the assignments; their version and generatedAt are not part of
+// it): the version of a compilation whose sources carry no version of
+// their own. A change to any, the assignments alone included, is a new
+// version. Without accounts the hash is what it was before them.
+func ContentVersion(grants []BundleGrant, accounts []BundleAccount, a *Assignments) (string, error) {
 	content := struct {
 		Grants    []BundleGrant      `json:"grants"`
+		Accounts  []BundleAccount    `json:"accounts,omitempty"`
 		Services  []AssignedService  `json:"services"`
 		Workloads []AssignedWorkload `json:"workloads"`
 		Access    []AssignedAccess   `json:"access,omitempty"`
-	}{Grants: grants}
+	}{Grants: grants, Accounts: accounts}
 	if a != nil {
 		content.Services, content.Workloads, content.Access = a.Services, a.Workloads, a.Access
 	}

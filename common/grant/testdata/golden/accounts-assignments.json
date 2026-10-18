@@ -1,0 +1,56 @@
+{
+  "access": [
+    {
+      "relation": "reader",
+      "resource": {
+        "kind": "s3_bucket",
+        "name": "data-payments-exports"
+      },
+      "service": "payments"
+    },
+    {
+      "relation": "writer",
+      "resource": {
+        "kind": "s3_bucket",
+        "name": "data-curated"
+      },
+      "subject": "prod/data/etl"
+    },
+    {
+      "relation": "reader",
+      "resource": {
+        "kind": "dynamodb_table",
+        "name": "payments-audit"
+      },
+      "subject": "prod/payments/worker"
+    }
+  ],
+  "generatedAt": "2026-10-17T12:34:56Z",
+  "services": [
+    {
+      "grants": [
+        {
+          "name": "payments-ledger"
+        }
+      ],
+      "members": [
+        "prod/payments/api",
+        "prod/payments/worker"
+      ],
+      "name": "payments",
+      "team": "payments"
+    }
+  ],
+  "version": "abc123",
+  "workloads": [
+    {
+      "grants": [
+        {
+          "name": "legacy-batch"
+        }
+      ],
+      "subject": "prod/legacy/batch",
+      "suspended": false
+    }
+  ]
+}

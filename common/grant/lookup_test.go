@@ -13,17 +13,28 @@ import (
 
 const lookupDir = "testdata/lookup"
 
-// lookupTree copies the lookup tree into a temporary directory, writes the
-// extra files over it (path relative to the root, empty content removes
-// the file) and loads it.
+// lookupTree loads a copy of the lookup tree with the extra files
+// (treeCopy).
 func lookupTree(t *testing.T, extra map[string]string) *Source {
 	t.Helper()
+	src, err := Load(treeCopy(t, lookupDir, extra))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	return src
+}
+
+// treeCopy copies the tree at from into a temporary directory, writes the
+// extra files over it (path relative to the root, empty content removes
+// the file) and returns the directory.
+func treeCopy(t *testing.T, from string, extra map[string]string) string {
+	t.Helper()
 	dir := t.TempDir()
-	err := filepath.WalkDir(lookupDir, func(path string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(from, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		rel, _ := filepath.Rel(lookupDir, path)
+		rel, _ := filepath.Rel(from, path)
 		if d.IsDir() {
 			return os.MkdirAll(filepath.Join(dir, rel), 0o755)
 		}
@@ -51,11 +62,7 @@ func lookupTree(t *testing.T, extra map[string]string) *Source {
 			t.Fatal(err)
 		}
 	}
-	src, err := Load(dir)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	return src
+	return dir
 }
 
 func lintLookup(t *testing.T, src *Source) *Report {

@@ -1,0 +1,24 @@
+# The account and its role: every application of the account shares it,
+# and the session policy the broker composes scopes each workload.
+kind: Account
+metadata:
+  name: apps
+spec:
+  id: "111122223333"
+  role: arn:aws:iam::111122223333:role/cracha/apps
+  envelope:
+    - arn:aws:s3:::data-*
+    - arn:aws:dynamodb:*:111122223333:table/*
+  access:
+    - kind: s3_bucket
+      permission: read
+      template: s3-object-read
+    - kind: s3_bucket
+      permission: write
+      template: s3-bucket-write
+      param: buckets
+      params: { prefix: incoming/ }
+      duration: 1800
+    - kind: dynamodb_table
+      permission: read
+      template: dynamo-table-read

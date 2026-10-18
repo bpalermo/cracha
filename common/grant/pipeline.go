@@ -58,7 +58,10 @@ type Report struct {
 // against the report, but Skipped says they did not run.
 func (r *Report) OK() bool { return r.Problems.OK() }
 
-// Lint runs the grant-compiler pipeline of design 6.2 up to compilation:
+// Lint runs the grant-compiler pipeline of design 6.2 up to compilation,
+// over the grants the bundle will hold (Source.CompiledGrants: the
+// accounts' implicit grants among them, and every grant with its
+// account's defaults applied):
 // render (1), Access Analyzer validation (2) and no-new-access check against
 // the envelope (3) when an analyzer is given, the size budget (4) and, for
 // the assignments known in Git, composition (5). The source must validate
@@ -77,7 +80,7 @@ func Lint(ctx context.Context, src *Source, opts LintOptions) (*Report, error) {
 	}
 	rendered := map[string]string{}
 	lookups := map[string]*BundleLookup{}
-	for _, g := range src.Grants {
+	for _, g := range src.CompiledGrants() {
 		res, err := lintGrant(ctx, g, src.Templates, opts.Analyzer)
 		if err != nil {
 			return nil, err

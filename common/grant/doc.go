@@ -1,5 +1,6 @@
 // Package grant is the grant bundle model and its compiler (docs/design.md,
-// section 6.2): it loads Grant, Assignment, Service and Access documents and
+// section 6.2): it loads Account, Grant, Assignment, Service and Access
+// documents and
 // session policy templates from a Git checkout, validates them, renders the
 // templates, runs the lints of the grant-compiler pipeline, compiles the
 // signed bundle the broker consumes, and signs and publishes it. The same
@@ -15,6 +16,7 @@
 // by walking the tree for *.yaml and *.yml files, and session policy
 // templates under a templates/ directory at its root:
 //
+//	accounts/payments.yaml              kind: Account
 //	grants/payments-ledger-rw.yaml      kind: Grant
 //	assignments/payments.yaml           kind: Assignment
 //	services/payments-api.yaml          kind: Service
@@ -22,7 +24,7 @@
 //	templates/dynamo-table-rw.json      a session policy template
 //
 // Unknown fields are rejected, so a typo in a field name fails the load
-// rather than silently widening or narrowing a grant. Names (of grants,
+// rather than silently widening or narrowing a grant. Names (of accounts, grants,
 // assignments, services, teams and templates) are DNS labels: lowercase
 // letters, digits and dashes, at most 63 characters, so they are safe as
 // file names, session tag values, metrics labels and authorization-store
@@ -48,7 +50,43 @@
 //	    - arn:aws:dynamodb:*:111122223333:table/payments-*
 //
 // A grant carries a session policy, managed policy ARNs, or both; one with
-// neither would hand out the whole shape role and is rejected.
+// neither would hand out the whole role and is rejected. baseRole and
+// envelope may be left out when the tree has an Account document for the
+// grant's account: they are then the account's (Source.CompiledGrants).
+// baseRole set is the override, a dedicated shape role.
+//
+// # Account
+//
+// An Account is one AWS account: the account role every grant of the
+// account is issued on unless it names its own, the default envelope of
+// its grants, and its access table, which says what holding a permission
+// on a resource of a kind in the account means in IAM:
+//
+//	kind: Account
+//	metadata:
+//	  name: payments
+//	spec:
+//	  id: "111122223333"
+//	  role: arn:aws:iam::111122223333:role/cracha/apps
+//	  envelope: [arn:aws:s3:::payments-*]   # required with access
+//	  access:
+//	    - kind: s3_bucket
+//	      permission: read
+//	      template: s3-object-read
+//	      param: bucket                     # optional: the one open parameter
+//	      params: {}                        # the template's other parameters
+//	      sessionTags: {}                   # optional, as on a Grant
+//	      duration: 3600                    # optional, as on a Grant
+//
+// Each entry is an implicit grant: a lookup grant named
+// ImplicitGrantName(name, kind, permission), account:payments:s3_bucket:read,
+// on the account role inside the account's envelope, which nothing assigns
+// and which the broker applies to a workload the Access documents relate
+// to resources of the kind in the account, unless the workload holds a
+// lookup grant of the same kind and permission. A resource is in the
+// account its Access document's resource.account names, or in the tree's
+// only Account (Source.ResourceAccount); a workload whose grants span two
+// accounts is refused, and the composition lint reports it.
 //
 // # Assignment
 //
@@ -184,14 +222,20 @@
 //	  "generatedAt": "<RFC 3339>",
 //	  "grants": [ { "name", "account", "baseRole", "sessionPolicy",
 //	                "managedPolicyArns", "sessionTags", "duration",
-//	                "envelope", "lookup"? } ]
+//	                "envelope", "lookup"?, "implicit"? } ],
+//	  "accounts"?: [ { "name", "id", "role", "envelope", "resources"? } ]
 //	}
 //
 // A lookup grant has an empty sessionPolicy and a lookup: { "param",
 // "kind", "permission", "maxResources", "template": { "name", "params",
 // "policy" }, "params" }, which the broker renders at issuance. Every other
 // grant has no lookup field at all, so a bundle without lookup grants is
-// byte for byte what it was before them.
+// byte for byte what it was before them. An account's implicit grant is a
+// lookup grant with implicit: true; accounts are the Account documents,
+// each with the resources its Access documents place in it when there is
+// more than one. Both are absent from a tree without Account documents,
+// which compiles to the bytes it did before them; grants are compiled with
+// their account's defaults applied.
 //
 // Its bytes are canonical: object keys sorted, grants sorted by name, two
 // space indentation and a trailing newline, so the same sources compile to

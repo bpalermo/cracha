@@ -1,0 +1,9 @@
+# Every member of the service reads the bucket: the account's implicit
+# grant for s3_bucket#read is rendered with it.
+kind: Access
+metadata:
+  name: payments-exports
+spec:
+  service: payments
+  resource: { kind: s3_bucket, name: data-payments-exports }
+  relation: reader

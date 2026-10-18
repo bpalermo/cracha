@@ -113,7 +113,10 @@ func ResolveAccess(src *Source) ([]AssignedAccess, error) {
 		if err != nil {
 			return nil, fmt.Errorf("access %s: %w", a.Name(), err)
 		}
-		shape := AssignedAccess{Subject: a.Spec.Subject, Service: a.Spec.Service, Resource: a.Spec.Resource, Relation: a.Spec.Relation}
+		// The account is the bundle's (bundleAccounts): the store relates by
+		// name alone.
+		resource := Resource{Kind: a.Spec.Resource.Kind, Name: a.Spec.Resource.Name}
+		shape := AssignedAccess{Subject: a.Spec.Subject, Service: a.Spec.Service, Resource: resource, Relation: a.Spec.Relation}
 		key := shape.holderKey()
 		shapes[key] = shape
 		byKey[key] = append(byKey[key], assigned{a.Name(), b})

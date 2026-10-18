@@ -1,0 +1,8 @@
+kind: Service
+metadata:
+  name: payments
+spec:
+  team: payments
+  members: [prod/payments/api, prod/payments/worker]
+  grants:
+    - name: payments-ledger

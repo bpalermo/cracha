@@ -1,0 +1,7 @@
+kind: Access
+metadata:
+  name: worker-audit
+spec:
+  subject: prod/payments/worker
+  resource: { kind: dynamodb_table, name: payments-audit }
+  relation: reader

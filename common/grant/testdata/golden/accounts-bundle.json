@@ -1,0 +1,185 @@
+{
+  "accounts": [
+    {
+      "envelope": [
+        "arn:aws:s3:::data-*",
+        "arn:aws:dynamodb:*:111122223333:table/*"
+      ],
+      "id": "111122223333",
+      "name": "apps",
+      "role": "arn:aws:iam::111122223333:role/cracha/apps"
+    }
+  ],
+  "generatedAt": "2026-10-17T12:34:56Z",
+  "grants": [
+    {
+      "account": "111122223333",
+      "baseRole": "arn:aws:iam::111122223333:role/cracha/apps",
+      "duration": 3600,
+      "envelope": [
+        "arn:aws:s3:::data-*",
+        "arn:aws:dynamodb:*:111122223333:table/*"
+      ],
+      "implicit": true,
+      "lookup": {
+        "kind": "dynamodb_table",
+        "maxResources": 5,
+        "param": "table",
+        "params": {},
+        "permission": "read",
+        "template": {
+          "name": "dynamo-table-read",
+          "params": {
+            "table": {
+              "description": "the table that may be read",
+              "type": "string"
+            }
+          },
+          "policy": {
+            "Statement": [
+              {
+                "Action": [
+                  "dynamodb:GetItem",
+                  "dynamodb:Query"
+                ],
+                "Effect": "Allow",
+                "Resource": "arn:aws:dynamodb:*:${account}:table/${table}"
+              }
+            ],
+            "Version": "2012-10-17"
+          }
+        }
+      },
+      "managedPolicyArns": [],
+      "name": "account:apps:dynamodb_table:read",
+      "sessionPolicy": "",
+      "sessionTags": {}
+    },
+    {
+      "account": "111122223333",
+      "baseRole": "arn:aws:iam::111122223333:role/cracha/apps",
+      "duration": 3600,
+      "envelope": [
+        "arn:aws:s3:::data-*",
+        "arn:aws:dynamodb:*:111122223333:table/*"
+      ],
+      "implicit": true,
+      "lookup": {
+        "kind": "s3_bucket",
+        "maxResources": 14,
+        "param": "bucket",
+        "params": {},
+        "permission": "read",
+        "template": {
+          "name": "s3-object-read",
+          "params": {
+            "bucket": {
+              "description": "the bucket whose objects may be read",
+              "type": "string"
+            }
+          },
+          "policy": {
+            "Statement": [
+              {
+                "Action": [
+                  "s3:GetObject"
+                ],
+                "Effect": "Allow",
+                "Resource": "arn:aws:s3:::${bucket}/*"
+              }
+            ],
+            "Version": "2012-10-17"
+          }
+        }
+      },
+      "managedPolicyArns": [],
+      "name": "account:apps:s3_bucket:read",
+      "sessionPolicy": "",
+      "sessionTags": {}
+    },
+    {
+      "account": "111122223333",
+      "baseRole": "arn:aws:iam::111122223333:role/cracha/apps",
+      "duration": 1800,
+      "envelope": [
+        "arn:aws:s3:::data-*",
+        "arn:aws:dynamodb:*:111122223333:table/*"
+      ],
+      "implicit": true,
+      "lookup": {
+        "kind": "s3_bucket",
+        "maxResources": 10,
+        "param": "buckets",
+        "params": {
+          "prefix": "incoming/"
+        },
+        "permission": "write",
+        "template": {
+          "name": "s3-bucket-write",
+          "params": {
+            "buckets": {
+              "description": "the buckets that may be written",
+              "type": "list"
+            },
+            "prefix": {
+              "default": "",
+              "type": "string"
+            }
+          },
+          "policy": {
+            "Statement": [
+              {
+                "Action": [
+                  "s3:PutObject",
+                  "s3:GetObject"
+                ],
+                "Effect": "Allow",
+                "Resource": "arn:aws:s3:::${buckets}/${prefix}*",
+                "Sid": "Write"
+              },
+              {
+                "Action": [
+                  "s3:ListBucket"
+                ],
+                "Effect": "Allow",
+                "Resource": "arn:aws:s3:::${buckets}",
+                "Sid": "List"
+              }
+            ],
+            "Version": "2012-10-17"
+          }
+        }
+      },
+      "managedPolicyArns": [],
+      "name": "account:apps:s3_bucket:write",
+      "sessionPolicy": "",
+      "sessionTags": {}
+    },
+    {
+      "account": "111122223333",
+      "baseRole": "arn:aws:iam::111122223333:role/broker/shape-legacy",
+      "duration": 3600,
+      "envelope": [
+        "arn:aws:s3:::legacy-*"
+      ],
+      "managedPolicyArns": [],
+      "name": "legacy-batch",
+      "sessionPolicy": "{\"Statement\":[{\"Action\":[\"s3:GetObject\"],\"Effect\":\"Allow\",\"Resource\":\"arn:aws:s3:::legacy-batch/*\"}],\"Version\":\"2012-10-17\"}",
+      "sessionTags": {}
+    },
+    {
+      "account": "111122223333",
+      "baseRole": "arn:aws:iam::111122223333:role/cracha/apps",
+      "duration": 3600,
+      "envelope": [
+        "arn:aws:s3:::data-*",
+        "arn:aws:dynamodb:*:111122223333:table/*"
+      ],
+      "managedPolicyArns": [],
+      "name": "payments-ledger",
+      "sessionPolicy": "{\"Statement\":[{\"Action\":[\"dynamodb:GetItem\",\"dynamodb:Query\"],\"Effect\":\"Allow\",\"Resource\":\"arn:aws:dynamodb:*:111122223333:table/payments-ledger\"}],\"Version\":\"2012-10-17\"}",
+      "sessionTags": {}
+    }
+  ],
+  "version": "abc123"
+}
