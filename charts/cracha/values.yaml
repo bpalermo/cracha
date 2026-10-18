@@ -350,9 +350,13 @@ agent:
 
   priorityClassName: system-node-critical
 
-  # Listeners must be bound on every node pods can run on.
-  tolerations:
-    - operator: Exists
+  # The agent must run on every node where the identity issuer's agent runs
+  # and enrolled pods can be scheduled, and nowhere else: on a node without
+  # the issuer's sockets its hostPath mounts fail and the DaemonSet never
+  # becomes ready. Mirror the issuer agent's tolerations here (for SPIRE,
+  # the spire-agent DaemonSet's). The default tolerates no taint, so
+  # tainted nodes (a control plane) are left out.
+  tolerations: []
 
   nodeSelector: {}
   # Requests, so the agent is never BestEffort: a starved probe on a busy

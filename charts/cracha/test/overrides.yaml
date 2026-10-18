@@ -125,7 +125,10 @@ agent:
   healthzPort: 17173
   logLevel: warn
   priorityClassName: ""
-  tolerations: []
+  tolerations:
+    - key: aether.io/agent-not-ready
+      operator: Exists
+      effect: NoSchedule
   nodeSelector:
     kubernetes.io/os: linux
   resources:
