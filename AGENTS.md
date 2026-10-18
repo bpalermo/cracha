@@ -353,7 +353,8 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   checks, the `sensitive` flag, pending requests as `pending_request`
   relationships, Watch); `internal/check` the safeguards, which rebuild
   the grant tree a write leaves from the bundle and SpiceDB's
-  relationships and run `common/grant`'s `LintComposition` on it, refusing
+  relationships (`grant.BundleSource`, the implicit grants included) and
+  run `common/grant`'s `LintComposition` on it, refusing
   with the broker's reason codes; `internal/service` the write path
   (authorization, expiry, approvals, break-glass, audit);
   `internal/audit` the JSON audit lines on stdout. Its tests run against

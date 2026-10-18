@@ -187,8 +187,9 @@ func TestClassify(t *testing.T) {
 		"grant g: 20 s3_bucket resources, over its compiled maximum of 17 (the broker refuses policy_too_large)": ReasonPolicyTooLarge,
 		"11 managed policy ARNs in total, STS allows at most 10":                                                 ReasonPolicyTooLarge,
 		`grant "x" not found`: ReasonNoGrant,
-		"grant g: rendered for its resources: x (the broker refuses resource_outside_envelope)": ReasonResourceOutsideEnvelope,
-		"composed session policy against the union envelope: statement 0":                       ReasonEnvelopeViolation,
+		"grant g: rendered for its resources: x (the broker refuses resource_outside_envelope)":            ReasonResourceOutsideEnvelope,
+		"composed session policy against the union envelope: statement 0":                                  ReasonEnvelopeViolation,
+		"grants span 2 accounts (1, 2); one credential is one account (the broker refuses accounts_mixed)": ReasonAccountsMixed,
 		"something else": ReasonInvalidComposition,
 	} {
 		if got := classify(problem); got != want {
@@ -212,5 +213,47 @@ func TestTreeReadsRelationships(t *testing.T) {
 	cs := tree.Compositions("prod/payments/api", now)
 	if len(cs) != 1 || !strings.Contains(cs[0].Policy, "arn:aws:s3:::data-a/*") {
 		t.Errorf("compositions = %+v", cs)
+	}
+}
+
+// With an account's implicit grant, a workload related to a bucket gets it
+// without any assignment: a bucket in its envelope passes, one outside is
+// refused, for a workload and for a service's members alike.
+func TestEvaluateImplicitGrant(t *testing.T) {
+	b := checktest.AccountBundle(t, "v1")
+	const w = "prod/payments/ledger"
+	for _, tt := range []struct {
+		name   string
+		rels   []store.Relationship
+		add    store.Tuple
+		reason string
+	}{
+		{"first bucket", nil, store.Tuple{Kind: grant.ResourceS3Bucket, Name: "data-a", Relation: grant.RelationReader, Subject: w}, ""},
+		{"outside the account's envelope", nil, store.Tuple{Kind: grant.ResourceS3Bucket, Name: "secrets", Relation: grant.RelationReader, Subject: w}, ReasonResourceOutsideEnvelope},
+		{"no write in the access table", nil, store.Tuple{Kind: grant.ResourceS3Bucket, Name: "data-a", Relation: grant.RelationWriter, Subject: w}, ""},
+		{"service, no member yet", nil, store.Tuple{Kind: grant.ResourceS3Bucket, Name: "data-a", Relation: grant.RelationReader, Service: "payments"}, ""},
+		{
+			"service outside the envelope",
+			[]store.Relationship{member("payments", w)},
+			store.Tuple{Kind: grant.ResourceS3Bucket, Name: "secrets", Relation: grant.RelationReader, Service: "payments"},
+			ReasonResourceOutsideEnvelope,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			add := tt.add
+			res, err := Checker{}.Evaluate(context.Background(), b, tt.rels, Change{Add: &add}, now)
+			if tt.reason == "" {
+				if err != nil {
+					t.Fatalf("refused: %v", err)
+				}
+				if add.Subject != "" && (len(res.Deltas) != 1 || !strings.Contains(res.Deltas[0].PolicyAfter, "arn:aws:s3:::data-a/*")) {
+					t.Errorf("deltas = %+v", res.Deltas)
+				}
+				return
+			}
+			if r := refusal(t, err); r.Reason != tt.reason {
+				t.Errorf("reason = %s (%s), want %s", r.Reason, r.Detail, tt.reason)
+			}
+		})
 	}
 }

@@ -35,16 +35,15 @@ type Tree struct {
 	lookups  map[string]*grant.BundleLookup
 }
 
-// NewTree rebuilds the tree from the bundle's grants and the store's
+// NewTree rebuilds the tree from the bundle's grants and accounts
+// (grant.BundleSource, its implicit grants included) and the store's
 // relationships: services from service#member, #team and the grants'
 // assignee_service; one Assignment per grant#assignee_workload and per
 // workload#suspended; one Access per resource relation. Relationships of
 // other shapes are ignored.
 func NewTree(b *grant.Bundle, rels []store.Relationship) *Tree {
-	t := &Tree{bundle: b, src: &grant.Source{}, rendered: map[string]string{}, lookups: map[string]*grant.BundleLookup{}}
-	for _, g := range b.Grants {
-		t.addGrant(g)
-	}
+	src, rendered, lookups := grant.BundleSource(b)
+	t := &Tree{bundle: b, src: src, rendered: rendered, lookups: lookups}
 	tb := treeBuilder{tree: t, services: map[string]*grant.Service{}}
 	for _, r := range rels {
 		tb.add(r)
@@ -53,20 +52,6 @@ func NewTree(b *grant.Bundle, rels []store.Relationship) *Tree {
 		t.src.Services = append(t.src.Services, tb.services[name])
 	}
 	return t
-}
-
-// addGrant takes a compiled grant into the tree, its policy rendered or,
-// for a lookup grant, left to the lookup.
-func (t *Tree) addGrant(g grant.BundleGrant) {
-	t.src.Grants = append(t.src.Grants, &grant.Grant{Kind: grant.KindGrant, Metadata: grant.Metadata{Name: g.Name}, Spec: grant.GrantSpec{
-		Account: g.Account, BaseRole: g.BaseRole, ManagedPolicyArns: g.ManagedPolicyArns,
-		SessionTags: g.SessionTags, Duration: g.Duration, Envelope: g.Envelope,
-	}})
-	if g.Lookup != nil {
-		t.lookups[g.Name] = g.Lookup
-		return
-	}
-	t.rendered[g.Name] = g.SessionPolicy
 }
 
 type treeBuilder struct {
@@ -105,7 +90,9 @@ func (tb *treeBuilder) add(r store.Relationship) {
 		}
 	default:
 		if t, ok := store.TupleOf(r); ok && t.IsAccess() {
-			tb.tree.src.Accesses = append(tb.tree.src.Accesses, t.Access(tb.name("access")))
+			a := t.Access(tb.name("access"))
+			a.Spec.Resource.Account = grant.BundleResourceAccount(tb.tree.bundle, a.Spec.Resource)
+			tb.tree.src.Accesses = append(tb.tree.src.Accesses, a)
 		}
 	}
 }

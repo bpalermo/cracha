@@ -72,6 +72,31 @@ func Bundle(t testing.TB, version string) *grant.Bundle {
 	return c.Bundle
 }
 
+// AccountBundle compiles a bundle of one Account, apps, whose access table
+// gives an implicit grant for reading S3 buckets (envelope data-*) to
+// every workload related to one, and no Grant document.
+func AccountBundle(t testing.TB, version string) *grant.Bundle {
+	t.Helper()
+	src := &grant.Source{
+		Templates: map[string]*grant.Template{
+			"s3-object-read": template("s3-object-read", `{"bucket":{"type":"string"}}`,
+				`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":"arn:aws:s3:::${bucket}/*"}]}`),
+		},
+		Accounts: []*grant.Account{{Kind: grant.KindAccount, Metadata: grant.Metadata{Name: "apps"}, Spec: grant.AccountSpec{
+			ID: account, Role: "arn:aws:iam::111122223333:role/cracha/apps", Envelope: []string{"arn:aws:s3:::data-*"},
+			Access: []grant.AccountAccess{{Kind: grant.ResourceS3Bucket, Permission: grant.PermissionRead, Template: "s3-object-read"}},
+		}}},
+	}
+	c, report, err := grant.Compile(context.Background(), src, grant.CompileOptions{Version: version, GeneratedAt: time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC)})
+	if err != nil {
+		if report != nil {
+			t.Fatalf("compile: %v: %v", err, report.Problems)
+		}
+		t.Fatalf("compile: %v", err)
+	}
+	return c.Bundle
+}
+
 // MaxResources is a lookup grant's compiled maximum.
 func MaxResources(t testing.TB, b *grant.Bundle, name string) int {
 	t.Helper()

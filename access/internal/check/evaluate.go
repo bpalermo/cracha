@@ -20,6 +20,7 @@ const (
 	ReasonEnvelopeViolation       = "envelope_violation"
 	ReasonPolicyTooLarge          = "policy_too_large"
 	ReasonResourceOutsideEnvelope = "resource_outside_envelope"
+	ReasonAccountsMixed           = "accounts_mixed"
 	// ReasonInvalidPolicy is a blocking finding of Access Analyzer's
 	// ValidatePolicy on the composed policy (CI's step 2).
 	ReasonInvalidPolicy = "invalid_policy"
@@ -238,20 +239,27 @@ func holding(set map[string]bool, c grant.Composition, resource string) {
 	}
 }
 
-// serviceLookups are, for a tuple of a service, the service's own lookup
-// grants of the tuple's kind whose permission its relation gives.
+// serviceLookups are, for a tuple of a service, the lookup grants of the
+// tuple's kind whose permission its relation gives that would render it
+// for the service's members: the service's own, and the implicit grants of
+// the resource's account (which apply to a member holding no lookup grant
+// of the kind).
 func serviceLookups(t *Tree, add store.Tuple) []string {
 	if add.Service == "" {
 		return nil
 	}
-	svc := t.src.Service(add.Service)
-	if svc == nil {
-		return nil
-	}
 	var out []string
-	for _, bg := range svc.Spec.Grants {
-		if l, ok := t.lookups[bg.Name]; ok && rendersWith(l, add) {
-			out = append(out, bg.Name)
+	if svc := t.src.Service(add.Service); svc != nil {
+		for _, bg := range svc.Spec.Grants {
+			if l, ok := t.lookups[bg.Name]; ok && rendersWith(l, add) {
+				out = append(out, bg.Name)
+			}
+		}
+	}
+	account := grant.BundleResourceAccount(t.bundle, grant.Resource{Kind: add.Kind, Name: add.Name})
+	for _, g := range t.src.Grants {
+		if l, ok := t.lookups[g.Name()]; ok && g.Implicit() && g.Spec.Account == account && rendersWith(l, add) {
+			out = append(out, g.Name())
 		}
 	}
 	return out
@@ -294,6 +302,7 @@ func scopeName(subject, cluster string) string {
 func classify(problem string) string {
 	rules := []struct{ phrase, reason string }{
 		{"resource_outside_envelope", ReasonResourceOutsideEnvelope},
+		{"accounts_mixed", ReasonAccountsMixed},
 		{"policy_too_large", ReasonPolicyTooLarge},
 		{"session tag \"", ReasonAmbiguous},
 		{"base roles", ReasonAmbiguous},
