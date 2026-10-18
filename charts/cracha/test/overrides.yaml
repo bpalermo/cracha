@@ -122,6 +122,7 @@ agent:
     binDir: /usr/libexec/cni
     confDir: /etc/kubernetes/cni/net.d
   fetchDeadline: 1500ms
+  prewarm: false
   brokerUrl: https://credentials.example.org:9443
   brokerSpiffeID: spiffe://prod.example.org/ns/cracha/sa/broker
   brokerTimeout: 5s

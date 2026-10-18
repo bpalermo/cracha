@@ -9,6 +9,12 @@
 // broker's answer is relayed unchanged (status, body, Cracha-* headers) and
 // never cached. An answer the agent had to make itself is a 503 with
 // Cracha-Reason.
+//
+// Prewarm runs, when a pod's listener is bound, the path its first request
+// would take: the JWT-SVID fetch, with a longer budget for the issuer to
+// learn of the new pod, and one broker call whose answer is discarded. It
+// warms the token cache here and the broker's credential cache (design 6.7),
+// so the app's first request is a broker cache hit; it holds no credentials.
 package credentials
 
 import (
@@ -64,6 +70,11 @@ const (
 const (
 	DefaultAudience    = "cracha-broker"
 	DefaultPerPodLimit = 8
+	// joinSlack is how much longer than the fetch deadline a request waits
+	// for a fetch already in flight for its pod (a prewarm's, whose budget
+	// is longer) before answering 503 itself: the slack lets a fetch the
+	// request started give its own answer at its deadline.
+	joinSlack = 500 * time.Millisecond
 	// refreshBefore is how close to its expiry a cached token is replaced.
 	refreshBefore = time.Minute
 	// maxBody bounds a relayed body; the broker's are a few hundred bytes.
@@ -83,6 +94,15 @@ type Config struct {
 	// PerPodLimit bounds a pod's requests in flight; DefaultPerPodLimit when
 	// zero.
 	PerPodLimit int
+	// FetchDeadline is the request's budget for the pod's token (the retry
+	// deadline the issuer is wrapped with, agent.fetchDeadline): a request
+	// that joins a fetch already in flight waits that long for it, and no
+	// longer. issuer.DefaultDeadline when zero.
+	FetchDeadline time.Duration
+	// PrewarmIssuer is the issuer a prewarm fetches with: the same one,
+	// wrapped with the prewarm's longer retry budget. Nil disables prewarm
+	// (agent.prewarm false).
+	PrewarmIssuer issuer.Issuer
 	// Logger; the default logger when nil.
 	Logger *slog.Logger
 	// Now is the clock, for tests.
@@ -95,10 +115,16 @@ type Handler struct {
 	broker Relay
 	cfg    Config
 
-	mu     sync.Mutex
-	tokens map[string]*cached       // by pod UID
-	slots  map[string]chan struct{} // by pod UID
-	// fetches coalesces concurrent fetches for one pod into one call.
+	// base is the parent of every prewarm, cancelled by Close.
+	base   context.Context
+	cancel context.CancelFunc
+
+	mu       sync.Mutex
+	tokens   map[string]*cached            // by pod UID
+	slots    map[string]chan struct{}      // by pod UID
+	prewarms map[string]context.CancelFunc // by pod UID
+	// fetches coalesces concurrent fetches for one pod into one call, a
+	// prewarm's and the requests' alike.
 	fetches singleflight.Group
 }
 
@@ -124,16 +150,102 @@ func New(iss issuer.Issuer, broker Relay, cfg Config) *Handler {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Handler{issuer: iss, broker: broker, cfg: cfg, tokens: map[string]*cached{}, slots: map[string]chan struct{}{}}
+	if cfg.FetchDeadline <= 0 {
+		cfg.FetchDeadline = issuer.DefaultDeadline
+	}
+	base, cancel := context.WithCancel(context.Background())
+	return &Handler{
+		issuer: iss, broker: broker, cfg: cfg, base: base, cancel: cancel,
+		tokens: map[string]*cached{}, slots: map[string]chan struct{}{}, prewarms: map[string]context.CancelFunc{},
+	}
 }
 
-// Forget drops what the handler holds for the pod: its token and its slots.
-// The listener registry calls it when the pod's listener closes.
+// Forget drops what the handler holds for the pod: its token and its slots,
+// and stops its prewarm. The listener registry calls it when the pod's
+// listener closes.
 func (h *Handler) Forget(pod listener.Pod) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if cancel, ok := h.prewarms[pod.UID]; ok {
+		cancel()
+		delete(h.prewarms, pod.UID)
+	}
 	delete(h.tokens, pod.UID)
 	delete(h.slots, pod.UID)
+}
+
+// Close stops every prewarm in flight.
+func (h *Handler) Close() { h.cancel() }
+
+// Prewarm starts, in the background, what the pod's first request would do:
+// fetch its JWT-SVID (retrying, within the prewarm's budget, a pod the
+// issuer does not know yet) into the token cache, and call the broker's
+// credentials path once, discarding the answer, so that the broker's cache
+// holds the pod's session when the app asks. The listener registry calls it
+// when it binds a pod's listener; it returns at once. A failure is logged
+// and nothing else: the app's own request takes the path as if no prewarm
+// had run. A request arriving meanwhile joins the prewarm's fetch rather
+// than starting another.
+func (h *Handler) Prewarm(pod listener.Pod) { h.startPrewarm(pod) }
+
+// startPrewarm is Prewarm, returning a channel closed when the prewarm is
+// done (for tests); nil when prewarm is off.
+func (h *Handler) startPrewarm(pod listener.Pod) <-chan struct{} {
+	if h.cfg.PrewarmIssuer == nil {
+		return nil
+	}
+	h.mu.Lock()
+	if cancel, ok := h.prewarms[pod.UID]; ok {
+		cancel()
+	}
+	ctx, cancel := context.WithCancel(h.base)
+	h.prewarms[pod.UID] = cancel
+	h.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer cancel()
+		h.prewarm(ctx, pod)
+	}()
+	return done
+}
+
+// prewarm is one pod's prewarm, logged as one line like a request.
+func (h *Handler) prewarm(ctx context.Context, pod listener.Pod) {
+	start := h.cfg.Now()
+	out := h.warm(ctx, pod)
+	latency := h.cfg.Now().Sub(start).String()
+	if out.err != nil {
+		h.cfg.Logger.Warn("prewarm failed; the pod's first request will take the whole path", "pod", pod.String(),
+			"spiffe_id", out.spiffeID, "latency", latency, "error", out.err)
+		return
+	}
+	h.cfg.Logger.Info("prewarm", "pod", pod.String(), "spiffe_id", out.spiffeID, "status", out.status,
+		"cache", out.cache, "latency", latency)
+}
+
+// warm fetches the pod's token and asks the broker once. The body is read
+// to the end, so the connection is reused, and dropped: the agent never
+// holds credentials (design 7.3).
+func (h *Handler) warm(ctx context.Context, pod listener.Pod) outcome {
+	v, err, _ := h.fetches.Do(pod.UID, func() (any, error) { return h.fetch(ctx, h.cfg.PrewarmIssuer, pod) })
+	if err != nil {
+		return outcome{err: fmt.Errorf("%s: %w", reasonOf(err), err)}
+	}
+	tok := v.(*cached)
+	out := outcome{spiffeID: tok.id}
+	resp, err := h.broker.Get(ctx, CredentialsPath, tok.token)
+	if err != nil {
+		out.err = fmt.Errorf("%s: %w", ReasonBrokerUnavailable, err)
+		return out
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBody))
+	out.status, out.cache = resp.StatusCode, resp.Header.Get("Cracha-Cache")
+	if resp.StatusCode != http.StatusOK {
+		out.err = fmt.Errorf("the broker answered %d (%s)", resp.StatusCode, resp.Header.Get(HeaderReason))
+	}
+	return out
 }
 
 // ServeHTTP implements http.Handler.
@@ -233,6 +345,14 @@ func reasonOf(err error) string {
 
 // token returns the pod's JWT-SVID: the cached one while it is more than
 // refreshBefore from expiry, else a fresh one from the issuer.
+//
+// One fetch per pod at a time: the requests a pod fires together share it,
+// and so does a request arriving during the pod's prewarm. The fetch is
+// detached from the request that started it, so that one client going away
+// does not fail the others (the issuer's retry deadline still bounds it),
+// and a request waits for it no longer than the fetch deadline (and a
+// slack): past that, a prewarm still waiting for the issuer to learn of the
+// pod is the 503 issuer_not_ready the request's own fetch would have been.
 func (h *Handler) token(ctx context.Context, pod listener.Pod) (*cached, error) {
 	now := h.cfg.Now()
 	h.mu.Lock()
@@ -241,19 +361,28 @@ func (h *Handler) token(ctx context.Context, pod listener.Pod) (*cached, error) 
 	if ok && tok.expiry.After(now.Add(refreshBefore)) {
 		return tok, nil
 	}
-	// One fetch per pod at a time: the requests a pod fires together share
-	// it, and the retries within the deadline happen once.
-	v, err, _ := h.fetches.Do(pod.UID, func() (any, error) { return h.fetch(ctx, pod) })
-	if err != nil {
-		return nil, err
+	ch := h.fetches.DoChan(pod.UID, func() (any, error) {
+		return h.fetch(context.WithoutCancel(ctx), h.issuer, pod)
+	})
+	wait, cancel := context.WithTimeout(ctx, h.cfg.FetchDeadline+joinSlack)
+	defer cancel()
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		return res.Val.(*cached), nil
+	case <-wait.Done():
+		return nil, issuer.NewError(issuer.NotFoundYet,
+			fmt.Errorf("the pod's JWT-SVID was still being fetched after %s", h.cfg.FetchDeadline))
 	}
-	return v.(*cached), nil
 }
 
-// fetch asks the issuer and caches the answer.
-func (h *Handler) fetch(ctx context.Context, pod listener.Pod) (*cached, error) {
+// fetch asks iss and caches the answer, unless ctx was cancelled first: a
+// prewarm stopped by Forget leaves nothing behind for a pod that is gone.
+func (h *Handler) fetch(ctx context.Context, iss issuer.Issuer, pod listener.Pod) (*cached, error) {
 	ref := issuer.PodRef{Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID}
-	raw, expiry, err := h.issuer.FetchJWTSVID(ctx, ref, h.cfg.Audience)
+	raw, expiry, err := iss.FetchJWTSVID(ctx, ref, h.cfg.Audience)
 	if err != nil {
 		return nil, err
 	}
@@ -263,8 +392,11 @@ func (h *Handler) fetch(ctx context.Context, pod listener.Pod) (*cached, error) 
 	}
 	tok := &cached{token: raw, id: id, expiry: expiry}
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if ctx.Err() != nil {
+		return nil, issuer.NewError(issuer.Unavailable, fmt.Errorf("the fetch was stopped: %w", ctx.Err()))
+	}
 	h.tokens[pod.UID] = tok
-	h.mu.Unlock()
 	return tok, nil
 }
 

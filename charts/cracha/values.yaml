@@ -335,6 +335,17 @@ agent:
   # Keep it under the SDKs' request timeouts.
   fetchDeadline: 3s
 
+  # Prewarm (design 7.2): when a pod's listener is bound (at enrolment, in
+  # either mode, and when the agent re-binds it on start), the agent runs
+  # the pod's first request in the background: it fetches the pod's
+  # JWT-SVID, retrying for up to 30 s while the issuer learns of the new
+  # pod, and calls the broker once, discarding the answer. The broker then
+  # holds the pod's session in its cache (design 6.7) and the app's first
+  # request is a cache hit instead of an STS call; enrolment never waits
+  # for it, and a failure is only logged. The agent keeps no credentials
+  # either way. false leaves the first request to do it all.
+  prewarm: true
+
   # The broker (design 7.3): its URL, empty for the broker Service of this
   # release, https://<name>-broker.<namespace>.svc:<broker.port>; the
   # SPIFFE ID it must present, verified instead of any DNS name or CA: a

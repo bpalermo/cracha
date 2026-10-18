@@ -31,6 +31,11 @@ const (
 	DefaultHealthz   = ":9799"
 	DefaultCNISocket = "/run/cracha/cni.sock"
 	DefaultCRISocket = "/run/containerd/containerd.sock"
+	// DefaultPrewarmDeadline is how long a prewarm retries a pod the issuer
+	// does not know yet: the seconds a new pod's entry takes to reach the
+	// node's issuer agent, with room for a slow sync. It bounds only the
+	// background prewarm; a request keeps its fetch deadline.
+	DefaultPrewarmDeadline = 30 * time.Second
 )
 
 // config is the agent's configuration, from its flags.
@@ -48,6 +53,8 @@ type config struct {
 	brokerTimeout    time.Duration
 	audience         string
 	fetchDeadline    time.Duration
+	prewarm          bool
+	prewarmDeadline  time.Duration
 	perPodLimit      int
 	recoveryInterval time.Duration
 	healthz          string
@@ -68,6 +75,8 @@ func (c *config) flags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.brokerTimeout, "broker-timeout", broker.DefaultTimeout, "how long one call to the broker may take")
 	fs.StringVar(&c.audience, "audience", credentials.DefaultAudience, "audience of the JWT-SVIDs fetched for pods")
 	fs.DurationVar(&c.fetchDeadline, "fetch-deadline", issuer.DefaultDeadline, "how long one request retries a pod the issuer does not know yet or an unavailable issuer before answering 503 (agent.fetchDeadline)")
+	fs.BoolVar(&c.prewarm, "prewarm", true, "when a pod's listener is bound, fetch its JWT-SVID and call the broker once in the background, so that its first request is a broker cache hit (agent.prewarm)")
+	fs.DurationVar(&c.prewarmDeadline, "prewarm-deadline", DefaultPrewarmDeadline, "how long a prewarm retries a pod the issuer does not know yet or an unavailable issuer")
 	fs.IntVar(&c.perPodLimit, "per-pod-limit", credentials.DefaultPerPodLimit, "requests in flight allowed per pod")
 	fs.DurationVar(&c.recoveryInterval, "recovery-interval", recovery.DefaultInterval, "how often the listeners that could not be bound are retried")
 	fs.StringVar(&c.healthz, "healthz", DefaultHealthz, "address of the /healthz and /readyz endpoints (empty disables them)")
@@ -122,8 +131,13 @@ func newComponents(_ context.Context, cfg config, client kubernetes.Interface, l
 		return nil, err
 	}
 	iss := issuer.WithRetry(c.spire, issuer.RetryPolicy{Deadline: cfg.fetchDeadline}, log)
-	c.credentials = credentials.New(iss, c.broker, credentials.Config{Audience: cfg.audience, PerPodLimit: cfg.perPodLimit, Logger: log})
-	c.registry = listener.New(netns.Loopback{Port: cfg.port}, listener.WithLogger(log), listener.WithCloseHook(c.credentials.Forget))
+	credCfg := credentials.Config{Audience: cfg.audience, PerPodLimit: cfg.perPodLimit, FetchDeadline: cfg.fetchDeadline, Logger: log}
+	if cfg.prewarm {
+		credCfg.PrewarmIssuer = issuer.WithRetry(c.spire, issuer.RetryPolicy{Deadline: cfg.prewarmDeadline}, log)
+	}
+	c.credentials = credentials.New(iss, c.broker, credCfg)
+	c.registry = listener.New(netns.Loopback{Port: cfg.port}, listener.WithLogger(log),
+		listener.WithCloseHook(c.credentials.Forget), listener.WithBindHook(c.credentials.Prewarm))
 	enroller := enrol.NewEnroller(client, c.registry, log)
 	c.enrolServer = enrol.NewServer(tokenreview.NewKubernetes(client), enroller, c.cri, enrol.ServerConfig{Port: cfg.port, Logger: log})
 	c.cniServer = cniserver.New(enroller, cfg.port, log)
@@ -137,6 +151,9 @@ func newComponents(_ context.Context, cfg config, client kubernetes.Interface, l
 func (c *components) close() {
 	if c.registry != nil {
 		_ = c.registry.CloseAll()
+	}
+	if c.credentials != nil {
+		c.credentials.Close()
 	}
 	if c.spire != nil {
 		_ = c.spire.Close()
