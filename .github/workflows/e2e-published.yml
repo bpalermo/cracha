@@ -1,0 +1,61 @@
+name: e2e-published
+
+# The end-to-end suite against a chart that was published, with the images
+# it pins, instead of the chart and images built from the checkout: what
+# e2e/run.sh does with E2E_CHART set. Run by hand, with the version to test:
+# a snapshot of main (<VERSION>-dev.<commit time>.g<commit>, what the
+# publish workflow's `check` job reports as CHART_VERSION) or a release
+# candidate's chart before the real tag is pushed (AGENTS.md, "Releasing").
+# The suite itself, SPIRE, the grants, the STS stand-in and the suite's own
+# images come from the checkout the workflow runs on, so run it from the
+# ref whose suite matches the chart: main for a snapshot of main, the
+# candidate's commit for a candidate.
+#
+# The cluster is created the way ci.yml's e2e job creates its own, and
+# e2e/run.sh reuses it. Third-party actions are pinned to commit SHAs, with
+# the version beside each.
+on:
+  workflow_dispatch:
+    inputs:
+      chart_version:
+        description: "The published chart version to test (helm pull --version)"
+        required: true
+        type: string
+      authz:
+        description: "The broker's authorization backend (E2E_AUTHZ of e2e/run.sh)"
+        required: true
+        type: choice
+        options: [static, spicedb]
+        default: static
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: e2e (kind, published chart, ${{ inputs.authz }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # The caches are only saved from main, as in ci.yml: a dispatch can
+      # target any branch.
+      - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
+
+      # e2e/run.sh uses a cluster of this name if one exists.
+      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          cluster_name: cracha-e2e
+
+      - name: e2e/run.sh against the published chart
+        env:
+          E2E_CHART: ${{ inputs.chart_version }}
+          E2E_AUTHZ: ${{ inputs.authz }}
+        run: e2e/run.sh --config=ci

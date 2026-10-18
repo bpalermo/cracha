@@ -18,6 +18,18 @@
 # mode, the port-forward and the key from the environment (.bazelrc's
 # test:e2e); those that need SpiceDB skip in static mode.
 #
+# E2E_CHART=<version> runs the suite against a published chart instead of
+# the one built here: the package is pulled from the registry
+# bazel/registry.bzl names, at that version, with the same pinned helm, and
+# installed as it is, with the images it pins (public, on the registry; the
+# node pulls them). The checkout's broker, csi and webhook images are then
+# neither built nor loaded and e2e/values-local.yaml is not passed; the
+# suite's own images (e2e/client, e2e/stsstub) still are. The log starts
+# with the chart's digest and the image references it pins, so it says what
+# was tested. Everything else is the same: the suite, SPIRE, the bundle and
+# the STS stand-in come from this checkout, so run it from a checkout whose
+# suite matches the chart.
+#
 # Needs docker, kind, kubectl and openssl on PATH (the cluster is created
 # from the node image in e2e/kind-node-image); helm, grantc and the
 # reconciler come from Bazel (@helm//:helm, the version MODULE.bazel pins,
@@ -29,6 +41,7 @@ cd "$(dirname "$0")/.."
 
 cluster="${KIND_CLUSTER:-cracha-e2e}"
 authz="${E2E_AUTHZ:-static}"
+chart_version="${E2E_CHART:-}"
 case "${authz}" in
 static | spicedb) ;;
 *)
@@ -38,31 +51,75 @@ static | spicedb) ;;
 esac
 # <image name>=<load target>: the go_image load targets and the names they
 # load under (their load_tag), which e2e/values-local.yaml, the STS stand-in
-# manifest and the tests use.
+# manifest and the tests use. Against a published chart only the suite's
+# own: the chart's images are the ones it pins.
 images=(
-	cracha-broker=//broker:image_load
-	cracha-csi=//csi:image_load
-	cracha-webhook=//webhook:image_load
 	cracha-e2e-stsstub=//e2e/stsstub:image_load
 	cracha-e2e-client=//e2e/client:image_load
 )
+if [[ -z "${chart_version}" ]]; then
+	images=(
+		cracha-broker=//broker:image_load
+		cracha-csi=//csi:image_load
+		cracha-webhook=//webhook:image_load
+		"${images[@]}"
+	)
+fi
 
 created=0
 kubeconfig="$(mktemp)"
 certs="$(mktemp -d)"
 bundle="$(mktemp -d)"
 spicedb="$(mktemp -d)"
+pulled="$(mktemp -d)"
 port_forward=""
 cleanup() {
 	if [[ -n "${port_forward}" ]]; then
 		kill "${port_forward}" 2>/dev/null || true
 	fi
-	rm -rf "${kubeconfig}" "${certs}" "${bundle}" "${spicedb}"
+	rm -rf "${kubeconfig}" "${certs}" "${bundle}" "${spicedb}" "${pulled}"
 	if [[ "${created}" == 1 && "${E2E_KEEP_CLUSTER:-0}" != 1 ]]; then
 		kind delete cluster --name "${cluster}"
 	fi
 }
 trap cleanup EXIT
+
+# The tools from Bazel and the chart: the one Bazel builds from this
+# checkout, installed below with the images loaded here (values-local.yaml),
+# or, with E2E_CHART, the published one at that version, pulled with the
+# same pinned helm (no helm on PATH needed) and installed with the images it
+# pins. helm prints the digest of the manifest it pulled; that and the pins
+# (read the way the publish workflow's check reads them, bazel/chart-pin.sh)
+# are the record of what was tested, first in the log and before a cluster
+# exists.
+chart_targets=(//charts/cracha:cracha)
+if [[ -n "${chart_version}" ]]; then
+	chart_targets=()
+fi
+bazel build "$@" "${chart_targets[@]}" @helm//:helm //grantc //reconciler
+bin="$(bazel info "$@" bazel-bin)"
+execroot="$(bazel info "$@" execution_root)"
+helm="${execroot}/$(bazel cquery "$@" @helm//:helm --output=files 2>/dev/null)"
+grantc="${execroot}/$(bazel cquery "$@" //grantc --output=files 2>/dev/null)"
+reconciler="${execroot}/$(bazel cquery "$@" //reconciler --output=files 2>/dev/null)"
+chart_values=(--values e2e/values-local.yaml)
+chart="${bin}/charts/cracha/cracha.tgz"
+if [[ -n "${chart_version}" ]]; then
+	chart_values=()
+	repository="$(bazel/registry.sh chart-ref cracha)"
+	"${helm}" pull "oci://${repository}" --version "${chart_version}" --destination "${pulled}" 2>&1 | tee "${pulled}/pull.log"
+	digest="$(sed -n 's/^Digest: \(sha256:[0-9a-f]\{64\}\)$/\1/p' "${pulled}/pull.log" | tail -1)"
+	chart="${pulled}/cracha-${chart_version}.tgz"
+	if [[ -z "${digest}" || ! -s "${chart}" ]]; then
+		echo "e2e: helm pull of oci://${repository} ${chart_version} reported no digest or left no package at ${chart}" >&2
+		exit 1
+	fi
+	echo "e2e: testing the published chart ${repository}:${chart_version}@${digest}"
+	for component in broker csi webhook; do
+		ref="$(bazel/registry.sh ref "${component}")"
+		echo "e2e: the chart pins ${ref}@$(bazel/chart-pin.sh "${chart}" cracha "${ref}")"
+	done
+fi
 
 # The node image is e2e/kind-node-image, the one ci.yml gives
 # helm/kind-action too. An existing cluster (one kept with E2E_KEEP_CLUSTER=1,
@@ -88,23 +145,6 @@ done
 
 # The identity issuer, with the entries of every component and test workload.
 e2e/spire.sh
-
-# Install the chart Bazel builds, with Bazel's pinned helm (no helm on PATH
-# needed). e2e/values.yaml is the suite's configuration; values-local.yaml
-# points every image at the ones just loaded. The release is created or
-# upgraded in place, so a kept cluster is reused.
-#
-# The chart's TLS mode is left at generated: it makes a CA of its own and
-# issues the broker's and the webhook's certificates from it, and the test
-# workloads are handed that CA below (SSL_CERT_FILE, not AWS_CA_BUNDLE:
-# design 6.5). The CA lives in the Secret cracha-ca, which an upgrade keeps.
-bazel build "$@" //charts/cracha:cracha @helm//:helm //grantc //reconciler
-bin="$(bazel info "$@" bazel-bin)"
-execroot="$(bazel info "$@" execution_root)"
-helm="${execroot}/$(bazel cquery "$@" @helm//:helm --output=files 2>/dev/null)"
-grantc="${execroot}/$(bazel cquery "$@" //grantc --output=files 2>/dev/null)"
-reconciler="${execroot}/$(bazel cquery "$@" //reconciler --output=files 2>/dev/null)"
-chart="${bin}/charts/cracha/cracha.tgz"
 
 # The grants, the production way (design 6.2): the bundle is compiled from
 # e2e/grants, signed with a throwaway P-256 key, published in the layout the
@@ -189,9 +229,16 @@ if [[ "${authz}" == spicedb ]]; then
 fi
 export E2E_AUTHZ="${authz}"
 
+# Install the chart. e2e/values.yaml is the suite's configuration. The
+# release is created or upgraded in place, so a kept cluster is reused.
+#
+# The chart's TLS mode is left at generated: it makes a CA of its own and
+# issues the broker's and the webhook's certificates from it, and the test
+# workloads are handed that CA below (SSL_CERT_FILE, not AWS_CA_BUNDLE:
+# design 6.5). The CA lives in the Secret cracha-ca, which an upgrade keeps.
 "${helm}" upgrade --install cracha "${chart}" \
 	--namespace cracha-system --create-namespace \
-	--values e2e/values.yaml --values e2e/values-local.yaml \
+	--values e2e/values.yaml "${chart_values[@]}" \
 	--values "${bundle}/values.yaml" --set-file broker.bundle.verifyKey="${bundle}/pub.pem" \
 	"${authz_values[@]}" \
 	--wait --timeout 300s
@@ -201,8 +248,9 @@ export E2E_AUTHZ="${authz}"
 kubectl apply -f e2e/manifests/stsstub.yaml
 
 # The image tag is fixed, so on a kept cluster restart every workload to make
-# it pick up the images just loaded. The STS stub starts with an empty record
-# either way.
+# it pick up the images just loaded (against a published chart its workloads
+# are pinned by digest and the restart changes nothing). The STS stub starts
+# with an empty record either way.
 workloads=(daemonset/cracha-csi deployment/cracha-broker deployment/cracha-webhook deployment/cracha-stsstub)
 for workload in "${workloads[@]}"; do
 	kubectl rollout restart "${workload}" -n cracha-system

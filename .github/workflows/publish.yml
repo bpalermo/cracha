@@ -441,8 +441,8 @@ jobs:
   # digest `publish` pushed; then every digest and its signature are verified
   # again, this time with no credential at all, as a consumer would. A
   # release is announced only once its artifacts pass. The end-to-end suite
-  # does not run here: e2e/run.sh deploys the chart and images built from the
-  # checkout, not a published chart.
+  # does not run here: e2e-published.yml runs it against a published chart
+  # by hand, with the version this job reports.
   check:
     name: check what was published
     needs: publish
