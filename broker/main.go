@@ -9,8 +9,9 @@
 // (--health-listen). Grants come from the signed, polled bundle grantc
 // publishes (--bundle-source, broker/internal/bundle) or, for development,
 // from a resolved-grants fixture file (--grants-fixture); the
-// authorization backend is the static assignments file or SpiceDB
-// (--authz-backend, authz.go), and the credential cache (design 6.7) wraps
+// authorization backend is the static one, its assignments from a file or
+// from the same publication as the bundle (--assignments-source), or
+// SpiceDB (--authz-backend, authz.go), and the credential cache (design 6.7) wraps
 // the issuer unless --cache=false. Revocation comes later. Configuration
 // is by flags, each with a CRACHA_* environment fallback (see config.go).
 package main
@@ -91,7 +92,7 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("aws config: %w", err)
 	}
 
-	src, err := newGrantSource(ctx, cfg, awsCfg, log)
+	src, err := newGrantSource(ctx, cfg, awsCfg, store.assignments, log)
 	if err != nil {
 		return err
 	}

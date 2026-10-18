@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/bpalermo/cracha/broker/internal/authz"
+	"github.com/bpalermo/cracha/common/grant"
+	"gopkg.in/yaml.v3"
 )
 
 const file = `
@@ -247,5 +249,119 @@ func TestJSONFile(t *testing.T) {
 func TestLoadMissing(t *testing.T) {
 	if _, err := Load(t.TempDir() + "/missing.yaml"); err == nil {
 		t.Fatal("loaded a missing file")
+	}
+}
+
+// A store with no assignments yet denies everything: an error, not an
+// empty answer.
+func TestEmptyStoreDenies(t *testing.T) {
+	s := NewEmpty()
+	ctx := context.Background()
+	if _, err := s.ListGrants(ctx, authz.Subject{ID: "prod/payments/ledger"}, authz.Consistency{}); err == nil {
+		t.Error("ListGrants on an empty store answered")
+	}
+	if _, err := s.Check(ctx, authz.Subject{ID: "prod/payments/ledger"}, "payments-ledger-rw", authz.Consistency{}); err == nil {
+		t.Error("Check on an empty store answered")
+	}
+	if s.Token() != "" {
+		t.Errorf("Token = %q", s.Token())
+	}
+}
+
+func TestSwap(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := NewEmpty()
+	changes, err := s.Watch(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	subject := authz.Subject{ID: "prod/payments/ledger"}
+	first, err := Build(File{Services: []Service{{Name: "svc", Team: "t", Members: []string{subject.ID}, Grants: []Assignment{{Name: "g1"}}}}}, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Swap(first)
+	if c := receive(t, changes); c.Token != "t1" || c.Subject.ID != "" || c.Grant != "" {
+		t.Errorf("change after the first swap = %+v, want every subject at t1", c)
+	}
+	d, err := s.ListGrants(ctx, subject, authz.Consistency{})
+	if err != nil || !reflect.DeepEqual(d.Grants, []string{"g1"}) || d.Token != "t1" {
+		t.Errorf("ListGrants after the first swap = %+v, %v", d, err)
+	}
+
+	second, err := Build(File{Workloads: []Workload{{Subject: subject.ID, Grants: []Assignment{{Name: "g2"}}}}}, "t2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Swap(second)
+	if c := receive(t, changes); c.Token != "t2" {
+		t.Errorf("change after the second swap = %+v", c)
+	}
+	d, err = s.ListGrants(ctx, subject, authz.Consistency{})
+	if err != nil || !reflect.DeepEqual(d.Grants, []string{"g2"}) || d.Token != "t2" || d.Tags["service"] != "" {
+		t.Errorf("ListGrants after the second swap = %+v, %v", d, err)
+	}
+	if _, err := s.ListGrants(ctx, subject, authz.Consistency{AtLeastAsFresh: "t1"}); err == nil {
+		t.Error("answered at least as fresh as a token swapped out")
+	}
+
+	// The same snapshot again is no change.
+	s.Swap(second)
+	select {
+	case c := <-changes:
+		t.Errorf("a change for a swap to the same token: %+v", c)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// A watcher that comes back behind is told at once.
+	late, err := s.Watch(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := receive(t, late); c.Token != "t2" {
+		t.Errorf("change for a watcher behind = %+v", c)
+	}
+
+	cancel()
+	for range changes {
+	}
+}
+
+func receive(t *testing.T, ch <-chan authz.Change) authz.Change {
+	t.Helper()
+	select {
+	case c, ok := <-ch:
+		if !ok {
+			t.Fatal("watch closed")
+		}
+		return c
+	case <-time.After(5 * time.Second):
+		t.Fatal("no change")
+	}
+	return authz.Change{}
+}
+
+// The published document is the file it stands for, field for field: the
+// store built from it answers as the store parsed from the file does.
+func TestFromAssignments(t *testing.T) {
+	published := &grant.Assignments{
+		Version: "v1", GeneratedAt: "2026-01-01T00:00:00Z",
+		Services: []grant.AssignedService{{
+			Name: "payments-api", Team: "payments", Members: []string{"prod/payments/ledger", "prod/payments/worker"},
+			Grants: []grant.BoundedGrant{{Name: "payments-ledger-rw"}, {Name: "prod-only", Clusters: []string{"prod-a", "prod-b"}}},
+		}},
+		Workloads: []grant.AssignedWorkload{
+			{Subject: "prod/payments/ledger", Grants: []grant.BoundedGrant{{Name: "break-glass", ExpiresAt: "2026-06-01T00:00:00Z"}, {Name: "payments-ledger-rw"}}},
+			{Subject: "prod/payments/suspended", Suspended: true, Grants: []grant.BoundedGrant{{Name: "payments-ledger-rw"}}},
+			{Subject: "prod/payments/lonely", Grants: []grant.BoundedGrant{{Name: "cluster-and-time", Clusters: []string{"prod-a"}, ExpiresAt: "2026-06-01T00:00:00Z"}}},
+		},
+	}
+	var parsed File
+	if err := yaml.Unmarshal([]byte(file), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if got := FromAssignments(published); !reflect.DeepEqual(got, parsed) {
+		t.Errorf("FromAssignments =\n%+v\nwant the file's\n%+v", got, parsed)
 	}
 }

@@ -1,11 +1,17 @@
 // Package bundle is the broker's production source of grants: a
 // grants.Source backed by the compiled, signed bundle grantc publishes
-// (docs/design.md, section 6.2, and common/grant's publication layout).
+// (docs/design.md, section 6.2, and common/grant's publication layout),
+// and, when the static authorization backend reads its assignments from
+// the same publication, the source of those too.
 //
 // A [Source] polls a [Fetcher] (a local directory or an S3 prefix), verifies
 // the signature over the exact published bytes with a grant.Verifier, parses
 // the bundle strictly and swaps the whole grant set atomically when the
-// version changed. Anything that fails to fetch, verify or parse is rejected
+// version changed. With an [AssignmentsSink] it does the same with the
+// version's assignments document, and a version is put in service only
+// when both verified and parsed: the pair is swapped together, and a
+// version that lacks its assignments, or whose assignments fail, is
+// rejected whole. Anything that fails to fetch, verify or parse is rejected
 // with a logged reason and the bundle in service stays: the broker never
 // fails open. Until a first bundle has loaded the source holds nothing,
 // Lookup finds no grant, Version is empty and Ready reports the reason, so
@@ -43,10 +49,11 @@ type snapshot struct {
 
 // Source is a grants.Source that serves the last good bundle.
 type Source struct {
-	fetcher  Fetcher
-	verifier grant.Verifier
-	interval time.Duration
-	log      *slog.Logger
+	fetcher     Fetcher
+	verifier    grant.Verifier
+	interval    time.Duration
+	log         *slog.Logger
+	assignments AssignmentsSink
 
 	current atomic.Pointer[snapshot]
 
@@ -60,6 +67,17 @@ type Source struct {
 	lastErr      error
 }
 
+// AssignmentsSink takes the assignments of each version the source puts
+// in service: the static authorization backend's store, when it reads its
+// assignments from the publication.
+type AssignmentsSink interface {
+	// Prepare checks a version's verified, parsed assignments (data is
+	// their published bytes) and returns the function that puts them in
+	// service. It changes nothing in service itself: a version whose
+	// bundle fails after its assignments prepared is not committed.
+	Prepare(a *grant.Assignments, data []byte) (commit func(), err error)
+}
+
 // Options configure a Source.
 type Options struct {
 	// PollInterval is how often Run looks for a new version; zero means
@@ -67,6 +85,9 @@ type Options struct {
 	PollInterval time.Duration
 	// Log receives swaps and rejections; nil means slog.Default().
 	Log *slog.Logger
+	// Assignments, when set, has every version's assignments fetched,
+	// verified and handed to it with the bundle; nil leaves them unread.
+	Assignments AssignmentsSink
 }
 
 // New makes a Source over a fetcher and the verifier its publications must
@@ -78,7 +99,7 @@ func New(fetcher Fetcher, verifier grant.Verifier, opts Options) *Source {
 	if opts.Log == nil {
 		opts.Log = slog.Default()
 	}
-	return &Source{fetcher: fetcher, verifier: verifier, interval: opts.PollInterval, log: opts.Log}
+	return &Source{fetcher: fetcher, verifier: verifier, interval: opts.PollInterval, log: opts.Log, assignments: opts.Assignments}
 }
 
 // Lookup implements grants.Source. Nothing is found until a bundle loads.
@@ -138,38 +159,73 @@ func (s *Source) jittered() time.Duration {
 }
 
 // Reload fetches, verifies and parses the current publication once and,
-// when it is a new version, puts it in service. A rejected publication is
-// logged (once per publication) and returned; the bundle in service, if
-// any, is untouched.
+// when it is a new version, puts it in service: its bundle and, with an
+// AssignmentsSink, its assignments, both or neither. A rejected
+// publication is logged (once per publication) and returned; what is in
+// service, if anything, is untouched.
 func (s *Source) Reload(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	fetched, err := s.fetcher.Fetch(ctx)
+	fetched, err := s.fetcher.Fetch(ctx, s.assignments != nil)
 	if err != nil {
 		return s.reject("fetch:"+err.Error(), "", fmt.Errorf("fetch: %w", err))
 	}
-	key := fetched.Version + "@" + grant.Digest(fetched.Bundle)
+	key := fetched.Version + "@" + grant.Digest(fetched.Bundle) + "@" + grant.Digest(fetched.Assignments)
 	b, err := s.verifyAndParse(ctx, fetched)
 	if err != nil {
 		return s.reject(key, fetched.Version, err)
 	}
-	s.lastRejected, s.lastErr = "", nil
 	old := s.current.Load()
 	if old != nil && old.version == b.Version {
+		s.lastRejected, s.lastErr = "", nil
 		return nil
+	}
+	commit, counts, err := s.prepareAssignments(ctx, fetched)
+	if err != nil {
+		return s.reject(key, fetched.Version, fmt.Errorf("assignments: %w", err))
 	}
 	snap, err := convert(b)
 	if err != nil {
 		return s.reject(key, fetched.Version, err)
 	}
+	s.lastRejected, s.lastErr = "", nil
 	s.current.Store(snap)
+	commit()
 	oldVersion := ""
 	if old != nil {
 		oldVersion = old.version
 	}
-	s.log.Info("grant bundle loaded", "old_version", oldVersion, "new_version", snap.version,
-		"grants", len(snap.grants), "generated_at", b.GeneratedAt)
+	attrs := []any{"old_version", oldVersion, "new_version", snap.version, "grants", len(snap.grants), "generated_at", b.GeneratedAt}
+	s.log.Info("grant bundle loaded", append(attrs, counts...)...)
 	return nil
+}
+
+// prepareAssignments verifies, parses and prepares the fetched version's
+// assignments, when the source has a sink; it returns the commit and what
+// to log about them. Without a sink the commit does nothing.
+func (s *Source) prepareAssignments(ctx context.Context, f *Fetched) (func(), []any, error) {
+	if s.assignments == nil {
+		return func() {}, nil, nil
+	}
+	sig, err := grant.ParseSignature(f.AssignmentsSignature)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := s.verifier.Verify(ctx, f.Assignments, sig); err != nil {
+		return nil, nil, fmt.Errorf("signature: %w", err)
+	}
+	a, err := grant.ParseAssignments(f.Assignments)
+	if err != nil {
+		return nil, nil, err
+	}
+	if a.Version != f.Version {
+		return nil, nil, fmt.Errorf("assignments say version %q, the pointer %q", a.Version, f.Version)
+	}
+	commit, err := s.assignments.Prepare(a, f.Assignments)
+	if err != nil {
+		return nil, nil, err
+	}
+	return commit, []any{"services", len(a.Services), "workloads", len(a.Workloads)}, nil
 }
 
 // verifyAndParse checks a fetched publication the way grantc verify does,

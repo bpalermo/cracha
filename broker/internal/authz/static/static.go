@@ -1,7 +1,13 @@
 // Package static is the "static" authorization backend of docs/design.md,
-// section 6.3: assignments held in memory, loaded from a file, for
-// bootstrap, air-gapped or tiny installs. Signature verification of the file
-// is not part of this slice; the file's SHA-256 is its consistency token.
+// section 6.3: assignments held in memory, for bootstrap, air-gapped or
+// tiny installs, from one of two sources. A file (Load), read once, for
+// development, whose SHA-256 is the consistency token. Or the assignments
+// document of the signed publication the grant bundle comes from
+// (common/grant's Assignments, converted by FromAssignments), which the
+// bundle poller verifies and hands to Swap with the bundle of the same
+// version; the token is then the SHA-256 of the published bytes, so every
+// swap is a new token, and Watch reports each swap as a change of every
+// subject.
 //
 // The file is YAML (JSON is YAML, so a JSON file works too) with this shape:
 //
@@ -32,12 +38,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bpalermo/cracha/broker/internal/authz"
+	"github.com/bpalermo/cracha/common/grant"
 	"gopkg.in/yaml.v3"
 )
 
@@ -69,6 +79,27 @@ type Assignment struct {
 	ExpiresAt string   `yaml:"expiresAt"`
 }
 
+// FromAssignments is the published assignments document as the file it
+// stands for: field for field, the version and generatedAt left out.
+func FromAssignments(a *grant.Assignments) File {
+	f := File{Services: make([]Service, 0, len(a.Services)), Workloads: make([]Workload, 0, len(a.Workloads))}
+	for _, s := range a.Services {
+		f.Services = append(f.Services, Service{Name: s.Name, Team: s.Team, Members: s.Members, Grants: fromBounded(s.Grants)})
+	}
+	for _, w := range a.Workloads {
+		f.Workloads = append(f.Workloads, Workload{Subject: w.Subject, Suspended: w.Suspended, Grants: fromBounded(w.Grants)})
+	}
+	return f
+}
+
+func fromBounded(gs []grant.BoundedGrant) []Assignment {
+	out := make([]Assignment, 0, len(gs))
+	for _, g := range gs {
+		out = append(out, Assignment{Name: g.Name, Clusters: g.Clusters, ExpiresAt: g.ExpiresAt})
+	}
+	return out
+}
+
 // Option configures a Store.
 type Option func(*Store)
 
@@ -78,10 +109,21 @@ func WithClock(now func() time.Time) Option {
 	return func(s *Store) { s.now = now }
 }
 
-// Store is the static backend. It implements authz.Store.
+// Store is the static backend. It implements authz.Store and
+// authz.Watcher.
 type Store struct {
+	now     func() time.Time
+	current atomic.Pointer[Snapshot]
+
+	// mu guards the watchers.
+	mu       sync.Mutex
+	watchers map[chan authz.Change]struct{}
+}
+
+// Snapshot is one set of assignments, built and checked ahead of the swap
+// that puts it in service, and immutable after.
+type Snapshot struct {
 	token     authz.Token
-	now       func() time.Time
 	workloads map[string]*workload
 }
 
@@ -121,28 +163,128 @@ func Parse(data []byte, opts ...Option) (*Store, error) {
 	if err := dec.Decode(&f); err != nil {
 		return nil, fmt.Errorf("parse: %w", err)
 	}
+	return New(f, TokenOf(data), opts...)
+}
+
+// TokenOf is the consistency token of a document: its hex SHA-256.
+func TokenOf(data []byte) authz.Token {
 	sum := sha256.Sum256(data)
-	return New(f, authz.Token(hex.EncodeToString(sum[:])), opts...)
+	return authz.Token(hex.EncodeToString(sum[:]))
 }
 
 // New builds a store from an already parsed file and the token to report.
 func New(f File, token authz.Token, opts ...Option) (*Store, error) {
-	s := &Store{token: token, now: time.Now, workloads: map[string]*workload{}}
+	snap, err := Build(f, token)
+	if err != nil {
+		return nil, err
+	}
+	s := NewEmpty(opts...)
+	s.current.Store(snap)
+	return s, nil
+}
+
+// NewEmpty makes a store that holds no assignments until the first Swap:
+// until then every question is answered with an error, which is a deny.
+func NewEmpty(opts ...Option) *Store {
+	s := &Store{now: time.Now, watchers: map[chan authz.Change]struct{}{}}
 	for _, o := range opts {
 		o(s)
 	}
-	if err := s.addServices(f.Services); err != nil {
+	return s
+}
+
+// Build checks a file and makes the snapshot a Swap puts in service.
+func Build(f File, token authz.Token) (*Snapshot, error) {
+	snap := &Snapshot{token: token, workloads: map[string]*workload{}}
+	if err := snap.addServices(f.Services); err != nil {
 		return nil, err
 	}
-	if err := s.addWorkloads(f.Workloads); err != nil {
+	if err := snap.addWorkloads(f.Workloads); err != nil {
 		return nil, err
 	}
-	return s, nil
+	return snap, nil
+}
+
+// Token returns the snapshot's consistency token.
+func (snap *Snapshot) Token() authz.Token { return snap.token }
+
+// Swap puts a snapshot in service, atomically: a question is answered
+// wholly from the old snapshot or wholly from the new one. Every watcher
+// is told that every subject may have changed.
+func (s *Store) Swap(snap *Snapshot) {
+	old := s.current.Swap(snap)
+	if old != nil && old.token == snap.token {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for ch := range s.watchers {
+		notify(ch, authz.Change{Token: snap.token})
+	}
+}
+
+// Prepare builds the snapshot of a published assignments document (data
+// is its bytes, whose SHA-256 is the snapshot's token) and returns the
+// Swap that puts it in service: the bundle source's assignments sink
+// (broker/internal/bundle), which commits it together with the bundle of
+// the same version.
+func (s *Store) Prepare(a *grant.Assignments, data []byte) (func(), error) {
+	snap, err := Build(FromAssignments(a), TokenOf(data))
+	if err != nil {
+		return nil, err
+	}
+	return func() { s.Swap(snap) }, nil
+}
+
+// notify sends a change without blocking. A watcher's buffer holds one
+// change; one already waiting there says what a second would (every
+// subject changed), so the second is dropped.
+func notify(ch chan authz.Change, c authz.Change) {
+	select {
+	case ch <- c:
+	default:
+	}
+}
+
+// Watch implements authz.Watcher: a change naming no subject, which the
+// cache takes as every subject, after each Swap, and at once when the
+// store is no longer at since (a swap the caller missed). The channel
+// closes when ctx ends.
+func (s *Store) Watch(ctx context.Context, since authz.Token) (<-chan authz.Change, error) {
+	ch := make(chan authz.Change, 1)
+	s.mu.Lock()
+	s.watchers[ch] = struct{}{}
+	if cur := s.current.Load(); since != "" && cur != nil && cur.token != since {
+		notify(ch, authz.Change{Token: cur.token})
+	}
+	s.mu.Unlock()
+	out := make(chan authz.Change)
+	go func() {
+		defer close(out)
+		defer func() {
+			s.mu.Lock()
+			delete(s.watchers, ch)
+			s.mu.Unlock()
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case c := <-ch:
+				select {
+				case out <- c:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return out, nil
 }
 
 // addServices loads the services section: every member of a service takes
 // its name and team as tags and its grants as assignments.
-func (s *Store) addServices(services []Service) error {
+func (snap *Snapshot) addServices(services []Service) error {
 	for i, svc := range services {
 		if svc.Name == "" {
 			return fmt.Errorf("services[%d]: name is required", i)
@@ -152,7 +294,7 @@ func (s *Store) addServices(services []Service) error {
 			return fmt.Errorf("service %q: %w", svc.Name, err)
 		}
 		for _, member := range svc.Members {
-			if err := s.addMember(svc, member, as); err != nil {
+			if err := snap.addMember(svc, member, as); err != nil {
 				return err
 			}
 		}
@@ -162,11 +304,11 @@ func (s *Store) addServices(services []Service) error {
 
 // addMember enrols one member in a service. A workload is a member of at
 // most one service.
-func (s *Store) addMember(svc Service, member string, as []assignment) error {
+func (snap *Snapshot) addMember(svc Service, member string, as []assignment) error {
 	if member == "" {
 		return fmt.Errorf("service %q: empty member", svc.Name)
 	}
-	w := s.workload(member)
+	w := snap.workload(member)
 	if w.service != "" {
 		return fmt.Errorf("workload %q is a member of services %q and %q; at most one is allowed", member, w.service, svc.Name)
 	}
@@ -177,7 +319,7 @@ func (s *Store) addMember(svc Service, member string, as []assignment) error {
 
 // addWorkloads loads the workloads section: direct assignments and the
 // suspension flag, each subject listed at most once.
-func (s *Store) addWorkloads(workloads []Workload) error {
+func (snap *Snapshot) addWorkloads(workloads []Workload) error {
 	seen := map[string]bool{}
 	for i, wl := range workloads {
 		if wl.Subject == "" {
@@ -191,18 +333,18 @@ func (s *Store) addWorkloads(workloads []Workload) error {
 		if err != nil {
 			return fmt.Errorf("workload %q: %w", wl.Subject, err)
 		}
-		w := s.workload(wl.Subject)
+		w := snap.workload(wl.Subject)
 		w.suspended = wl.Suspended
 		w.assignments = append(w.assignments, as...)
 	}
 	return nil
 }
 
-func (s *Store) workload(subject string) *workload {
-	w, ok := s.workloads[subject]
+func (snap *Snapshot) workload(subject string) *workload {
+	w, ok := snap.workloads[subject]
 	if !ok {
 		w = &workload{}
-		s.workloads[subject] = w
+		snap.workloads[subject] = w
 	}
 	return w
 }
@@ -226,16 +368,28 @@ func convert(in []Assignment, source string) ([]assignment, error) {
 	return out, nil
 }
 
-// Token returns the store's consistency token.
+// errEmpty is the answer of a store that holds no assignments yet.
+var errEmpty = errors.New("static: no assignments loaded yet")
+
+// Token returns the store's consistency token; empty before the first
+// Swap.
 func (s *Store) Token() authz.Token {
-	return s.token
+	if snap := s.current.Load(); snap != nil {
+		return snap.token
+	}
+	return ""
 }
 
-func (s *Store) checkConsistency(c authz.Consistency) error {
-	if c.AtLeastAsFresh != "" && c.AtLeastAsFresh != s.token {
-		return fmt.Errorf("static: cannot answer at least as fresh as %q: this store is at %q", c.AtLeastAsFresh, s.token)
+// snapshot is the snapshot in service for a question at consistency c.
+func (s *Store) snapshot(c authz.Consistency) (*Snapshot, error) {
+	snap := s.current.Load()
+	if snap == nil {
+		return nil, errEmpty
 	}
-	return nil
+	if c.AtLeastAsFresh != "" && c.AtLeastAsFresh != snap.token {
+		return nil, fmt.Errorf("static: cannot answer at least as fresh as %q: this store is at %q", c.AtLeastAsFresh, snap.token)
+	}
+	return snap, nil
 }
 
 // ListGrants implements authz.Store.
@@ -243,13 +397,14 @@ func (s *Store) ListGrants(ctx context.Context, subject authz.Subject, c authz.C
 	if err := ctx.Err(); err != nil {
 		return authz.Decision{}, err
 	}
-	if err := s.checkConsistency(c); err != nil {
+	snap, err := s.snapshot(c)
+	if err != nil {
 		return authz.Decision{}, err
 	}
-	d := authz.Decision{Token: s.token, Tags: map[string]string{}}
-	w, ok := s.workloads[subject.ID]
+	d := authz.Decision{Token: snap.token, Tags: map[string]string{}}
+	w, ok := snap.workloads[subject.ID]
 	if !ok {
-		d.Trace = append(d.Trace, "subject "+subject.ID+" is not in the assignments file")
+		d.Trace = append(d.Trace, "subject "+subject.ID+" is not in the assignments")
 		return d, nil
 	}
 	if w.suspended {

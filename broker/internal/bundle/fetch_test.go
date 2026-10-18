@@ -78,7 +78,7 @@ func (f *fakeS3) GetObject(_ context.Context, in *s3.GetObjectInput, _ ...func(*
 func publishToFake(t *testing.T, f *fakeS3, prefix string, data []byte, sig *grant.Signature) {
 	t.Helper()
 	put := &fakePut{objects: f.objects}
-	if _, err := grant.NewS3Publisher(put, f.bucket, prefix).Publish(context.Background(), data, sig); err != nil {
+	if _, err := grant.NewS3Publisher(put, f.bucket, prefix).Publish(context.Background(), grant.Publication{Bundle: data, BundleSignature: sig}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -105,7 +105,7 @@ func TestS3Fetcher(t *testing.T) {
 	publishToFake(t, fake, "/cracha/prod/", data, sig)
 
 	f := NewS3(fake, "grants", "/cracha/prod/")
-	got, err := f.Fetch(context.Background())
+	got, err := f.Fetch(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,11 +133,11 @@ func TestS3Fetcher(t *testing.T) {
 	// A bucket without a prefix, and an unreachable bucket.
 	fake2 := &fakeS3{bucket: "grants", objects: map[string][]byte{}}
 	publishToFake(t, fake2, "", data, sig)
-	if got, err := NewS3(fake2, "grants", "").Fetch(context.Background()); err != nil || got.Version != "abc123" || fake2.keys[0] != "latest" {
+	if got, err := NewS3(fake2, "grants", "").Fetch(context.Background(), false); err != nil || got.Version != "abc123" || fake2.keys[0] != "latest" {
 		t.Errorf("no prefix: %+v, %v, keys %v", got, err, fake2.keys)
 	}
 	fake2.err = errors.New("AccessDenied")
-	if _, err := NewS3(fake2, "grants", "").Fetch(context.Background()); err == nil || !strings.Contains(err.Error(), "AccessDenied") {
+	if _, err := NewS3(fake2, "grants", "").Fetch(context.Background(), false); err == nil || !strings.Contains(err.Error(), "AccessDenied") {
 		t.Errorf("error not passed through: %v", err)
 	}
 }
@@ -150,18 +150,25 @@ func TestPointerIsNotTrusted(t *testing.T) {
 		"other path":      `{"version":"v1","bundle":"../../etc/passwd","signature":"bundles/v1/bundle.json.sig"}`,
 		"other signature": `{"version":"v1","bundle":"bundles/v1/bundle.json","signature":"bundles/v2/bundle.json.sig"}`,
 		"bad version":     `{"version":"../v1","bundle":"v1/bundle.json","signature":"v1/bundle.json.sig"}`,
-		"unknown field":   `{"version":"v1","bundle":"bundles/v1/bundle.json","signature":"bundles/v1/bundle.json.sig","x":1}`,
 		"not json":        `latest: v1`,
 		"missing version": `{"version":"v9","bundle":"bundles/v9/bundle.json","signature":"bundles/v9/bundle.json.sig"}`,
 	} {
 		pub.overwrite(t, grant.LatestFile, []byte(pointer))
-		if _, err := f.Fetch(context.Background()); err == nil {
+		if _, err := f.Fetch(context.Background(), false); err == nil {
 			t.Errorf("%s: the pointer was followed", name)
 		}
 	}
-	pub.overwrite(t, grant.LatestFile, []byte(`{"version":"v1","bundle":"bundles/v1/bundle.json","signature":"bundles/v1/bundle.json.sig"}`))
-	if got, err := f.Fetch(context.Background()); err != nil || got.Version != "v1" {
-		t.Errorf("a well-formed pointer: %+v, %v", got, err)
+	// A field this reader does not know is ignored, so that a later
+	// additive change to the layout does not stop it; only the version is
+	// trusted anyway.
+	for name, pointer := range map[string]string{
+		"well-formed":   `{"version":"v1","bundle":"bundles/v1/bundle.json","signature":"bundles/v1/bundle.json.sig"}`,
+		"unknown field": `{"version":"v1","bundle":"bundles/v1/bundle.json","signature":"bundles/v1/bundle.json.sig","x":1}`,
+	} {
+		pub.overwrite(t, grant.LatestFile, []byte(pointer))
+		if got, err := f.Fetch(context.Background(), false); err != nil || got.Version != "v1" {
+			t.Errorf("%s pointer: %+v, %v", name, got, err)
+		}
 	}
 }
 
@@ -172,5 +179,34 @@ func TestObjectSizeIsBounded(t *testing.T) {
 	}
 	if got, err := readAll(bytes.NewReader(huge[:maxObjectBytes])); err != nil || len(got) != maxObjectBytes {
 		t.Errorf("an object at the limit: %d bytes, %v", len(got), err)
+	}
+}
+
+// The S3 fetcher reads a version's assignments beside its bundle when
+// asked, and fails when they are not there.
+func TestS3FetcherAssignments(t *testing.T) {
+	pub := newPublication(t)
+	bundle, assignments := testBundle(t, "v1", "a"), testAssignments(t, "v1", "a")
+	signer, _ := grant.NewLocalSigner(pub.key)
+	bsig, _ := signer.Sign(context.Background(), bundle)
+	asig, _ := signer.Sign(context.Background(), assignments)
+	fake := &fakeS3{bucket: "grants", objects: map[string][]byte{}}
+	if _, err := grant.NewS3Publisher(&fakePut{objects: fake.objects}, "grants", "p").Publish(context.Background(),
+		grant.Publication{Bundle: bundle, BundleSignature: bsig, Assignments: assignments, AssignmentsSignature: asig}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := NewS3(fake, "grants", "p").Fetch(context.Background(), true)
+	if err != nil || !bytes.Equal(got.Assignments, assignments) || len(got.AssignmentsSignature) == 0 {
+		t.Fatalf("Fetch = %+v, %v", got, err)
+	}
+	if strings.Join(fake.keys, " ") != "p/latest p/bundles/v1/bundle.json p/bundles/v1/bundle.json.sig p/bundles/v1/assignments.json p/bundles/v1/assignments.json.sig" {
+		t.Errorf("keys = %v", fake.keys)
+	}
+	delete(fake.objects, "p/bundles/v1/assignments.json")
+	if _, err := NewS3(fake, "grants", "p").Fetch(context.Background(), true); err == nil || !strings.Contains(err.Error(), "publishes no readable assignments") {
+		t.Errorf("Fetch without assignments = %v", err)
+	}
+	if _, err := NewS3(fake, "grants", "p").Fetch(context.Background(), false); err != nil {
+		t.Errorf("Fetch of the bundle alone = %v", err)
 	}
 }

@@ -33,22 +33,24 @@ type config struct {
 	logLevel          string
 	showVersion       bool
 
-	// The authorization backend (design 6.3): static, the assignments file
-	// (broker/internal/authz/static), or spicedb, the reference backend
-	// (broker/internal/authz/spicedb).
-	authzBackend     string
-	assignments      string
-	spicedbEndpoint  string
-	spicedbTokenFile string
-	spicedbCA        string
-	spicedbInsecure  bool
-	spicedbTimeout   time.Duration
+	// The authorization backend (design 6.3): static
+	// (broker/internal/authz/static), its assignments from a file or from
+	// the publication the bundle comes from (--assignments-source), or
+	// spicedb, the reference backend (broker/internal/authz/spicedb).
+	authzBackend      string
+	assignmentsSource string
+	assignments       string
+	spicedbEndpoint   string
+	spicedbTokenFile  string
+	spicedbCA         string
+	spicedbInsecure   bool
+	spicedbTimeout    time.Duration
 
 	// The compiled grant bundle (broker/internal/bundle), the production
 	// source of grants; --grants-fixture is the development one, and
 	// exactly one of the two is given.
 	bundleSource       string
-	bundleVerifyKey    string
+	bundleVerifyKey    pathList
 	bundleKMSKey       string
 	bundlePollInterval string
 
@@ -153,7 +155,8 @@ func (c *config) bindFlags(fs *flag.FlagSet, env envDefaults) {
 	fs.StringVar(&c.trustDomainLabels, "trust-domain-labels", env.str("trust-domain-labels", ""), "trust domain short labels, <trust-domain>=<label>,...; unmapped domains get td.<name>")
 	fs.StringVar(&c.grantsFixture, "grants-fixture", env.str("grants-fixture", ""), "path to a resolved-grants fixture file, for development; excludes --bundle-source")
 	fs.StringVar(&c.bundleSource, "bundle-source", env.str("bundle-source", ""), "where the compiled grant bundle is published: local:<dir> or s3://bucket[/prefix]; excludes --grants-fixture")
-	fs.StringVar(&c.bundleVerifyKey, "bundle-verify-key", env.str("bundle-verify-key", ""), "path to the PEM public key the bundle's signature is verified with")
+	c.bundleVerifyKey = newPathList(env.str("bundle-verify-key", ""))
+	fs.Var(&c.bundleVerifyKey, "bundle-verify-key", "path to a PEM file of the public key, or keys, the bundle's signature is verified with; repeatable, and any key of any file verifies (the one the signature names), for rotating the signing key; the environment takes a comma-separated list")
 	fs.StringVar(&c.bundleKMSKey, "bundle-kms-key", env.str("bundle-kms-key", ""), "ARN of the KMS key the bundle's signature is verified with, instead of --bundle-verify-key")
 	fs.StringVar(&c.bundlePollInterval, "bundle-poll-interval", env.str("bundle-poll-interval", bundle.DefaultPollInterval.String()), "how often to look for a new bundle version")
 	fs.StringVar(&c.awsRegion, "aws-region", env.str("aws-region", ""), "AWS region for STS; the SDK's default chain when empty")
@@ -165,8 +168,9 @@ func (c *config) bindFlags(fs *flag.FlagSet, env envDefaults) {
 
 // bindAuthzFlags declares the authorization backend's flags (design 6.3).
 func (c *config) bindAuthzFlags(fs *flag.FlagSet, env envDefaults) {
-	fs.StringVar(&c.authzBackend, "authz-backend", env.str("authz-backend", backendStatic), "authorization backend: static (an assignments file) or spicedb")
-	fs.StringVar(&c.assignments, "assignments", env.str("assignments", ""), "path to the static backend's assignments file (required with --authz-backend static)")
+	fs.StringVar(&c.authzBackend, "authz-backend", env.str("authz-backend", backendStatic), "authorization backend: static (assignments from a file or the publication, --assignments-source) or spicedb")
+	fs.StringVar(&c.assignmentsSource, "assignments-source", env.str("assignments-source", assignmentsFile), "where the static backend's assignments come from: file (--assignments, read once) or published (the assignments of the version --bundle-source serves, verified and swapped with its bundle)")
+	fs.StringVar(&c.assignments, "assignments", env.str("assignments", ""), "path to the static backend's assignments file (required with --assignments-source file)")
 	fs.StringVar(&c.spicedbEndpoint, "spicedb-endpoint", env.str("spicedb-endpoint", ""), "SpiceDB gRPC address, host:port (required with --authz-backend spicedb)")
 	fs.StringVar(&c.spicedbTokenFile, "spicedb-token-file", env.str("spicedb-token-file", ""), "path to the file holding SpiceDB's preshared key (required with --authz-backend spicedb)")
 	fs.StringVar(&c.spicedbCA, "spicedb-ca", env.str("spicedb-ca", ""), "path to the PEM bundle SpiceDB's certificate is verified with; the system roots when empty")
@@ -180,10 +184,51 @@ const (
 	backendSpiceDB = "spicedb"
 )
 
+// The static backend's assignment sources.
+const (
+	assignmentsFile      = "file"
+	assignmentsPublished = "published"
+)
+
+// pathList is a repeatable flag of paths. Its default, from the
+// environment, is a comma-separated list, which the first value given on
+// the command line replaces.
+type pathList struct {
+	paths       []string
+	fromDefault bool
+}
+
+func newPathList(def string) pathList {
+	var l pathList
+	for _, p := range strings.Split(def, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			l.paths = append(l.paths, p)
+		}
+	}
+	l.fromDefault = len(l.paths) > 0
+	return l
+}
+
+// String implements flag.Value.
+func (l *pathList) String() string { return strings.Join(l.paths, ",") }
+
+// Set implements flag.Value.
+func (l *pathList) Set(v string) error {
+	if v == "" {
+		return errors.New("empty path")
+	}
+	if l.fromDefault {
+		l.paths, l.fromDefault = nil, false
+	}
+	l.paths = append(l.paths, v)
+	return nil
+}
+
 // authzProblems is what is wrong with the authorization backend flags: the
-// static backend needs its assignments file and none of the SpiceDB flags;
-// the SpiceDB backend needs an endpoint and a token file, no assignments
-// file, at most one of a CA and insecure, and a positive timeout.
+// static backend needs exactly one source of assignments, its file or the
+// publication of --bundle-source, and none of the SpiceDB flags; the
+// SpiceDB backend needs an endpoint and a token file, no assignments of
+// its own, at most one of a CA and insecure, and a positive timeout.
 func (c *config) authzProblems() []string {
 	var problems []string
 	switch c.authzBackend {
@@ -202,8 +247,20 @@ func (c *config) authzProblems() []string {
 
 func (c *config) staticProblems() []string {
 	var problems []string
-	if c.assignments == "" {
-		problems = append(problems, "--assignments is required with --authz-backend static")
+	switch c.assignmentsSource {
+	case assignmentsFile:
+		if c.assignments == "" {
+			problems = append(problems, "--assignments is required with --authz-backend static and --assignments-source file")
+		}
+	case assignmentsPublished:
+		if c.assignments != "" {
+			problems = append(problems, "--assignments and --assignments-source published are exclusive: the assignments come from the publication")
+		}
+		if c.bundleSource == "" {
+			problems = append(problems, "--assignments-source published needs --bundle-source, the publication they come from")
+		}
+	default:
+		problems = append(problems, fmt.Sprintf("--assignments-source %q is not file or published", c.assignmentsSource))
 	}
 	if c.spicedbEndpoint != "" || c.spicedbTokenFile != "" || c.spicedbCA != "" || c.spicedbInsecure {
 		problems = append(problems, "the --spicedb-* flags need --authz-backend spicedb")
@@ -215,6 +272,9 @@ func (c *config) spicedbProblems() []string {
 	var problems []string
 	if c.assignments != "" {
 		problems = append(problems, "--assignments needs --authz-backend static")
+	}
+	if c.assignmentsSource != assignmentsFile {
+		problems = append(problems, "--assignments-source "+c.assignmentsSource+" needs --authz-backend static")
 	}
 	if c.spicedbEndpoint == "" {
 		problems = append(problems, "--spicedb-endpoint is required with --authz-backend spicedb")
@@ -332,7 +392,7 @@ func (c *config) grantsProblems() []string {
 		problems = append(problems, "--grants-fixture and --bundle-source are exclusive")
 	}
 	if c.bundleSource == "" {
-		if c.bundleVerifyKey != "" || c.bundleKMSKey != "" {
+		if len(c.bundleVerifyKey.paths) > 0 || c.bundleKMSKey != "" {
 			problems = append(problems, "--bundle-verify-key and --bundle-kms-key need --bundle-source")
 		}
 		return problems
@@ -343,9 +403,9 @@ func (c *config) grantsProblems() []string {
 	}
 	c.bundle = loc
 	switch {
-	case c.bundleVerifyKey != "" && c.bundleKMSKey != "":
+	case len(c.bundleVerifyKey.paths) > 0 && c.bundleKMSKey != "":
 		problems = append(problems, "--bundle-verify-key and --bundle-kms-key are exclusive")
-	case c.bundleVerifyKey == "" && c.bundleKMSKey == "":
+	case len(c.bundleVerifyKey.paths) == 0 && c.bundleKMSKey == "":
 		problems = append(problems, "--bundle-source needs one of --bundle-verify-key or --bundle-kms-key")
 	}
 	d, err := time.ParseDuration(c.bundlePollInterval)
