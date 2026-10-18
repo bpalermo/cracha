@@ -63,7 +63,10 @@ relationships of `e2e/grants`, and installs the chart with
 pod (design 7.2): `init` (the default, the chart's) has the webhook inject
 the `cracha-enrol` init container; `cni` installs the chart with
 `e2e/values-cni.yaml` on top, which switches the agent to the `cracha-cni`
-plugin. The tests that need SpiceDB (revocation through Watch, suspension,
+plugin. A kept cluster that ran in `cni` mode keeps the plugin chained on
+its node, where it fails every sandbox while no agent serves its socket, so
+run.sh refuses to run it in `init` mode until it is deleted. The tests that
+need SpiceDB (revocation through Watch, suspension,
 the cache's mode) skip in static mode, those that look at one enrolment
 mode's wiring skip in the other; the rest run everywhere, and one of them
 checks that the static document and the grant tree assign the same

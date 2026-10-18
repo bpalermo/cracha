@@ -153,6 +153,17 @@ fi
 kind get kubeconfig --name "${cluster}" >"${kubeconfig}"
 export KUBECONFIG="${kubeconfig}"
 
+# A kept cluster that ran in cni mode has cracha-cni chained in its node's
+# conflist, and the plugin fails every sandbox of the node while nothing
+# serves its socket (design 7.2), which the agent in init mode does not.
+# Nothing here uninstalls it, so such a cluster cannot go back to init.
+if [[ "${enrol}" == init && "${created}" == 0 ]] &&
+	docker exec "${cluster}-control-plane" sh -c 'grep -qs cracha-cni /etc/cni/net.d/*' 2>/dev/null; then
+	echo "e2e: the kept cluster ${cluster} ran in cni mode and keeps the cracha-cni plugin on its node;" >&2
+	echo "e2e: delete it first (kind delete cluster --name ${cluster}) to run E2E_ENROL=init" >&2
+	exit 2
+fi
+
 # The images, built here and loaded into the node. The load target loads the
 # host platform's manifest of the index into the local daemon.
 for image in "${images[@]}"; do
