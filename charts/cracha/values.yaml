@@ -280,12 +280,15 @@ agent:
     cpu: 100m
     memory: 32Mi
 
-
   # With enrol cni: the agent's Unix socket, in a host directory it owns
   # (created 0700, the socket 0600, so only the node's root, which execs the
   # plugin, reaches it), and the node's CNI bin and conf directories the
   # installer writes to: the only host paths the agent image ever writes,
-  # and only in the cni-install init container. The entry it chains is
+  # in the cni-install init container and in the agent container's
+  # cni-retire preStop hook, which takes the plugin off the node again
+  # when the agent is not coming back in cni mode (the chart uninstalled,
+  # or enrol switched to init; a restart, a rollout or a drain leaves it).
+  # The entry it chains is
   # {"type": "cracha-cni", "socket": <cni.socket>, "timeout": "5s"}.
   cni:
     socket: /run/cracha/cni.sock

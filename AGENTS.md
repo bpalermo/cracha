@@ -63,9 +63,11 @@ relationships of `e2e/grants`, and installs the chart with
 pod (design 7.2): `init` (the default, the chart's) has the webhook inject
 the `cracha-enrol` init container; `cni` installs the chart with
 `e2e/values-cni.yaml` on top, which switches the agent to the `cracha-cni`
-plugin. A kept cluster that ran in `cni` mode keeps the plugin chained on
-its node, where it fails every sandbox while no agent serves its socket, so
-run.sh refuses to run it in `init` mode until it is deleted. The tests that
+plugin. A kept cluster switches modes through the chart: the agent going
+retires the plugin from the node (its `preStop` hook, design 7.2), and the
+suite's cni leg checks that switch both ways with `helm upgrade`, through
+the helm and chart package run.sh hands it as `E2E_HELM` and
+`E2E_CHART_PACKAGE`. The tests that
 need SpiceDB (revocation through Watch, suspension,
 the cache's mode) skip in static mode, those that look at one enrolment
 mode's wiring skip in the other; the rest run everywhere, and one of them
@@ -190,8 +192,13 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   mode) copies it into the node's CNI bin directory and chains it after
   the primary plugin of the lexically first conflist of the CNI conf
   directory, with write-fsync-rename and nothing rewritten when already
-  there (`--uninstall` undoes it). `go_image` takes the extra file through
-  its `files` argument.
+  there (`--uninstall` undoes it). `cracha-agent cni-retire`
+  (`agent/internal/cni/retire`, the agent container's `preStop` hook in
+  cni mode) runs that uninstall when the agent is not coming back in cni
+  mode: its DaemonSet gone or being deleted, the DaemonSet's pod template
+  annotation `cracha.dev/enrol` no longer `cni`, or its token refused
+  (401) for the whole budget; on anything else it logs and leaves the
+  plugin. `go_image` takes the extra file through its `files` argument.
 - Code private to a binary goes under its `internal/`. The webhook's
   `internal/mutate` is the admission decision (design 7.5), pure over two
   interfaces: ServiceAccount lookups (`internal/sacache`, a Get remembered
@@ -320,12 +327,24 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   and `agent_test.go` holds it to that. `agent.enrol: cni` renders the
   socket's hostPath for the agent container and the `cni-install` init
   container from the agent image, with `cni.binDir` and `cni.confDir`
-  mounted read-write in it alone (no capability, read-only root): on the
+  mounted read-write (no capability, read-only root): on the
   node it writes `<binDir>/cracha-cni` and rewrites the lexically first
   conflist of `confDir` (kind: `10-kindnet.conflist`) with the entry
   `{"type": "cracha-cni", "socket": <cni.socket>, "timeout": "5s"}`
-  appended to its `plugins`, and touches nothing else; `test/agent-cni.yaml`
-  renders it with non-default directories and `agent_test.go` checks them.
+  appended to its `plugins`, and touches nothing else. The agent container
+  mounts the same two directories read-write in cni mode for one reason:
+  its `preStop` hook, `cracha-agent cni-retire`, which takes the plugin
+  off the node when the agent is not coming back in cni mode (the chart
+  uninstalled, or `agent.enrol` switched: it reads its own DaemonSet,
+  through the Role `get` on that one DaemonSet by name that both modes
+  render, and compares the pod template's annotation `cracha.dev/enrol`,
+  which the template always carries) and leaves it on a restart, a
+  rollout or a drain; `terminationGracePeriodSeconds` is 60 in cni mode
+  to cover the hook. A node that lost its agent pod without the hook (a
+  crash) keeps the plugin: `cracha-agent cni-install --uninstall` once on
+  the node, or the chart installed again in cni mode, fixes it.
+  `test/agent-cni.yaml` renders cni mode with non-default directories and
+  `agent_test.go` checks the installer, the hook, the mounts and the Role.
 - `broker.authz.backend` picks the authorization store: `static` (the
   default) renders the assignments ConfigMap and its mount; `spicedb` takes
   `broker.authz.spicedb` (endpoint, `tokenSecret` naming a Secret the

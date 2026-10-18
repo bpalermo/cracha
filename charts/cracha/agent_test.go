@@ -1,6 +1,7 @@
 package cracha
 
 import (
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -28,6 +29,14 @@ func TestAgentDaemonSetHardening(t *testing.T) {
 	}
 	if init, _ := path(spec, "initContainers").([]any); len(init) != 0 {
 		t.Errorf("initContainers = %v, want none in init mode", init)
+	}
+	// The template says its mode, for the retire hook of a pod that was
+	// in cni mode; the hook itself is cni mode's.
+	if got := path(ds, "spec", "template", "metadata", "annotations", "cracha.dev/enrol"); got != "init" {
+		t.Errorf("template annotation cracha.dev/enrol = %v, want init", got)
+	}
+	if path(containers[0], "lifecycle") != nil {
+		t.Errorf("lifecycle = %v, want none in init mode", path(containers[0], "lifecycle"))
 	}
 	sc := path(containers[0], "securityContext")
 	if got := stringList(path(sc, "capabilities", "add")); !slices.Equal(got, []string{"SYS_ADMIN"}) {
@@ -130,8 +139,10 @@ func TestAgentArgs(t *testing.T) {
 
 // In cni mode the agent's socket directory is mounted for the plugin, the
 // cni-install init container puts the plugin on the node from the agent
-// image with the CNI directories mounted read-write in it alone, and there
-// is no TokenReview.
+// image with the CNI directories mounted read-write, the agent container
+// mounts the same two directories for its cni-retire preStop hook, which
+// reads the DaemonSet the template annotation names the mode of, under a
+// grace period that covers it, and there is no TokenReview.
 func TestAgentCNIMode(t *testing.T) {
 	docs := rendered(t, "cni")
 	ds := object(t, docs, "DaemonSet", "cracha-agent")
@@ -169,21 +180,54 @@ func TestAgentCNIMode(t *testing.T) {
 		t.Errorf("cni-install securityContext = %v", sc)
 	}
 	// The installer mounts the two directories read-write, at their host
-	// paths; the agent container mounts neither.
-	mounted := map[string]string{}
-	for _, m := range mountsOf(init[0]) {
-		if path(m, "readOnly") == true {
-			t.Errorf("cni-install mounts %v read-only", path(m, "name"))
+	// paths, and nothing else; the agent container mounts the same two
+	// read-write for the retire hook (design 7.8).
+	cniMounts := func(container any) map[string]string {
+		mounted := map[string]string{}
+		for _, m := range mountsOf(container) {
+			name, _ := path(m, "name").(string)
+			if name != "cni-bin-dir" && name != "cni-conf-dir" {
+				continue
+			}
+			if path(m, "readOnly") == true {
+				t.Errorf("%v is mounted read-only in %v", name, path(container, "name"))
+			}
+			mounted[name], _ = path(m, "mountPath").(string)
 		}
-		mounted[path(m, "name").(string)], _ = path(m, "mountPath").(string)
+		return mounted
 	}
-	if mounted["cni-bin-dir"] != "/usr/libexec/cni" || mounted["cni-conf-dir"] != "/etc/kubernetes/cni/net.d" || len(mounted) != 2 {
-		t.Errorf("cni-install mounts = %v", mounted)
-	}
-	for _, m := range mountsOf(containers[0]) {
-		if name := path(m, "name"); name == "cni-bin-dir" || name == "cni-conf-dir" {
-			t.Errorf("the agent container mounts %v, which only the installer may", name)
+	want := map[string]string{"cni-bin-dir": "/usr/libexec/cni", "cni-conf-dir": "/etc/kubernetes/cni/net.d"}
+	for _, c := range []any{init[0], containers[0]} {
+		if got := cniMounts(c); !reflect.DeepEqual(got, want) {
+			t.Errorf("%v mounts the CNI directories at %v, want %v", path(c, "name"), got, want)
 		}
+	}
+	if n := len(mountsOf(init[0])); n != 2 {
+		t.Errorf("cni-install has %d mounts, want the two CNI directories alone", n)
+	}
+	// The retire hook, told the DaemonSet and the directories, with the
+	// namespace from the downward API, under a grace period that covers
+	// its 20 s budget; and the template says the mode the hook compares.
+	hook := stringList(path(containers[0], "lifecycle", "preStop", "exec", "command"))
+	for _, want := range []string{"/cracha-agent", "cni-retire", "--daemonset=cracha-agent", "--bin-dir=/usr/libexec/cni", "--conf-dir=/etc/kubernetes/cni/net.d"} {
+		if !slices.Contains(hook, want) {
+			t.Errorf("preStop hook %v lacks %q", hook, want)
+		}
+	}
+	var podNamespace any
+	for _, e := range path(containers[0], "env").([]any) {
+		if path(e, "name") == "POD_NAMESPACE" {
+			podNamespace = path(e, "valueFrom", "fieldRef", "fieldPath")
+		}
+	}
+	if podNamespace != "metadata.namespace" {
+		t.Errorf("POD_NAMESPACE = %v, want metadata.namespace from the downward API", podNamespace)
+	}
+	if grace, _ := path(spec, "terminationGracePeriodSeconds").(int); grace < 40 {
+		t.Errorf("terminationGracePeriodSeconds = %v, want one that covers the hook's 20 s budget and the shutdown", path(spec, "terminationGracePeriodSeconds"))
+	}
+	if got := path(ds, "spec", "template", "metadata", "annotations", "cracha.dev/enrol"); got != "cni" {
+		t.Errorf("template annotation cracha.dev/enrol = %v, want cni", got)
 	}
 	role := object(t, docs, "ClusterRole", "cracha-agent")
 	for _, rule := range path(role, "rules").([]any) {
@@ -231,6 +275,30 @@ func TestAgentClusterRole(t *testing.T) {
 	binding := object(t, rendered(t, "defaults"), "ClusterRoleBinding", "cracha-agent")
 	if path(binding, "subjects", 0, "name") != "cracha-agent" || path(binding, "roleRef", "name") != "cracha-agent" {
 		t.Errorf("binding = %v", binding)
+	}
+}
+
+// The agent's Role, in both modes, grants exactly what the retire hook
+// reads: its own DaemonSet, by name, and nothing else.
+func TestAgentRole(t *testing.T) {
+	for rendering, name := range map[string]string{"defaults": "cracha", "overrides": "custom", "cni": "cracha"} {
+		t.Run(rendering, func(t *testing.T) {
+			docs := rendered(t, rendering)
+			role := object(t, docs, "Role", name+"-agent")
+			rules, _ := path(role, "rules").([]any)
+			if len(rules) != 1 {
+				t.Fatalf("%d rules, want one", len(rules))
+			}
+			rule := rules[0]
+			if g, r, v, n := stringList(path(rule, "apiGroups")), stringList(path(rule, "resources")), stringList(path(rule, "verbs")), stringList(path(rule, "resourceNames")); !slices.Equal(g, []string{"apps"}) || !slices.Equal(r, []string{"daemonsets"}) || !slices.Equal(v, []string{"get"}) || !slices.Equal(n, []string{name + "-agent"}) {
+				t.Errorf("rule = %v, want get on apps/daemonsets named %s-agent", rule, name)
+			}
+			binding := object(t, docs, "RoleBinding", name+"-agent")
+			if path(binding, "roleRef", "kind") != "Role" || path(binding, "roleRef", "name") != name+"-agent" ||
+				path(binding, "subjects", 0, "kind") != "ServiceAccount" || path(binding, "subjects", 0, "name") != name+"-agent" {
+				t.Errorf("binding = %v", binding)
+			}
+		})
 	}
 }
 

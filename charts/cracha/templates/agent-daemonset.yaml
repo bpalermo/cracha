@@ -17,11 +17,20 @@ spec:
       labels:
         {{- include "cracha.labels" . | nindent 8 }}
         app.kubernetes.io/component: agent
-      {{- with .Values.agent.podAnnotations }}
       annotations:
+        # The mode this template selects, which the cni-retire preStop hook
+        # of cni mode reads from the DaemonSet (design 7.2): a template that
+        # no longer says cni retires the plugin from the node.
+        cracha.dev/enrol: {{ $enrol | quote }}
+        {{- with .Values.agent.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
     spec:
+      {{- if eq $enrol "cni" }}
+      # Covers the cni-retire hook (20 s of retrying the apiserver at most,
+      # then the uninstall) and the agent's own shutdown after it.
+      terminationGracePeriodSeconds: 60
+      {{- end }}
       {{- with .Values.agent.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}
@@ -59,8 +68,9 @@ spec:
         # image into the node's CNI bin directory and chains it after the
         # node's primary plugin in its conflist, naming the agent's socket;
         # a second run on a node that has it changes nothing. These two
-        # host directories are the only ones the agent image ever writes,
-        # and only here: the agent container does not mount them.
+        # host directories are the only ones the agent image ever writes:
+        # here, and in the agent container's cni-retire preStop hook below,
+        # which undoes this when the agent is not coming back in cni mode.
         - name: cni-install
           image: {{ include "cracha.image" (dict "root" . "image" .Values.agent.image) }}
           imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
@@ -111,6 +121,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            {{- if eq $enrol "cni" }}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- end }}
           ports:
             {{- if eq $enrol "init" }}
             - name: enrol
@@ -128,6 +144,28 @@ spec:
               path: /readyz
               port: healthz
             periodSeconds: 5
+          {{- if eq $enrol "cni" }}
+          # Retirement (design 7.2): the plugin fails every sandbox of the
+          # node while nothing serves its socket, so when this pod goes for
+          # good the plugin goes with it. The hook reads the DaemonSet (the
+          # Role of agent-rbac.yaml) and runs the installer's uninstall when
+          # it is gone (the chart is being uninstalled) or its template no
+          # longer says cni (agent.enrol changed); a restart, a rollout with
+          # the mode unchanged or a drain leaves the plugin in place. A pod
+          # killed without the hook (a node crash) leaves it too:
+          # `cracha-agent cni-install --uninstall` once on the node, or the
+          # chart installed again in cni mode, puts that right.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /cracha-agent
+                  - cni-retire
+                  - --daemonset={{ include "cracha.name" . }}-agent
+                  - --bin-dir={{ .Values.agent.cni.binDir }}
+                  - --conf-dir={{ .Values.agent.cni.confDir }}
+                  - --log-level={{ include "cracha.logLevel" .Values.agent.logLevel }}
+          {{- end }}
           securityContext:
             # Root, because setns into a pod's network namespace needs
             # CAP_SYS_ADMIN and the runtime grants a container's capabilities
@@ -169,6 +207,13 @@ spec:
             {{- if eq $enrol "cni" }}
             - name: cni-socket-dir
               mountPath: {{ dir .Values.agent.cni.socket }}
+            # The node's CNI directories, writable, for the cni-retire
+            # preStop hook alone (design 7.8): the agent proper never opens
+            # them.
+            - name: cni-bin-dir
+              mountPath: {{ .Values.agent.cni.binDir }}
+            - name: cni-conf-dir
+              mountPath: {{ .Values.agent.cni.confDir }}
             {{- end }}
       volumes:
         - name: cri-socket
@@ -195,9 +240,9 @@ spec:
           hostPath:
             path: {{ dir .Values.agent.cni.socket }}
             type: DirectoryOrCreate
-        # The node's CNI directories, for the installer alone. They exist
-        # on any node with a CNI; a node without one has nothing to chain
-        # into.
+        # The node's CNI directories, for the installer and the retire
+        # hook. They exist on any node with a CNI; a node without one has
+        # nothing to chain into.
         - name: cni-bin-dir
           hostPath:
             path: {{ .Values.agent.cni.binDir }}
