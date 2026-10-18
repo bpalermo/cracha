@@ -158,6 +158,7 @@ go_test(
     srcs = [
         "rbac_test.go",
         "render_test.go",
+        "volumes_test.go",
     ],
     data = [
         ":rendered_defaults",

@@ -227,6 +227,13 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   goes there too. A value every install must give (`broker.cluster`,
   `webhook.defaultRegion`) is `required` in the templates and listed in
   `test/required.yaml`.
+- Helm merges an install's values into the defaults, so a volume source
+  the defaults fill in (`broker.workloadAPI.volume`) is never rendered with
+  `toYaml` of the whole map: an install choosing another source would get
+  both. Such a value is a `type` naming the source beside one map per
+  source, and a helper renders the chosen one only
+  (`cracha.workloadAPIVolumeSource`). `//charts/cracha:cracha_test` fails
+  any rendered volume with two sources, in every rendering it has.
 - The default TLS mode generates a CA at render time, for development and
   kind only: the broker's certificate must be trusted by the workload images
   (design 6.5), so production uses `existing` or `cert-manager`.
