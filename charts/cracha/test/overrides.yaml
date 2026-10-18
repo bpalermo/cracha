@@ -155,6 +155,9 @@ webhook:
   conflictingEnv: strip
   saCacheTTL: 0s
   timeoutSeconds: 5
+  drain: 2s
+  shutdownTimeout: 1m
+  minReadySeconds: 10
   excludedNamespaces:
     - spire
     - kube-system

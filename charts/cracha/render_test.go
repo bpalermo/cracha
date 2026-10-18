@@ -345,6 +345,48 @@ func TestWebhookDeployment(t *testing.T) {
 			}
 		}
 	})
+	// A rollout loses no admission (design 7.5): the new pod is Ready for
+	// minReadySeconds before the old one is told to stop, the old one
+	// drains for webhook.drain and then waits webhook.shutdownTimeout for
+	// what is in flight, and its grace period covers the two with a
+	// margin; no preStop hook is involved.
+	t.Run("rollout", func(t *testing.T) {
+		for _, tc := range []struct {
+			rendering, name              string
+			drain, shutdownTimeout       string
+			minReadySeconds, gracePeriod int
+		}{
+			{"defaults", "cracha-webhook", "5s", "10s", 5, 20},
+			{"overrides", "custom-webhook", "2s", "1m", 10, 67},
+		} {
+			deploy := object(t, rendered(t, tc.rendering), "Deployment", tc.name)
+			if got := path(deploy, "spec", "strategy", "type"); got != "RollingUpdate" {
+				t.Errorf("%s: strategy %v, want RollingUpdate", tc.rendering, got)
+			}
+			if got := path(deploy, "spec", "strategy", "rollingUpdate", "maxUnavailable"); got != 0 {
+				t.Errorf("%s: maxUnavailable %v, want 0", tc.rendering, got)
+			}
+			if got := path(deploy, "spec", "strategy", "rollingUpdate", "maxSurge"); got != 1 {
+				t.Errorf("%s: maxSurge %v, want 1", tc.rendering, got)
+			}
+			if got := path(deploy, "spec", "minReadySeconds"); got != tc.minReadySeconds {
+				t.Errorf("%s: minReadySeconds %v, want %d", tc.rendering, got, tc.minReadySeconds)
+			}
+			if got := path(deploy, "spec", "template", "spec", "terminationGracePeriodSeconds"); got != tc.gracePeriod {
+				t.Errorf("%s: terminationGracePeriodSeconds %v, want %d", tc.rendering, got, tc.gracePeriod)
+			}
+			args := webhookArgs(t, tc.rendering, tc.name)
+			for _, want := range []string{"--drain=" + tc.drain, "--shutdown-timeout=" + tc.shutdownTimeout} {
+				if !slices.Contains(args, want) {
+					t.Errorf("%s: args %q lack %q", tc.rendering, args, want)
+				}
+			}
+			containers, _ := path(deploy, "spec", "template", "spec", "containers").([]any)
+			if len(containers) == 1 && path(containers[0], "lifecycle") != nil {
+				t.Errorf("%s: the container has a lifecycle (%v); the binary drains, not a preStop hook", tc.rendering, path(containers[0], "lifecycle"))
+			}
+		}
+	})
 	t.Run("no TLS Secret", func(t *testing.T) {
 		for _, tc := range []struct{ rendering, name string }{{"defaults", "cracha-webhook"}, {"overrides", "custom-webhook"}} {
 			deploy := object(t, rendered(t, tc.rendering), "Deployment", tc.name)

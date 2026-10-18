@@ -170,3 +170,18 @@ agent's own trust domain, which the agent completes from its SVID.
 /ns/{{ .Release.Namespace }}/sa/{{ include "cracha.name" . }}-broker
 {{- end -}}
 {{- end -}}
+
+{{/*
+A Go duration of whole seconds ("5s", "1m", "1m30s") as a number of seconds,
+for the fields Kubernetes counts in seconds. Anything else fails the render.
+*/}}
+{{- define "cracha.seconds" -}}
+{{- $d := toString . -}}
+{{- if or (eq $d "") (not (regexMatch "^([0-9]+h)?([0-9]+m)?([0-9]+s)?$" $d)) -}}
+{{- fail (printf "%q is not a duration of whole seconds, such as 5s or 1m30s" $d) -}}
+{{- end -}}
+{{- $h := regexFind "[0-9]+h" $d | trimSuffix "h" | int -}}
+{{- $m := regexFind "[0-9]+m" $d | trimSuffix "m" | int -}}
+{{- $s := regexFind "[0-9]+s" $d | trimSuffix "s" | int -}}
+{{ add (mul $h 3600) (mul $m 60) $s }}
+{{- end -}}
