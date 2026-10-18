@@ -356,6 +356,33 @@ func TestDeletedPodListenerCloses(t *testing.T) {
 	t.Logf("agent: %s (netns %s)", closed.Msg, closed.Netns)
 }
 
+// deletePodWhenDone removes the pod at the end of the test and waits for
+// it to be gone: a pod that keeps fetching would share the broker's cache
+// entry with the later tests' pods of the same identity and take their
+// misses.
+func deletePodWhenDone(t *testing.T, name string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		pods := client.CoreV1().Pods(testNamespace)
+		grace := int64(0)
+		if err := pods.Delete(ctx, name, metav1.DeleteOptions{GracePeriodSeconds: &grace}); err != nil {
+			t.Logf("deleting pod %s: %v", name, err)
+			return
+		}
+		err := eventually(ctx, func() error {
+			if _, err := pods.Get(ctx, name, metav1.GetOptions{}); err == nil {
+				return fmt.Errorf("pod %s still terminating", name)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Logf("waiting for pod %s to go: %v", name, err)
+		}
+	})
+}
+
 // An agent restart is hitless (design 7.4): a pod fetching every two
 // seconds is refused while the agent is away, and answered again within
 // restartBudget of the new agent being ready, after it re-bound the pod's
@@ -364,6 +391,7 @@ func TestAgentRestartIsHitless(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 	pod := runFetchingWorkload(ctx, t, "restarted")
+	deletePodWhenDone(t, pod.Name)
 	ref := podRef(pod)
 
 	restartedAt := time.Now()
