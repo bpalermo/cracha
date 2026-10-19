@@ -2,7 +2,8 @@
 # What check-registry-config.sh decides, on fixture checkouts: a tree whose
 # only registry literal is the setting passes; a literal anywhere else, a chart
 # default that is not derived from its image_push, and a setting the parser
-# cannot read each fail the way the script promises (1, 1 and 2).
+# cannot read each fail the way the script promises (1, 1 and 2), and so does
+# an image a BUILD file publishes that registry.sh does not print (1).
 #
 # The script hunts with `git grep`, so each fixture is a git repository with
 # the real scripts, the real setting and the real values.yaml committed.
@@ -21,6 +22,8 @@ fixture() {
 	mkdir -p "$1/bazel" "$1/charts/cracha"
 	cp "${src}/registry.bzl" "${src}/registry.sh" "${src}/check-registry-config.sh" "$1/bazel/"
 	cp "${values}" "$1/charts/cracha/values.yaml"
+	mkdir -p "$1/agent"
+	printf 'go_image(\n    repository = image_repository("agent"),\n)\n' >"$1/agent/BUILD.bazel"
 	git -C "$1" init --quiet .
 	git -C "$1" config user.email test@example.com
 	git -C "$1" config user.name test
@@ -84,6 +87,13 @@ fixture "${spelled}"
 sed -i "s|\"{@//agent:image_push.repository}\"|\"${host}/${namespace}/agent\"|" "${spelled}/charts/cracha/values.yaml"
 commit "${spelled}"
 expect "${spelled}" 1 "a chart default spelled out instead of derived"
+
+unlisted="${work}/unlisted"
+fixture "${unlisted}"
+mkdir -p "${unlisted}/ghost"
+printf 'go_image(\n    repository = image_repository("ghost"),\n)\n' >"${unlisted}/ghost/BUILD.bazel"
+commit "${unlisted}"
+expect "${unlisted}" 1 "an image registry.sh does not print"
 
 unparsable="${work}/unparsable"
 fixture "${unparsable}"

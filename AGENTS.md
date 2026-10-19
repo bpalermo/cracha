@@ -345,7 +345,8 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   account role it would be the role's whole policy.
 - `bazel/` holds build rules; `docs/` the design; `charts/cracha` the Helm
   chart; `e2e/` the end-to-end suite with its values files, the fixtures it
-  deploys beside the chart and the two images only it uses.
+  deploys beside the chart and the two images only it uses; `third_party/`
+  the third-party binaries Crachá builds and publishes (SpiceDB, below).
 
 ## Images and versions
 
@@ -353,7 +354,29 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   may spell it out.
 - Images are built with the `go_image` macro in `bazel/image/defs.bzl`, from
   pure-Go binaries on a digest-pinned distroless base. Image repositories are
-  `broker`, `agent` and `webhook`.
+  `broker`, `agent`, `webhook` and `spicedb`.
+- `spicedb` (`//third_party/spicedb`) is a third-party binary: SpiceDB built
+  from a pinned upstream release (`github.com/authzed/spicedb` in `go.mod`, a
+  `tool`, so nothing imports it) plus one reviewed patch,
+  `0001-mysql-client-tls.patch` (MySQL client TLS:
+  `--datastore-tls-{ca,cert,key}-path`, `--datastore-tls-server-name`,
+  reloaded on rotation). That patch is the only change Crachá makes to
+  SpiceDB; `0002-bazel-build-files.patch` only adds the file it creates to the
+  BUILD file Gazelle generated, since `go_deps.module_override` applies
+  patches after Gazelle runs. The binary is built as upstream's release is
+  (cgo off, the `memoryprotection` tag, `-checklinkname=0`) and `spicedb
+  version` reports `SPICEDB_VERSION` of its BUILD file, the release with a
+  `-cracha.<n>` suffix; `//third_party/spicedb:spicedb_test` checks the
+  version against `go.mod`, the patch's flags, and a schema write and
+  permission check against the binary. To bump SpiceDB: rebase Bruno's fork
+  branch `mysql-client-tls-v<version>` of bpalermo/spicedb onto the new
+  release; regenerate the patch with `git diff v<version>..mysql-client-tls-v<version>`
+  over its non-test Go files; `bazel run @rules_go//go -- get
+  github.com/authzed/spicedb@v<version>`, `bazel mod tidy`; refresh `0002`
+  if Gazelle's BUILD file for the package changed; set `SPICEDB_VERSION` to
+  `v<version>-cracha.1`; and report which shared modules Crachá's own
+  requirements now hold above what that release's `go.mod` asks for. A change
+  to the patch alone bumps the suffix.
 - `VERSION` holds the release being worked towards. Binaries report the commit
   they were built from, stamped by `bazel/workspace_status.sh`.
 
@@ -519,7 +542,7 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 ## Publishing
 
 - Every published coordinate comes from `bazel/registry.bzl`: the registry
-  host, the organization, the three image repositories and the chart's.
+  host, the organization, the four image repositories and the chart's.
   Bazel loads it; shell and the workflows read it through `bazel/registry.sh`
   (`bazel/registry.sh` prints `KEY=VALUE` lines, `bazel/registry.sh ref agent`
   one reference). `bazel/check-registry-config.sh`, run by the `lint` job of
@@ -533,7 +556,7 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   `bazel build --config=ci` before any credential exists on the runner,
   refuses an unstamped chart or a chart whose pins are not the digests it is
   about to push, logs in to the registry once (`docker/login-action`, which
-  `image_push` and cosign both read), pushes the three images, signs each
+  `image_push` and cosign both read), pushes the four images, signs each
   index and its platform manifests keyless by digest with the pinned cosign
   (`cosign sign --recursive`), verifies them before signing (so an unchanged
   digest is not signed twice) and after, then pushes the chart with
@@ -553,8 +576,9 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   `bazel/registry.sh` and the comments of `bazel/registry.bzl`, the build
   lists of `ci.yml` and `publish.yml` (build, push, record, sign, verify,
   check, release notes) and, if the chart deploys it, `values.yaml`, the
-  chart's `images` and `PINNED_COMPONENTS`, and
-  `bazel/check-registry-config.sh`.
+  chart's `images` and `PINNED_COMPONENTS`, and the chart loop of
+  `bazel/check-registry-config.sh`, which fails an image a BUILD file
+  publishes that `bazel/registry.sh` does not print.
 - On a `v*` tag the `grantc` job of `publish.yml` builds
   `//grantc:grantc_{linux_amd64,linux_arm64,darwin_arm64}` (`go_cross_binary`
   of the pure-Go, stamped `//grantc`; `//grantc:release_binaries_test`
