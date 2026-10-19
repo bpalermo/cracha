@@ -1,8 +1,13 @@
 definition team {}
 
 definition service {
-  relation owner: team
+  relation team: team
   relation member: workload
+  relation owner: workload | service#member
+  relation approver: workload | service#member
+  relation sensitive: workload:*
+  permission manage = owner
+  permission approve = approver + owner
 }
 
 definition workload {
@@ -36,6 +41,11 @@ definition s3_bucket {
   relation writer: workload | workload with within_window | workload with in_clusters | workload with bounded | service#member | service#member with within_window | service#member with in_clusters | service#member with bounded
   permission write = writer
   permission read = reader + writer
+  relation owner: workload | service#member
+  relation approver: workload | service#member
+  relation sensitive: workload:*
+  permission manage = owner
+  permission approve = approver + owner
 }
 
 definition dynamodb_table {
@@ -43,4 +53,17 @@ definition dynamodb_table {
   relation writer: workload | workload with within_window | workload with in_clusters | workload with bounded | service#member | service#member with within_window | service#member with in_clusters | service#member with bounded
   permission write = writer
   permission read = reader + writer
+  relation owner: workload | service#member
+  relation approver: workload | service#member
+  relation sensitive: workload:*
+  permission manage = owner
+  permission approve = approver + owner
+}
+
+caveat pending_payload(request string) {
+  request != ""
+}
+
+definition pending_request {
+  relation target: s3_bucket with pending_payload | dynamodb_table with pending_payload | service with pending_payload
 }

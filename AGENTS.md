@@ -58,12 +58,17 @@ CA anywhere in the suite. `E2E_AUTHZ` picks the broker's authorization
 backend: `static` (the default) reads the assignments published with the
 bundle, and a test republishes a changed copy of the tree (grantc from the
 runfiles, the key from `E2E_BUNDLE_KEY`) and watches the running broker
-take it; `spicedb` also deploys SpiceDB from
-`e2e/manifests/spicedb.yaml` (memory datastore, plaintext gRPC, a preshared
-key the script makes), runs `cracha-reconciler` built from the checkout on
-the host through a `kubectl port-forward` to write the schema and the
-relationships of `e2e/grants`, and installs the chart with
-`e2e/values-spicedb.yaml` on top. `E2E_ENROL` picks how the agent enrols a
+take it; `spicedb` installs the chart with `e2e/values-spicedb.yaml` on
+top, which deploys the chart's SpiceDB (memory datastore, one replica)
+behind its SPIFFE gateway with a preshared key the script makes, has the
+SPIRE server mint X.509-SVIDs for the identities the suite plays (broker,
+access, reconciler and one the gateway does not know; `spire-server x509
+mint`, handed to the tests as `E2E_SPICEDB_SVIDS`) and runs
+`cracha-reconciler schema` built from the checkout on the host through a
+`kubectl port-forward` to the gateway; the suite writes its relationships
+(`e2e/spicedb_access_test.go`, the relationships `e2e/grants` gives the
+static mode) as the access identity, and checks the gateway's method table
+identity by identity. `E2E_ENROL` picks how the agent enrols a
 pod (design 7.2): `init` (the default, the chart's) has the webhook inject
 the `cracha-enrol` init container; `cni` installs the chart with
 `e2e/values-cni.yaml` on top, which switches the agent to the `cracha-cni`
@@ -73,7 +78,7 @@ suite's cni leg checks that switch both ways with `helm upgrade`, through
 the helm and chart package run.sh hands it as `E2E_HELM` and
 `E2E_CHART_PACKAGE`. The tests that
 need SpiceDB (revocation through Watch, suspension,
-the cache's mode) skip in static mode, those that look at one enrolment
+the cache's mode, the gateway) skip in static mode, those that look at one enrolment
 mode's wiring skip in the other; the rest run everywhere, and one of them
 checks that the static document and the grant tree assign the same
 things. `e2e/client` is the workload: the AWS SDK with the injected
@@ -241,8 +246,8 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   validation, templates, lints, the compiled bundle and assignments,
   signing (one key or a `KeyRing` of several) and publishing. Who holds
   what is `ResolveAssignments` and `ResolveAccess`, the one mapping from
-  Services, Assignments and Access documents that both the published
-  assignments document and the reconciler's relationships come from.
+  Services, Assignments and Access documents that the published
+  assignments document comes from.
   Its source tree holds five kinds: `Account` (an AWS account's account
   role, the default envelope of its grants and its access table, whose
   entries compile into implicit lookup grants named
@@ -269,8 +274,11 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   through `idenc.Resource`.
 - `common/spicedb` is the SpiceDB schema (design 6.4), embedded from
   `schema.zed`, and the constants for every object type, relation,
-  permission, caveat and caveat context key in it: the broker's adapter and
-  the reconciler spell nothing in the schema twice.
+  permission, caveat and caveat context key in it: the broker's adapter,
+  the access service and the reconciler spell nothing in the schema twice.
+  `common/spicedb/conn` is how every client dials SpiceDB: SPIFFE mTLS to
+  the gateway with its own X.509-SVID, the gateway verified by SPIFFE ID,
+  no preshared key. `common/spiffetest` mints test SVIDs.
 - `grantc/` is the grant compiler CLI over `common/grant` (lint, compile,
   sign, verify, publish); it runs in CI and has no container image. The
   grants themselves are not in this repository: they live in the private
@@ -285,19 +293,21 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   source serves, swapped with its bundle; its Watch reports every swap as
   a change of every subject) or `spicedb`
   (`broker/internal/authz/spicedb`, the adapter over the reference model of
-  design 6.4: the preshared key is read from `--spicedb-token-file`, never a
-  flag value; every query carries the caveat context `now` and `cluster`;
+  design 6.4: it dials the gateway with its own SVID
+  (`--spicedb-endpoint`, `--spicedb-server-spiffe-id`) and holds no key;
+  the gateway admits it to reads only; every query carries the caveat context `now` and `cluster`;
   every error is a deny; its Watch feeds the cache). The contract both
   answer is `broker/internal/authz`, `LookupResources` included, and the
   SpiceDB tests hold the adapter to the static backend's answers for the
   same assignments and access.
-- `reconciler/` is `cracha-reconciler`, the `authz-reconciler` writer of
-  design 6.4: `schema` writes the embedded schema, `apply` makes SpiceDB's
-  relationships match a grant source tree (`reconciler/internal/reconcile`
-  computes the desired set and the diff; `reconciler/internal/fakespicedb`
-  is the in-memory SpiceDB its tests use). Like `grantc` it runs from CI or
-  an operator's machine and has no container image; the e2e will run it
-  from the host against a port-forwarded SpiceDB.
+- `reconciler/` is `cracha-reconciler`, which writes the SpiceDB schema
+  (design 6.4) through the gateway with an SVID from the Workload API
+  (`-workload-api`) or from files (`-svid`, `-svid-key`, `-bundle`), and
+  reads it back. It writes no relationship: with the spicedb backend they
+  live only in SpiceDB and the access service is their one writer; `apply`
+  refuses with that message. Like `grantc` it runs from CI or an
+  operator's machine and has no container image; the e2e runs it from the
+  host through a port-forward to the gateway.
 - The broker's transport is `broker/internal/mtls` (design 6.5): the TLS
   configuration over go-spiffe (`tlsconfig.MTLSServerConfig`, the agent's
   ID the only one authorised, so any other client fails at the handshake),
@@ -416,11 +426,18 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   the assignments ConfigMap and its mount, and with `published` neither
   (the broker reads them from `broker.bundle.source`, which it needs;
   `test/assignments-published.yaml` renders it, since the overrides render
-  SpiceDB); `spicedb` takes
-  `broker.authz.spicedb` (endpoint, `tokenSecret` naming a Secret the
-  operator keeps, whose key is mounted as a file and never put in the
-  environment, an optional `ca` the chart puts in a ConfigMap, `insecure`
-  for kind only, `timeout`).
+  SpiceDB); `spicedb` takes `broker.authz.spicedb` (the gateway's
+  `endpoint` and `serverSpiffeID`, both defaulting to the chart's own, and
+  `timeout`) and renders `spicedb.*` unless `spicedb.enabled` is false:
+  SpiceDB and the Envoy gateway in one pod (SpiceDB on the loopback, the
+  key from `spicedb.presharedKeySecret`, mounted by that pod alone; Envoy
+  the one listener, its SVID from the SPIRE agent's SDS, its RBAC the
+  method table of design 6.4 generated from `spicedb.gateway`), the
+  datastore (`memory`, `mysql`, `postgres`, the URI from a Secret, an
+  optional CA and Postgres client certificate) and the migration Job.
+  `spicedb_test.go` holds the RBAC to exactly the three identities with
+  exactly their methods. The SpiceDB and Envoy images are pinned by hand,
+  by tag and digest, in `values.yaml`, the only place either is spelled.
 - Brokers verify the publication with the signing key's PEM and need no
   KMS access: a KMS signature's `keyId` is its public key's identity, the
   same a local verifier of the exported PEM computes (`aws kms

@@ -1,9 +1,11 @@
 // Package spicedb holds the SpiceDB schema of the reference authorization
 // backend (docs/design.md, section 6.4) and the names in it, so that the
 // broker's adapter, which queries it, and the reconciler, which writes to
-// it, share one spelling of every object type, relation, permission, caveat
-// and caveat context key. The schema itself is schema.zed, embedded
-// verbatim; the reconciler's schema command writes it to SpiceDB.
+// the access service, which writes its relationships, and the reconciler,
+// which writes the schema, share one spelling of every object type,
+// relation, permission, caveat and caveat context key. The schema itself is
+// schema.zed, embedded verbatim; the reconciler's schema command writes it
+// to SpiceDB.
 //
 // Object IDs: a workload's is its authorization subject encoding of design
 // 4.3 (common/idenc), whose charset is a subset of SpiceDB's object ID
@@ -29,7 +31,18 @@ const (
 	TypeGrant         = "grant"
 	TypeS3Bucket      = "s3_bucket"
 	TypeDynamoDBTable = "dynamodb_table"
+	// DefinitionPendingRequest is a write request awaiting approval, one
+	// relationship to its target (RelationTarget) with the request in its
+	// caveat context (CaveatPendingPayload). Written and read only by
+	// cracha-access; the broker never reads it.
+	DefinitionPendingRequest = "pending_request"
 )
+
+// ManagedTypes are the object types the write path manages (design 6.4):
+// each has the relations RelationOwner, RelationApprover and
+// RelationSensitive, and the permissions PermissionManage and
+// PermissionApprove. The broker never reads them.
+var ManagedTypes = []string{TypeService, TypeS3Bucket, TypeDynamoDBTable}
 
 // ResourceTypes are the object types of the resources a workload is
 // related to by name (Level 3): each has the relations RelationReader and
@@ -42,8 +55,9 @@ var ResourceTypes = []string{TypeS3Bucket, TypeDynamoDBTable}
 
 // Relations.
 const (
-	// RelationOwner is service#owner: the team that owns a service.
-	RelationOwner = "owner"
+	// RelationTeam is service#team: the team that owns a service, its
+	// team tag.
+	RelationTeam = "team"
 	// RelationMember is service#member: a workload of a service.
 	RelationMember = "member"
 	// RelationSuspended is workload#suspended: a suspended workload, whose
@@ -61,6 +75,20 @@ const (
 	// resource type (Level 3).
 	RelationWriter = "writer"
 	RelationReader = "reader"
+	// RelationOwner and RelationApprover are the relations of every managed
+	// type (ManagedTypes): the workloads, or a service's members, who
+	// manage the object's relationships and who approve a request to
+	// change them.
+	RelationOwner    = "owner"
+	RelationApprover = "approver"
+	// RelationSensitive flags a managed object as sensitive: the
+	// relationship <type>:<id>#sensitive@workload:*, read with
+	// ReadRelationships. Its subject is the wildcard, so the flag is a
+	// property of the object, not of any workload.
+	RelationSensitive = "sensitive"
+	// RelationTarget is pending_request#target: the object a pending
+	// request would change.
+	RelationTarget = "target"
 )
 
 // Permissions.
@@ -73,6 +101,10 @@ const (
 	// resource type (Level 3).
 	PermissionWrite = "write"
 	PermissionRead  = "read"
+	// PermissionManage is owner, and PermissionApprove approver or owner,
+	// on every managed type: an owner may approve.
+	PermissionManage  = "manage"
+	PermissionApprove = "approve"
 )
 
 // Caveats. A relationship carries at most one caveat, so a bound on time
@@ -81,6 +113,9 @@ const (
 	CaveatWithinWindow = "within_window"
 	CaveatInClusters   = "in_clusters"
 	CaveatBounded      = "bounded"
+	// CaveatPendingPayload carries a pending request on its target
+	// relationship, under CaveatContextRequest.
+	CaveatPendingPayload = "pending_payload"
 )
 
 // Caveat context keys. ContextExpiresAt (an RFC 3339 timestamp) and
@@ -92,6 +127,9 @@ const (
 	ContextNow       = "now"
 	ContextAllowed   = "allowed"
 	ContextCluster   = "cluster"
+	// CaveatContextRequest is the JSON of a pending request, stored on the
+	// relationship of CaveatPendingPayload.
+	CaveatContextRequest = "request"
 )
 
 // TeamNone is the team object a suspended workload without a service is

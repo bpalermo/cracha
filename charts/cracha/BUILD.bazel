@@ -106,8 +106,9 @@ helm_lint_test(
 )
 
 # The bundle source's other two verification keys: KMS, and a Secret the
-# install keeps (test/overrides.yaml renders the inline key); the SpiceDB
-# backend over plaintext (overrides renders it with a CA); the static backend
+# install keeps (test/overrides.yaml renders the inline key); the chart's
+# SpiceDB on the memory datastore and on postgres with a client certificate
+# (overrides renders mysql), and an external gateway; the static backend
 # with an assignments ConfigMap the install keeps (the defaults render the
 # chart's own), and with its assignments from the publication (the
 # overrides render SpiceDB, which takes none).
@@ -122,7 +123,9 @@ helm_lint_test(
         "assignments-published",
         "bundle-kms",
         "bundle-secret",
-        "spicedb-insecure",
+        "spicedb-external",
+        "spicedb-memory",
+        "spicedb-postgres",
         "static-configmap",
     ]
 ]
@@ -163,6 +166,14 @@ helm_template_test(
             "published",
             REQUIRED_VALUES + ["test/assignments-published.yaml"],
         ),
+        (
+            "spicedb_memory",
+            REQUIRED_VALUES + ["test/spicedb-memory.yaml"],
+        ),
+        (
+            "spicedb_postgres",
+            REQUIRED_VALUES + ["test/spicedb-postgres.yaml"],
+        ),
     ]
 ]
 
@@ -174,6 +185,7 @@ go_test(
         "assignments_test.go",
         "rbac_test.go",
         "render_test.go",
+        "spicedb_test.go",
         "volumes_test.go",
     ],
     data = [
@@ -182,6 +194,8 @@ go_test(
         ":rendered_overrides",
         ":rendered_pod_labels",
         ":rendered_published",
+        ":rendered_spicedb_memory",
+        ":rendered_spicedb_postgres",
     ],
     deps = [
         "@in_gopkg_yaml_v3//:yaml_v3",

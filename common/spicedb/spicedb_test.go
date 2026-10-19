@@ -2,6 +2,7 @@ package spicedb
 
 import (
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -26,7 +27,7 @@ func TestSchemaNames(t *testing.T) {
 		"definition " + TypeGrant + " {",
 		"definition " + TypeS3Bucket + " {",
 		"definition " + TypeDynamoDBTable + " {",
-		"relation " + RelationOwner + ": " + TypeTeam,
+		"relation " + RelationTeam + ": " + TypeTeam,
 		"relation " + RelationMember + ": " + TypeWorkload,
 		"relation " + RelationSuspended + ": " + TypeTeam,
 		"relation " + RelationAccount + ": " + TypeAWSAccount,
@@ -47,12 +48,35 @@ func TestSchemaNames(t *testing.T) {
 		TypeService + "#" + RelationMember, TypeService + "#" + RelationMember + " with " + CaveatWithinWindow,
 		TypeService + "#" + RelationMember + " with " + CaveatInClusters, TypeService + "#" + RelationMember + " with " + CaveatBounded,
 	}, " | ")
+	managed := "  relation " + RelationOwner + ": " + TypeWorkload + " | " + TypeService + "#" + RelationMember + "\n" +
+		"  relation " + RelationApprover + ": " + TypeWorkload + " | " + TypeService + "#" + RelationMember + "\n" +
+		"  relation " + RelationSensitive + ": " + TypeWorkload + ":*\n" +
+		"  permission " + PermissionManage + " = " + RelationOwner + "\n" +
+		"  permission " + PermissionApprove + " = " + RelationApprover + " + " + RelationOwner + "\n"
+	service := "definition " + TypeService + " {\n" +
+		"  relation " + RelationTeam + ": " + TypeTeam + "\n" +
+		"  relation " + RelationMember + ": " + TypeWorkload + "\n" + managed + "}"
+	if !strings.Contains(Schema, service) {
+		t.Errorf("schema does not contain\n%s", service)
+	}
+	pending := "caveat " + CaveatPendingPayload + "(" + CaveatContextRequest + " string) {\n" +
+		"  " + CaveatContextRequest + " != \"\"\n}\n\n" +
+		"definition " + DefinitionPendingRequest + " {\n" +
+		"  relation " + RelationTarget + ": " + TypeS3Bucket + " with " + CaveatPendingPayload + " | " +
+		TypeDynamoDBTable + " with " + CaveatPendingPayload + " | " + TypeService + " with " + CaveatPendingPayload + "\n}"
+	if !strings.Contains(Schema, pending) {
+		t.Errorf("schema does not contain\n%s", pending)
+	}
+	if len(ManagedTypes) != 3 || !slices.Contains(ManagedTypes, TypeService) {
+		t.Errorf("ManagedTypes = %v", ManagedTypes)
+	}
 	for _, typ := range ResourceTypes {
 		def := "definition " + typ + " {\n" +
 			"  relation " + RelationReader + ": " + holders + "\n" +
 			"  relation " + RelationWriter + ": " + holders + "\n" +
 			"  permission " + PermissionWrite + " = " + RelationWriter + "\n" +
 			"  permission " + PermissionRead + " = " + RelationReader + " + " + RelationWriter + "\n" +
+			managed +
 			"}"
 		if !strings.Contains(Schema, def) {
 			t.Errorf("schema does not contain\n%s", def)

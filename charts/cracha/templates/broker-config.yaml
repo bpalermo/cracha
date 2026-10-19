@@ -1,4 +1,3 @@
-{{- $backend := include "cracha.authzBackend" . -}}
 {{- $assignments := include "cracha.assignmentsSource" . -}}
 {{- if and (eq $assignments "file") (not .Values.broker.assignments.existingConfigMap) }}
 # The static authorization backend's assignments (broker.assignments), from
@@ -14,22 +13,6 @@ metadata:
 data:
   {{ .Values.broker.assignments.key }}: |
     {{- required "broker.assignments.document is required unless broker.assignments.existingConfigMap names a ConfigMap" .Values.broker.assignments.document | toYaml | nindent 4 }}
-{{- end }}
-{{- if and (eq $backend "spicedb") .Values.broker.authz.spicedb.ca }}
----
-# The authority SpiceDB's certificate is verified with
-# (broker.authz.spicedb.ca).
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ include "cracha.name" . }}-spicedb-ca
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "cracha.labels" . | nindent 4 }}
-    app.kubernetes.io/component: broker
-data:
-  ca.pem: |
-    {{- .Values.broker.authz.spicedb.ca | nindent 4 }}
 {{- end }}
 {{- if and (not .Values.broker.bundle.source) (not .Values.broker.grants.existingConfigMap) }}
 ---

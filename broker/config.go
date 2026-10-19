@@ -41,9 +41,7 @@ type config struct {
 	assignmentsSource string
 	assignments       string
 	spicedbEndpoint   string
-	spicedbTokenFile  string
-	spicedbCA         string
-	spicedbInsecure   bool
+	spicedbServerID   string
 	spicedbTimeout    time.Duration
 
 	// The compiled grant bundle (broker/internal/bundle), the production
@@ -68,6 +66,10 @@ type config struct {
 	// agentID is --agent-spiffe-id parsed; zero when it is to be derived
 	// from the broker's own SVID and --namespace (mtls.DefaultAgentID).
 	agentID spiffeid.ID
+	// spicedbServer is --spicedb-server-spiffe-id when it is a full SPIFFE
+	// ID; zero when it is a path, or empty, to be completed in the trust
+	// domain of the broker's own SVID (spicedbServerID).
+	spicedbServer spiffeid.ID
 }
 
 // errVersion is returned by parseConfig when --version was asked for.
@@ -171,10 +173,8 @@ func (c *config) bindAuthzFlags(fs *flag.FlagSet, env envDefaults) {
 	fs.StringVar(&c.authzBackend, "authz-backend", env.str("authz-backend", backendStatic), "authorization backend: static (assignments from a file or the publication, --assignments-source) or spicedb")
 	fs.StringVar(&c.assignmentsSource, "assignments-source", env.str("assignments-source", assignmentsFile), "where the static backend's assignments come from: file (--assignments, read once) or published (the assignments of the version --bundle-source serves, verified and swapped with its bundle)")
 	fs.StringVar(&c.assignments, "assignments", env.str("assignments", ""), "path to the static backend's assignments file (required with --assignments-source file)")
-	fs.StringVar(&c.spicedbEndpoint, "spicedb-endpoint", env.str("spicedb-endpoint", ""), "SpiceDB gRPC address, host:port (required with --authz-backend spicedb)")
-	fs.StringVar(&c.spicedbTokenFile, "spicedb-token-file", env.str("spicedb-token-file", ""), "path to the file holding SpiceDB's preshared key (required with --authz-backend spicedb)")
-	fs.StringVar(&c.spicedbCA, "spicedb-ca", env.str("spicedb-ca", ""), "path to the PEM bundle SpiceDB's certificate is verified with; the system roots when empty")
-	fs.BoolVar(&c.spicedbInsecure, "spicedb-insecure", env.boolean("spicedb-insecure", false), "speak plaintext gRPC to SpiceDB, the key in the clear; for kind only, excludes --spicedb-ca")
+	fs.StringVar(&c.spicedbEndpoint, "spicedb-endpoint", env.str("spicedb-endpoint", ""), "gRPC address, host:port, of SpiceDB's gateway, reached over SPIFFE mTLS with the broker's own X.509-SVID (required with --authz-backend spicedb)")
+	fs.StringVar(&c.spicedbServerID, "spicedb-server-spiffe-id", env.str("spicedb-server-spiffe-id", ""), "SPIFFE ID the SpiceDB gateway must present: a full ID, or a path (/ns/<ns>/sa/<sa>) in the trust domain of the broker's own SVID; empty derives /ns/<--namespace>/sa/cracha-spicedb")
 	fs.DurationVar(&c.spicedbTimeout, "spicedb-timeout", env.duration("spicedb-timeout", spicedb.DefaultTimeout), "how long one SpiceDB call may take")
 }
 
@@ -227,8 +227,8 @@ func (l *pathList) Set(v string) error {
 // authzProblems is what is wrong with the authorization backend flags: the
 // static backend needs exactly one source of assignments, its file or the
 // publication of --bundle-source, and none of the SpiceDB flags; the
-// SpiceDB backend needs an endpoint and a token file, no assignments of
-// its own, at most one of a CA and insecure, and a positive timeout.
+// SpiceDB backend needs an endpoint, a gateway SPIFFE ID it can resolve, no
+// assignments of its own and a positive timeout.
 func (c *config) authzProblems() []string {
 	var problems []string
 	switch c.authzBackend {
@@ -262,7 +262,7 @@ func (c *config) staticProblems() []string {
 	default:
 		problems = append(problems, fmt.Sprintf("--assignments-source %q is not file or published", c.assignmentsSource))
 	}
-	if c.spicedbEndpoint != "" || c.spicedbTokenFile != "" || c.spicedbCA != "" || c.spicedbInsecure {
+	if c.spicedbEndpoint != "" || c.spicedbServerID != "" {
 		problems = append(problems, "the --spicedb-* flags need --authz-backend spicedb")
 	}
 	return problems
@@ -279,13 +279,35 @@ func (c *config) spicedbProblems() []string {
 	if c.spicedbEndpoint == "" {
 		problems = append(problems, "--spicedb-endpoint is required with --authz-backend spicedb")
 	}
-	if c.spicedbTokenFile == "" {
-		problems = append(problems, "--spicedb-token-file is required with --authz-backend spicedb")
+	return append(problems, c.spicedbServerProblems()...)
+}
+
+// spicedbServerProblems is what is wrong with --spicedb-server-spiffe-id: a
+// full SPIFFE ID (parsed into c.spicedbServer) or a path, or empty with
+// --namespace to derive it from.
+func (c *config) spicedbServerProblems() []string {
+	id := c.spicedbServerID
+	switch {
+	case id == "":
+		if c.namespace == "" {
+			return []string{"--namespace (CRACHA_NAMESPACE) is required to derive the SpiceDB gateway's SPIFFE ID; or give --spicedb-server-spiffe-id"}
+		}
+		return nil
+	case strings.HasPrefix(id, "/"):
+		if _, err := spiffeid.FromPath(spiffeid.RequireTrustDomainFromString("example.org"), id); err != nil {
+			return []string{fmt.Sprintf("--spicedb-server-spiffe-id %q: %v", id, err)}
+		}
+		return nil
 	}
-	if c.spicedbInsecure && c.spicedbCA != "" {
-		problems = append(problems, "--spicedb-insecure excludes --spicedb-ca")
+	parsed, err := spiffeid.FromString(id)
+	if err != nil {
+		return []string{fmt.Sprintf("--spicedb-server-spiffe-id %q: %v", id, err)}
 	}
-	return problems
+	if parsed.Path() == "" {
+		return []string{fmt.Sprintf("--spicedb-server-spiffe-id %q names a trust domain, not a workload", id)}
+	}
+	c.spicedbServer = parsed
+	return nil
 }
 
 // bindCacheFlags declares the credential cache's flags (design 6.7).

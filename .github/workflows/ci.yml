@@ -255,8 +255,8 @@ jobs:
   # gets as far as creating a cluster, and only when `diff` found something
   # the suite deploys or runs impacted: a documentation-only change pays for
   # no cluster. Once per authorization backend (E2E_AUTHZ of e2e/run.sh:
-  # static, the assignments document, and spicedb, which also deploys SpiceDB
-  # and reconciles the grant tree into it) and per enrolment mode (E2E_ENROL:
+  # static, the assignments document, and spicedb, the chart's SpiceDB
+  # behind its SPIFFE gateway) and per enrolment mode (E2E_ENROL:
   # init, the webhook's init container, and cni, the chained CNI plugin on
   # the node); each leg is its own cluster, and one failing does not stop the
   # others.

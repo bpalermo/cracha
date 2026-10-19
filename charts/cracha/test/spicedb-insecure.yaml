@@ -1,9 +1,0 @@
-# The SpiceDB backend over plaintext gRPC, as a kind cluster runs it.
-broker:
-  authz:
-    backend: spicedb
-    spicedb:
-      endpoint: spicedb.spicedb.svc:50051
-      tokenSecret:
-        name: spicedb-key
-      insecure: true

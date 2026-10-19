@@ -1,73 +1,91 @@
-// Command cracha-reconciler is the authz-reconciler of docs/design.md,
-// section 6.4: it writes the SpiceDB schema and makes SpiceDB's
-// relationships match a Git checkout of grants, the same tree
-// cracha-grantc compiles.
+// Command cracha-reconciler writes the SpiceDB schema of docs/design.md,
+// section 6.4, through the SpiceDB gateway, over SPIFFE mTLS with its own
+// X.509-SVID: from the Workload API, or from files (an SVID the issuer
+// minted for a CI job or an operator).
 //
-//	cracha-reconciler schema -endpoint host:port -token-file FILE [-ca pem] [-insecure] [-dry-run]
-//	cracha-reconciler apply  -source DIR -endpoint host:port -token-file FILE [-ca pem] [-insecure] [-dry-run]
+//	cracha-reconciler schema -endpoint host:port -server-spiffe-id ID \
+//	    (-workload-api unix:///path | -svid cert.pem -svid-key key.pem -bundle bundle.pem) [-dry-run]
 //
-// apply refuses a tree the loader or the lints reject, reads every
-// relationship of the resource types it owns (grant, service, workload,
-// s3_bucket and dynamodb_table), logs the difference and writes it in
-// batches, then reads back to confirm; a second run is a no-op. -dry-run
-// logs the difference and writes nothing. The exit status is 0 on
-// success, 1 when the tree is rejected or SpiceDB still differs after the
-// write, and 2 on a usage or operational error.
+// schema writes the embedded schema, which is idempotent, and reads it
+// back to confirm; -dry-run prints it and connects to nothing. The gateway
+// admits the reconciler's SPIFFE ID to SchemaService's WriteSchema and
+// ReadSchema and to nothing else: the reconciler writes no relationship.
+// With the spicedb backend, relationships live only in SpiceDB and their
+// one writer is the access service (cracha-access); the former apply
+// command, which wrote them from a Git tree, refuses with that message.
+// The exit status is 0 on success, 1 when the schema read back lacks a
+// definition or caveat written, and 2 on a usage or operational error.
 package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
+	"regexp"
 	"strings"
 
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
-	authzed "github.com/authzed/authzed-go/v1"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
+	"github.com/spiffe/go-spiffe/v2/workloadapi"
 
-	"github.com/bpalermo/cracha/common/grant"
 	"github.com/bpalermo/cracha/common/spicedb"
+	"github.com/bpalermo/cracha/common/spicedb/conn"
 	"github.com/bpalermo/cracha/common/version"
-	"github.com/bpalermo/cracha/reconciler/internal/reconcile"
 )
 
 const usage = `usage: cracha-reconciler <command> [flags]
 
 commands:
   schema   write the SpiceDB schema (idempotent); -dry-run prints it
-  apply    make SpiceDB's relationships match a grant source tree
   --version  print the version
 
 Run "cracha-reconciler <command> -h" for a command's flags.`
 
-// clients are the SpiceDB services a command uses; close releases the
-// connection.
-type clients struct {
-	permissions v1.PermissionsServiceClient
-	schema      v1.SchemaServiceClient
-	close       func() error
+// errApplyRemoved is what apply answers: the reconciler no longer writes
+// relationships.
+var errApplyRemoved = errors.New("apply was removed: with the spicedb backend, relationships live only in SpiceDB and are written by the access service (cracha-access), their one writer (docs/design.md, section 6.4); the reconciler writes the schema only, and the gateway refuses it every relationship write")
+
+// errDiverged is a schema read back without the definitions written.
+var errDiverged = errors.New("SpiceDB holds another schema after the write")
+
+// declaration is a definition or caveat of a schema. SpiceDB answers
+// ReadSchema with the schema it compiled, formatted its own way, so the
+// read-back is compared by what it declares, not byte for byte.
+var declaration = regexp.MustCompile(`(?m)^(definition|caveat) ([a-z][a-z0-9_]*)`)
+
+// missingNames is every definition and caveat of the embedded schema that
+// the schema read back does not declare.
+func missingNames(read string) []string {
+	held := map[string]bool{}
+	for _, m := range declaration.FindAllStringSubmatch(read, -1) {
+		held[m[1]+" "+m[2]] = true
+	}
+	var missing []string
+	for _, m := range declaration.FindAllStringSubmatch(spicedb.Schema, -1) {
+		if name := m[1] + " " + m[2]; !held[name] {
+			missing = append(missing, name)
+		}
+	}
+	return missing
 }
 
-// dialer connects to SpiceDB as the flags say, so tests can substitute a
-// fake.
-type dialer func(ctx context.Context, f *connFlags) (*clients, error)
+// session is a connection to SpiceDB: its SchemaService and what to close.
+type session struct {
+	schema v1.SchemaServiceClient
+	close  func() error
+}
+
+// dialer connects as the flags say, so tests can substitute a fake.
+type dialer func(ctx context.Context, f *connFlags) (*session, error)
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, dial))
 }
-
-var (
-	errRejected  = errors.New("source tree rejected")
-	errDialFlags = errors.New("-endpoint and -token-file are required")
-)
 
 // run is main without the process: it returns the exit status.
 func run(args []string, stdout, stderr io.Writer, dial dialer) int {
@@ -75,8 +93,6 @@ func run(args []string, stdout, stderr io.Writer, dial dialer) int {
 		fmt.Fprintln(stderr, usage)
 		return 2
 	}
-	ctx := context.Background()
-	log := slog.New(slog.NewTextHandler(stderr, nil))
 	var err error
 	switch cmd := args[0]; cmd {
 	case "--version", "-version":
@@ -86,19 +102,17 @@ func run(args []string, stdout, stderr io.Writer, dial dialer) int {
 		fmt.Fprintln(stdout, usage)
 		return 0
 	case "schema":
-		err = runSchema(ctx, args[1:], stdout, stderr, dial)
+		err = runSchema(context.Background(), args[1:], stdout, stderr, dial)
 	case "apply":
-		err = runApply(ctx, args[1:], stdout, stderr, log, dial)
+		err = errApplyRemoved
 	default:
 		fmt.Fprintf(stderr, "cracha-reconciler: unknown command %q\n%s\n", cmd, usage)
 		return 2
 	}
 	switch {
-	case err == nil:
+	case err == nil, errors.Is(err, flag.ErrHelp):
 		return 0
-	case errors.Is(err, flag.ErrHelp):
-		return 0
-	case errors.Is(err, errRejected), errors.Is(err, reconcile.ErrDiverged):
+	case errors.Is(err, errDiverged):
 		fmt.Fprintf(stderr, "cracha-reconciler: %v\n", err)
 		return 1
 	default:
@@ -107,94 +121,88 @@ func run(args []string, stdout, stderr io.Writer, dial dialer) int {
 	}
 }
 
-func newFlags(name string, stderr io.Writer) *flag.FlagSet {
-	fs := flag.NewFlagSet("cracha-reconciler "+name, flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	return fs
-}
-
-// connFlags say how to reach SpiceDB.
+// connFlags say how to reach SpiceDB's gateway and with which SVID.
 type connFlags struct {
-	endpoint  string
-	tokenFile string
-	ca        string
-	insecure  bool
-	dryRun    bool
+	endpoint    string
+	server      string
+	workloadAPI string
+	svid        string
+	svidKey     string
+	bundle      string
+	dryRun      bool
 }
 
 func (f *connFlags) register(fs *flag.FlagSet) {
-	fs.StringVar(&f.endpoint, "endpoint", "", "SpiceDB gRPC endpoint, host:port (required)")
-	fs.StringVar(&f.tokenFile, "token-file", "", "file holding the preshared key (required)")
-	fs.StringVar(&f.ca, "ca", "", "PEM file with the CA that signed SpiceDB's certificate (default: the system roots)")
-	fs.BoolVar(&f.insecure, "insecure", false, "connect without TLS; for kind only")
-	fs.BoolVar(&f.dryRun, "dry-run", false, "write nothing")
+	fs.StringVar(&f.endpoint, "endpoint", "", "the SpiceDB gateway's gRPC address, host:port (required)")
+	fs.StringVar(&f.server, "server-spiffe-id", "", "the SPIFFE ID the gateway must present (required)")
+	fs.StringVar(&f.workloadAPI, "workload-api", "", "the SPIFFE Workload API address the reconciler's X.509-SVID and bundle come from, unix:///path; excludes -svid")
+	fs.StringVar(&f.svid, "svid", "", "PEM file of the reconciler's X.509-SVID and its intermediates, with -svid-key and -bundle; excludes -workload-api")
+	fs.StringVar(&f.svidKey, "svid-key", "", "PEM file of the SVID's private key (PKCS#8)")
+	fs.StringVar(&f.bundle, "bundle", "", "PEM file of the trust domain's X.509 authorities, which verify the gateway")
+	fs.BoolVar(&f.dryRun, "dry-run", false, "print the schema and connect to nothing")
 }
 
-// check validates the connection flags before anything is read.
-func (f *connFlags) check() error {
-	if f.endpoint == "" || f.tokenFile == "" {
-		return errDialFlags
+// check validates the connection flags and parses the gateway's ID.
+func (f *connFlags) check() (spiffeid.ID, error) {
+	if f.endpoint == "" || f.server == "" {
+		return spiffeid.ID{}, errors.New("-endpoint and -server-spiffe-id are required")
 	}
-	return nil
-}
-
-// bearer sends the preshared key as a bearer token on every call.
-type bearer struct {
-	token     string
-	plaintext bool
-}
-
-func (b bearer) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
-	return map[string]string{"authorization": "Bearer " + b.token}, nil
-}
-
-// RequireTransportSecurity refuses to send the key in clear unless
-// -insecure asked for exactly that.
-func (b bearer) RequireTransportSecurity() bool { return !b.plaintext }
-
-// dial connects to SpiceDB as the flags say.
-func dial(_ context.Context, f *connFlags) (*clients, error) {
-	token, err := os.ReadFile(f.tokenFile)
+	id, err := spiffeid.FromString(f.server)
 	if err != nil {
-		return nil, fmt.Errorf("token file: %w", err)
+		return spiffeid.ID{}, fmt.Errorf("-server-spiffe-id %q: %w", f.server, err)
 	}
-	key := strings.TrimSpace(string(token))
-	if key == "" {
-		return nil, fmt.Errorf("token file %s is empty", f.tokenFile)
+	files := f.svid != "" || f.svidKey != "" || f.bundle != ""
+	switch {
+	case f.workloadAPI != "" && files:
+		return spiffeid.ID{}, errors.New("-workload-api excludes -svid, -svid-key and -bundle")
+	case f.workloadAPI == "" && (f.svid == "" || f.svidKey == "" || f.bundle == ""):
+		return spiffeid.ID{}, errors.New("give -workload-api, or -svid, -svid-key and -bundle")
 	}
-	creds, err := f.transport()
+	return id, nil
+}
+
+// dial connects to the gateway with the SVID the flags name.
+func dial(ctx context.Context, f *connFlags) (*session, error) {
+	server, err := f.check()
 	if err != nil {
 		return nil, err
 	}
-	c, err := authzed.NewClient(f.endpoint, grpc.WithTransportCredentials(creds), grpc.WithPerRPCCredentials(bearer{token: key, plaintext: f.insecure}))
+	svids, bundles, closeSource, err := f.sources(ctx, server.TrustDomain())
 	if err != nil {
-		return nil, fmt.Errorf("connect to %s: %w", f.endpoint, err)
+		return nil, err
 	}
-	return &clients{permissions: c.PermissionsServiceClient, schema: c.SchemaServiceClient, close: c.Close}, nil
+	c, err := conn.Dial(conn.Config{Endpoint: f.endpoint, Server: server, SVIDs: svids, Bundles: bundles})
+	if err != nil {
+		_ = closeSource()
+		return nil, err
+	}
+	return &session{schema: c.SchemaServiceClient, close: func() error { return errors.Join(c.Close(), closeSource()) }}, nil
 }
 
-// transport is the TLS configuration the flags describe, or plaintext.
-func (f *connFlags) transport() (credentials.TransportCredentials, error) {
-	if f.insecure {
-		return insecure.NewCredentials(), nil
-	}
-	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
-	if f.ca != "" {
-		pemData, err := os.ReadFile(f.ca)
+// sources are the reconciler's SVID and bundle: the Workload API's, or the
+// files', the bundle for the gateway's trust domain.
+func (f *connFlags) sources(ctx context.Context, td spiffeid.TrustDomain) (x509svid.Source, x509bundle.Source, func() error, error) {
+	if f.workloadAPI != "" {
+		src, err := workloadapi.NewX509Source(ctx, workloadapi.WithClientOptions(workloadapi.WithAddr(f.workloadAPI)))
 		if err != nil {
-			return nil, fmt.Errorf("ca: %w", err)
+			return nil, nil, nil, fmt.Errorf("workload api %s: %w", f.workloadAPI, err)
 		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pemData) {
-			return nil, fmt.Errorf("ca: no certificate in %s", f.ca)
-		}
-		cfg.RootCAs = pool
+		return src, src, src.Close, nil
 	}
-	return credentials.NewTLS(cfg), nil
+	svid, err := x509svid.Load(f.svid, f.svidKey)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("svid: %w", err)
+	}
+	bundle, err := x509bundle.Load(td, f.bundle)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("bundle: %w", err)
+	}
+	return svid, bundle, func() error { return nil }, nil
 }
 
 func runSchema(ctx context.Context, args []string, stdout, stderr io.Writer, dial dialer) error {
-	fs := newFlags("schema", stderr)
+	fs := flag.NewFlagSet("cracha-reconciler schema", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	var cf connFlags
 	cf.register(fs)
 	if err := fs.Parse(args); err != nil {
@@ -207,90 +215,24 @@ func runSchema(ctx context.Context, args []string, stdout, stderr io.Writer, dia
 		_, err := io.WriteString(stdout, spicedb.Schema)
 		return err
 	}
-	if err := cf.check(); err != nil {
+	if _, err := cf.check(); err != nil {
 		return fmt.Errorf("schema: %w", err)
 	}
-	c, err := dial(ctx, &cf)
+	s, err := dial(ctx, &cf)
 	if err != nil {
 		return err
 	}
-	defer c.close()
-	r := &reconcile.Reconciler{Permissions: c.permissions, Schema: c.schema}
-	if err := r.WriteSchema(ctx); err != nil {
-		return err
+	defer s.close()
+	if _, err := s.schema.WriteSchema(ctx, &v1.WriteSchemaRequest{Schema: spicedb.Schema}); err != nil {
+		return fmt.Errorf("write schema: %w", err)
+	}
+	read, err := s.schema.ReadSchema(ctx, &v1.ReadSchemaRequest{})
+	if err != nil {
+		return fmt.Errorf("read the schema back: %w", err)
+	}
+	if missing := missingNames(read.GetSchemaText()); len(missing) > 0 {
+		return fmt.Errorf("%w: it lacks %s", errDiverged, strings.Join(missing, ", "))
 	}
 	fmt.Fprintf(stdout, "wrote the schema to %s\n", cf.endpoint)
 	return nil
-}
-
-func runApply(ctx context.Context, args []string, stdout, stderr io.Writer, log *slog.Logger, dial dialer) error {
-	fs := newFlags("apply", stderr)
-	var cf connFlags
-	cf.register(fs)
-	source := fs.String("source", "", "the grant source tree (required)")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if fs.NArg() != 0 {
-		return errors.New("apply: takes no arguments")
-	}
-	if *source == "" {
-		return errors.New("apply: -source is required")
-	}
-	if err := cf.check(); err != nil {
-		return fmt.Errorf("apply: %w", err)
-	}
-	desired, err := loadDesired(ctx, *source, stderr)
-	if err != nil {
-		return err
-	}
-	c, err := dial(ctx, &cf)
-	if err != nil {
-		return err
-	}
-	defer c.close()
-	r := &reconcile.Reconciler{Permissions: c.permissions, Schema: c.schema, Log: log}
-	res, err := r.Apply(ctx, desired, cf.dryRun)
-	if res != nil {
-		printResult(stdout, res, cf.dryRun)
-	}
-	return err
-}
-
-// loadDesired loads and lints the tree, printing the lints' problems to
-// stderr, and computes the relationships it calls for. A tree the loader
-// or a lint rejects is errRejected.
-func loadDesired(ctx context.Context, source string, stderr io.Writer) ([]reconcile.Relationship, error) {
-	src, err := grant.Load(source)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errRejected, err)
-	}
-	report, err := grant.Lint(ctx, src, grant.LintOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errRejected, err)
-	}
-	if !report.OK() {
-		for _, p := range report.Problems {
-			fmt.Fprintf(stderr, "problem: %s\n", p)
-		}
-		return nil, fmt.Errorf("%w: %d problems", errRejected, len(report.Problems))
-	}
-	desired, err := reconcile.Desired(src)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errRejected, err)
-	}
-	return desired, nil
-}
-
-// printResult writes the one-line summary of an apply.
-func printResult(w io.Writer, res *reconcile.Result, dryRun bool) {
-	d := res.Diff
-	switch {
-	case d.Empty():
-		fmt.Fprintln(w, "nothing to change: SpiceDB matches the source")
-	case dryRun:
-		fmt.Fprintf(w, "dry run: %d relationships to write and %d to delete; nothing written\n", len(d.Touch), len(d.Delete))
-	default:
-		fmt.Fprintf(w, "wrote %d of %d updates (%d to write, %d to delete) in %d batches, at %s\n", res.Written, d.Len(), len(d.Touch), len(d.Delete), res.Batches, res.Token)
-	}
 }

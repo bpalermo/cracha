@@ -1,0 +1,18 @@
+# The chart's SpiceDB on postgres with a client certificate and the
+# server's authority, the migration Job left to the defaults.
+broker:
+  authz:
+    backend: spicedb
+spicedb:
+  presharedKeySecret:
+    name: spicedb-key
+  datastore:
+    engine: postgres
+    uriSecret:
+      name: spicedb-datastore
+    caSecret:
+      name: postgres-ca
+    clientCertSecret:
+      name: spicedb-client
+  gateway:
+    trustDomain: prod.example.org

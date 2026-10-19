@@ -34,20 +34,15 @@ broker:
         driver: csi.spiffe.io
         readOnly: true
     socket: socket
-  # The SpiceDB backend, verified with its own CA; test/spicedb-insecure.yaml
-  # renders the plaintext knob and test/static-configmap.yaml the static
-  # backend with a ConfigMap the install keeps.
+  # The SpiceDB backend, through a gateway named here rather than the
+  # chart's own; test/spicedb-memory.yaml renders the defaults, and
+  # test/static-configmap.yaml the static backend with a ConfigMap the
+  # install keeps.
   authz:
     backend: spicedb
     spicedb:
-      endpoint: spicedb.spicedb.svc:50051
-      tokenSecret:
-        name: spicedb-key
-        key: preshared-key
-      ca: |
-        -----BEGIN CERTIFICATE-----
-        MIIBszCCAVmgAwIBAgIUAAAAAAAAAAAAAAAAAAAAAAAAAAAwCgYIKoZIzj0EAwIw
-        -----END CERTIFICATE-----
+      endpoint: spicedb.authz.svc:50051
+      serverSpiffeID: spiffe://prod.example.org/ns/authz/sa/spicedb
       timeout: 2s
   grants:
     existingConfigMap: my-grants
@@ -195,5 +190,79 @@ webhook:
     requests:
       cpu: 50m
       memory: 64Mi
+  podAnnotations:
+    example.com/scrape: "true"
+# The chart's SpiceDB with every knob: mysql with a private CA, the
+# identities given, the CSI Workload API, the NetworkPolicy;
+# test/spicedb-postgres.yaml renders the client certificate.
+spicedb:
+  enabled: true
+  replicas: 3
+  image:
+    repository: registry.example.com/authzed/spicedb
+    tag: v9.9.9
+    digest: ""
+    pullPolicy: Always
+  port: 50061
+  presharedKeySecret:
+    name: spicedb-key
+    key: key
+  datastore:
+    engine: mysql
+    uriSecret:
+      name: spicedb-datastore
+      key: dsn
+    caSecret:
+      name: nas-root
+      key: root.pem
+  migration:
+    enabled: true
+    timeout: 10m
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+  logLevel: debug
+  gateway:
+    image:
+      repository: registry.example.com/envoyproxy/envoy
+      tag: v9.9.9
+      digest: ""
+      pullPolicy: Always
+    port: 15051
+    healthPort: 15080
+    trustDomain: prod.example.org
+    identities:
+      broker: spiffe://prod.example.org/ns/cracha-system/sa/custom-broker
+      access: spiffe://prod.example.org/ns/cracha-system/sa/custom-access
+      reconciler: spiffe://prod.example.org/ci/cracha-reconciler
+    logLevel: debug
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+  workloadAPI:
+    volume:
+      type: csi
+      csi:
+        driver: csi.spiffe.io
+        readOnly: true
+    socket: socket
+  networkPolicy:
+    enabled: true
+    from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: cracha-system
+  priorityClassName: system-cluster-critical
+  nodeSelector:
+    kubernetes.io/os: linux
+  tolerations:
+    - key: dedicated
+      operator: Exists
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
   podAnnotations:
     example.com/scrape: "true"

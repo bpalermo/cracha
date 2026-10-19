@@ -76,14 +76,10 @@ spec:
             - --assignments=/etc/cracha/assignments/{{ .Values.broker.assignments.key }}
             {{- end }}
             {{- else }}
-            - --spicedb-endpoint={{ $spicedb.endpoint }}
-            - --spicedb-token-file=/etc/cracha/spicedb/token/{{ $spicedb.tokenSecret.key }}
-            {{- if $spicedb.ca }}
-            - --spicedb-ca=/etc/cracha/spicedb/ca/ca.pem
-            {{- end }}
-            {{- if $spicedb.insecure }}
-            - --spicedb-insecure
-            {{- end }}
+            # SpiceDB's gateway, over SPIFFE mTLS with the broker's own
+            # X.509-SVID: no key, no CA (design 6.4).
+            - --spicedb-endpoint={{ include "cracha.spicedbEndpoint" . }}
+            - --spicedb-server-spiffe-id={{ include "cracha.spicedbServerSpiffeID" . }}
             - --spicedb-timeout={{ $spicedb.timeout }}
             {{- end }}
             {{- if .Values.broker.bundle.source }}
@@ -161,15 +157,6 @@ spec:
             - name: assignments
               mountPath: /etc/cracha/assignments
               readOnly: true
-            {{- else if eq $backend "spicedb" }}
-            - name: spicedb-token
-              mountPath: /etc/cracha/spicedb/token
-              readOnly: true
-            {{- if $spicedb.ca }}
-            - name: spicedb-ca
-              mountPath: /etc/cracha/spicedb/ca
-              readOnly: true
-            {{- end }}
             {{- end }}
             {{- if $bundleDir }}
             - name: bundle
@@ -211,17 +198,6 @@ spec:
         - name: assignments
           configMap:
             name: {{ .Values.broker.assignments.existingConfigMap | default (printf "%s-assignments" (include "cracha.name" .)) }}
-        {{- else if eq $backend "spicedb" }}
-        # SpiceDB's preshared key, from the Secret the install keeps, read
-        # by the broker as a file.
-        - name: spicedb-token
-          secret:
-            secretName: {{ $spicedb.tokenSecret.name }}
-        {{- if $spicedb.ca }}
-        - name: spicedb-ca
-          configMap:
-            name: {{ include "cracha.name" . }}-spicedb-ca
-        {{- end }}
         {{- end }}
         {{- if $bundleDir }}
         # The published bundle, laid out as grantc publish writes it.

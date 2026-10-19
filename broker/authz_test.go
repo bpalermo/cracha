@@ -12,6 +12,10 @@ import (
 
 	"github.com/bpalermo/cracha/broker/internal/authz"
 	"github.com/bpalermo/cracha/common/grant"
+	"github.com/bpalermo/cracha/common/spiffetest"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 )
 
 // The SpiceDB store the broker opens has Watch, and what main hands the
@@ -19,13 +23,9 @@ import (
 // finds Watch by type assertion (design 6.7), and a wrapper without it
 // would leave the cache in TTL mode without a word.
 func TestSpiceDBStoreWatches(t *testing.T) {
-	token := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(token, []byte("key\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	// Dial is lazy: no SpiceDB is needed to open the store.
-	s, err := newStore(config{authzBackend: backendSpiceDB, spicedbEndpoint: "127.0.0.1:1", spicedbTokenFile: token, spicedbInsecure: true},
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s, err := newStore(config{authzBackend: backendSpiceDB, spicedbEndpoint: "127.0.0.1:1", namespace: "cracha-system"},
+		testSVIDs(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,11 +38,42 @@ func TestSpiceDBStoreWatches(t *testing.T) {
 	}
 }
 
+// testSVIDs is the broker's SVID and bundle, from a test authority.
+func testSVIDs(t *testing.T) svidSource {
+	ca := spiffetest.NewCA(t, "cracha.test")
+	return struct {
+		*x509svid.SVID
+		*x509bundle.Bundle
+	}{ca.SVID(t, "spiffe://cracha.test/ns/cracha-system/sa/cracha-broker"), ca.Bundle()}
+}
+
+// The gateway's SPIFFE ID: the default in the broker's trust domain and
+// namespace, a path completed in that trust domain, or a full ID.
+func TestSpiceDBServerID(t *testing.T) {
+	svids := testSVIDs(t)
+	full := spiffeid.RequireFromString("spiffe://other.test/ns/x/sa/gw")
+	for name, tc := range map[string]struct {
+		cfg  config
+		want string
+	}{
+		"default": {config{namespace: "cracha-system"}, "spiffe://cracha.test/ns/cracha-system/sa/cracha-spicedb"},
+		"path":    {config{spicedbServerID: "/ns/authz/sa/spicedb"}, "spiffe://cracha.test/ns/authz/sa/spicedb"},
+		"full":    {config{spicedbServerID: full.String(), spicedbServer: full}, full.String()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			id, err := spicedbServerID(tc.cfg, svids)
+			if err != nil || id.String() != tc.want {
+				t.Fatalf("got %v, %v; want %s", id, err, tc.want)
+			}
+		})
+	}
+}
+
 // The static store reading the published assignments is the grant source's
 // sink, starts empty (denying) and watches, so its swaps flush the cache.
 func TestPublishedStaticStore(t *testing.T) {
 	s, err := newStore(config{authzBackend: backendStatic, assignmentsSource: assignmentsPublished, bundleSource: "local:/b"},
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+		nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +90,7 @@ func TestPublishedStaticStore(t *testing.T) {
 	if err := os.WriteFile(file, []byte("services: []\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s, err = newStore(config{authzBackend: backendStatic, assignmentsSource: assignmentsFile, assignments: file}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s, err = newStore(config{authzBackend: backendStatic, assignmentsSource: assignmentsFile, assignments: file}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil || s.assignments != nil {
 		t.Errorf("the file store: %v, sink %v", err, s.assignments)
 	}

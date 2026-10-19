@@ -22,8 +22,8 @@ test:e2e --test_tag_filters=e2e
 test:e2e --nocache_test_results
 test:e2e --test_env=KUBECONFIG
 # The modes e2e/run.sh ran in (E2E_AUTHZ, E2E_ENROL) and, in spicedb mode,
-# how the tests reach the SpiceDB it deployed: the port-forward's address
-# and the file with the preshared key.
+# how the tests reach the chart's SpiceDB gateway: the port-forward's
+# address and the directory of the SVIDs run.sh had SPIRE mint for them.
 test:e2e --test_env=E2E_AUTHZ
 test:e2e --test_env=E2E_ENROL
 # The helm run.sh installed the chart with and the package it installed,
@@ -31,7 +31,7 @@ test:e2e --test_env=E2E_ENROL
 test:e2e --test_env=E2E_HELM
 test:e2e --test_env=E2E_CHART_PACKAGE
 test:e2e --test_env=E2E_SPICEDB_ENDPOINT
-test:e2e --test_env=E2E_SPICEDB_TOKEN_FILE
+test:e2e --test_env=E2E_SPICEDB_SVIDS
 # The key run.sh signed the publication with, for the test that republishes
 # the grant tree.
 test:e2e --test_env=E2E_BUNDLE_KEY

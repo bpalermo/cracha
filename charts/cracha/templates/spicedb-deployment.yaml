@@ -1,0 +1,202 @@
+{{- if include "cracha.spicedbEnabled" . }}
+{{- $selector := dict "root" . "component" "spicedb" -}}
+{{- $s := .Values.spicedb -}}
+{{- $g := $s.gateway -}}
+{{- $engine := include "cracha.spicedbEngine" . -}}
+{{- if not $s.presharedKeySecret.name }}{{ fail "spicedb.presharedKeySecret.name is required with the chart's SpiceDB: the Secret holding its preshared key" }}{{ end -}}
+{{- if not (has $s.logLevel (list "trace" "debug" "info" "warn" "error")) -}}
+{{- fail (printf "spicedb.logLevel must be trace, debug, info, warn or error, not %q" $s.logLevel) -}}
+{{- end -}}
+{{- if eq (int $s.port) (int $g.port) }}{{ fail "spicedb.port and spicedb.gateway.port share the pod's network namespace: they must differ" }}{{ end -}}
+# SpiceDB and its gateway (design 6.4): SpiceDB on the pod's loopback,
+# Envoy the pod's one listener on its network.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cracha.name" . }}-spicedb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: spicedb
+spec:
+  replicas: {{ $s.replicas }}
+  selector:
+    matchLabels:
+      {{- include "cracha.selectorLabels" $selector | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cracha.labels" . | nindent 8 }}
+        app.kubernetes.io/component: spicedb
+      annotations:
+        # A new gateway configuration restarts the pods: Envoy reads it once.
+        checksum/gateway: {{ include (print .Template.BasePath "/spicedb-gateway-config.yaml") . | sha256sum }}
+        {{- with $s.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with $s.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      # The gateway's SPIFFE ID is this service account's.
+      serviceAccountName: {{ include "cracha.name" . }}-spicedb
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: spicedb
+          image: {{ include "cracha.image" (dict "root" . "image" $s.image) }}
+          imagePullPolicy: {{ $s.image.pullPolicy }}
+          # Plaintext gRPC on the loopback only, metrics on the loopback,
+          # no HTTP gateway, no telemetry, no release check, no migration
+          # (the migration Job owns it).
+          args:
+            - serve
+            - --grpc-addr=127.0.0.1:{{ $s.port }}
+            - --http-enabled=false
+            - --metrics-addr=127.0.0.1:9090
+            - --telemetry-endpoint=
+            - --skip-release-check
+            - --log-format=json
+            - --log-level={{ $s.logLevel }}
+            - --datastore-engine={{ $engine }}
+          env:
+            - name: SPICEDB_GRPC_PRESHARED_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s.presharedKeySecret.name }}
+                  key: {{ $s.presharedKeySecret.key }}
+            {{- include "cracha.spicedbDatastoreEnv" . | nindent 12 }}
+          # SpiceDB's gRPC health, asked on the loopback from inside the
+          # container: the port is not on the pod's network.
+          readinessProbe:
+            exec:
+              command: ["grpc_health_probe", "-addr=127.0.0.1:{{ $s.port }}"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["grpc_health_probe", "-addr=127.0.0.1:{{ $s.port }}"]
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Both containers wait before they are told to stop, so that the
+          # pod is out of the Service's endpoints before either goes.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          securityContext:
+            {{- include "cracha.restrictedSecurityContext" . | nindent 12 }}
+          {{- with $s.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with (include "cracha.spicedbDatastoreMounts" .) }}
+          volumeMounts:
+            {{- . | nindent 12 }}
+          {{- end }}
+        - name: gateway
+          image: {{ include "cracha.image" (dict "root" . "image" $g.image) }}
+          imagePullPolicy: {{ $g.image.pullPolicy }}
+          args:
+            - -c
+            - /etc/envoy/envoy.yaml
+            - --log-level
+            - {{ $g.logLevel }}
+            - --disable-hot-restart
+          env:
+            # Added to every call the gateway forwards (its route's
+            # request_headers_to_add), never written to its configuration.
+            - name: SPICEDB_PRESHARED_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s.presharedKeySecret.name }}
+                  key: {{ $s.presharedKeySecret.key }}
+          ports:
+            - name: grpc
+              containerPort: {{ $g.port }}
+            - name: health
+              containerPort: {{ $g.healthPort }}
+          # Ready while Envoy serves and SpiceDB passes its health checks;
+          # alive while Envoy serves.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: health
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          securityContext:
+            {{- include "cracha.restrictedSecurityContext" . | nindent 12 }}
+          {{- with $g.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: gateway-config
+              mountPath: /etc/envoy
+              readOnly: true
+            - name: spire-workload-api
+              mountPath: /spiffe-workload-api
+              readOnly: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "cracha.selectorLabels" $selector | nindent 14 }}
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "cracha.selectorLabels" $selector | nindent 14 }}
+      volumes:
+        - name: gateway-config
+          configMap:
+            name: {{ include "cracha.name" . }}-spicedb-gateway
+        # The gateway's X.509-SVID and trust bundle, over the SPIRE agent's
+        # SDS on the Workload API socket.
+        - name: spire-workload-api
+          {{- include "cracha.workloadAPIVolumeSource" (dict "component" "spicedb" "volume" $s.workloadAPI.volume) | nindent 10 }}
+        {{- include "cracha.spicedbDatastoreVolumes" . | nindent 8 }}
+---
+# The gateway's identity (design 4.2): the issuer gives this service account
+# the SPIFFE ID the broker verifies the gateway by. It holds no Kubernetes
+# permissions.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "cracha.name" . }}-spicedb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: spicedb
+automountServiceAccountToken: false
+{{- end }}

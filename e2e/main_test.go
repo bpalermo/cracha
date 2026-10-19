@@ -119,6 +119,11 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	cancel()
+	// In spicedb mode, the relationships the tests expect.
+	if err := seedSpiceDB(); err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: writing the suite's relationships to SpiceDB: %v\n", err)
+		os.Exit(1)
+	}
 
 	code := m.Run()
 

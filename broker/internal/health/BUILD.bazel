@@ -13,6 +13,6 @@ go_test(
     embed = [":health"],
     deps = [
         "//broker/internal/mtls",
-        "//broker/internal/mtls/mtlstest",
+        "//common/spiffetest",
     ],
 )

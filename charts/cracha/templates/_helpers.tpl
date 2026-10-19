@@ -99,8 +99,9 @@ or "" for S3 or no source. A local source needs broker.bundle.volume.
 
 {{/*
 The authorization backend of broker.authz, checked: "static" or "spicedb".
-The SpiceDB knobs need the spicedb backend, which needs an endpoint and the
-Secret holding its preshared key, and takes at most one of a CA and insecure.
+The SpiceDB knobs need the spicedb backend; with it, the endpoint is the
+chart's own SpiceDB gateway (spicedb.enabled) unless one is given, and an
+install that turns the chart's SpiceDB off must give one.
 */}}
 {{- define "cracha.authzBackend" -}}
 {{- $a := .Values.broker.authz -}}
@@ -109,15 +110,78 @@ Secret holding its preshared key, and takes at most one of a CA and insecure.
 {{- fail (printf "broker.authz.backend must be static or spicedb, not %q" $a.backend) -}}
 {{- end -}}
 {{- if eq $a.backend "static" -}}
-{{- if or $s.endpoint $s.tokenSecret.name $s.ca $s.insecure -}}
+{{- if or $s.endpoint $s.serverSpiffeID -}}
 {{- fail "broker.authz.spicedb needs broker.authz.backend spicedb" -}}
 {{- end -}}
-{{- else -}}
-{{- if not $s.endpoint }}{{ fail "broker.authz.spicedb.endpoint is required with broker.authz.backend spicedb" }}{{ end -}}
-{{- if not $s.tokenSecret.name }}{{ fail "broker.authz.spicedb.tokenSecret.name is required with broker.authz.backend spicedb: the Secret holding the preshared key" }}{{ end -}}
-{{- if and $s.insecure $s.ca }}{{ fail "broker.authz.spicedb.insecure excludes broker.authz.spicedb.ca" }}{{ end -}}
+{{- else if and (not .Values.spicedb.enabled) (not $s.endpoint) -}}
+{{- fail "broker.authz.spicedb.endpoint is required with broker.authz.backend spicedb and spicedb.enabled false: the SpiceDB gateway the broker reaches" -}}
 {{- end -}}
 {{ $a.backend }}
+{{- end -}}
+
+{{/* Whether the chart deploys SpiceDB and its gateway: spicedb.enabled with the spicedb backend. */}}
+{{- define "cracha.spicedbEnabled" -}}
+{{- if and (eq (include "cracha.authzBackend" .) "spicedb") .Values.spicedb.enabled -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* The SpiceDB gateway the broker dials: broker.authz.spicedb.endpoint, or the chart's own. */}}
+{{- define "cracha.spicedbEndpoint" -}}
+{{- if .Values.broker.authz.spicedb.endpoint -}}
+{{ .Values.broker.authz.spicedb.endpoint }}
+{{- else -}}
+{{ include "cracha.serviceHost" (dict "root" . "component" "spicedb") }}:{{ .Values.spicedb.gateway.port }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The SPIFFE ID the broker verifies the SpiceDB gateway by:
+broker.authz.spicedb.serverSpiffeID, or the path of the chart's SpiceDB
+ServiceAccount, which the broker completes in its own trust domain.
+*/}}
+{{- define "cracha.spicedbServerSpiffeID" -}}
+{{- if .Values.broker.authz.spicedb.serverSpiffeID -}}
+{{ .Values.broker.authz.spicedb.serverSpiffeID }}
+{{- else -}}
+/ns/{{ .Release.Namespace }}/sa/{{ include "cracha.name" . }}-spicedb
+{{- end -}}
+{{- end -}}
+
+{{/*
+The SPIFFE ID the gateway admits for one of its clients (spicedb.gateway.
+identities.<client>), or by default the client's ServiceAccount in the
+release's namespace and spicedb.gateway.trustDomain. Call with
+(dict "root" . "client" "broker").
+*/}}
+{{- define "cracha.gatewayIdentity" -}}
+{{- $id := index .root.Values.spicedb.gateway.identities .client -}}
+{{- if $id -}}
+{{- if not (hasPrefix "spiffe://" $id) }}{{ fail (printf "spicedb.gateway.identities.%s must be a SPIFFE ID, not %q" .client $id) }}{{ end -}}
+{{ $id }}
+{{- else -}}
+spiffe://{{ required "spicedb.gateway.trustDomain is required with the chart's SpiceDB: the trust domain of the gateway's clients" .root.Values.spicedb.gateway.trustDomain }}/ns/{{ .root.Release.Namespace }}/sa/{{ include "cracha.name" .root }}-{{ .client }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+SpiceDB's datastore engine (spicedb.datastore.engine), checked: memory
+(development and kind only, one replica, everything lost on restart),
+mysql or postgres, which need the connection URI's Secret.
+*/}}
+{{- define "cracha.spicedbEngine" -}}
+{{- $d := .Values.spicedb.datastore -}}
+{{- if not (has $d.engine (list "memory" "mysql" "postgres")) -}}
+{{- fail (printf "spicedb.datastore.engine must be memory, mysql or postgres, not %q" $d.engine) -}}
+{{- end -}}
+{{- if eq $d.engine "memory" -}}
+{{- if gt (int .Values.spicedb.replicas) 1 }}{{ fail "spicedb.datastore.engine memory holds the relationships in each pod: spicedb.replicas must be 1" }}{{ end -}}
+{{- if or $d.uriSecret.name $d.caSecret.name $d.clientCertSecret.name }}{{ fail "spicedb.datastore's Secrets need engine mysql or postgres" }}{{ end -}}
+{{- else -}}
+{{- if not $d.uriSecret.name }}{{ fail (printf "spicedb.datastore.uriSecret.name is required with engine %s: the Secret holding the connection URI" $d.engine) }}{{ end -}}
+{{- if and $d.clientCertSecret.name (ne $d.engine "postgres") }}{{ fail "spicedb.datastore.clientCertSecret needs engine postgres" }}{{ end -}}
+{{- end -}}
+{{ $d.engine }}
 {{- end -}}
 
 {{/*
@@ -220,4 +284,65 @@ for the fields Kubernetes counts in seconds. Anything else fails the render.
 {{- $m := regexFind "[0-9]+m" $d | trimSuffix "m" | int -}}
 {{- $s := regexFind "[0-9]+s" $d | trimSuffix "s" | int -}}
 {{ add (mul $h 3600) (mul $m 60) $s }}
+{{- end -}}
+
+{{/*
+The environment SpiceDB's containers (serve and migrate) reach the
+datastore with: the connection URI from its Secret and, with a CA Secret,
+SSL_CERT_FILE naming the mounted authority. Nothing for the memory engine.
+*/}}
+{{- define "cracha.spicedbDatastoreEnv" -}}
+{{- $d := .Values.spicedb.datastore -}}
+{{- if ne (include "cracha.spicedbEngine" .) "memory" -}}
+- name: SPICEDB_DATASTORE_CONN_URI
+  valueFrom:
+    secretKeyRef:
+      name: {{ $d.uriSecret.name }}
+      key: {{ $d.uriSecret.key }}
+{{- if $d.caSecret.name }}
+# The datastore server's authority, in place of the system roots, so that
+# tls=true (mysql) or sslmode=verify-full (postgres) verifies a private root.
+- name: SSL_CERT_FILE
+  value: /etc/spicedb/datastore-ca/{{ $d.caSecret.key }}
+{{- end }}
+{{- end -}}
+{{- end -}}
+
+{{/* The datastore's CA and client certificate mounts, if any. */}}
+{{- define "cracha.spicedbDatastoreMounts" -}}
+{{- $d := .Values.spicedb.datastore -}}
+{{- if $d.caSecret.name }}
+- name: datastore-ca
+  mountPath: /etc/spicedb/datastore-ca
+  readOnly: true
+{{- end }}
+{{- if $d.clientCertSecret.name }}
+- name: datastore-client
+  mountPath: /etc/spicedb/datastore-client
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{/* The datastore's CA and client certificate volumes, if any. */}}
+{{- define "cracha.spicedbDatastoreVolumes" -}}
+{{- $d := .Values.spicedb.datastore -}}
+{{- if $d.caSecret.name }}
+- name: datastore-ca
+  secret:
+    secretName: {{ $d.caSecret.name }}
+    items:
+      - key: {{ $d.caSecret.key }}
+        path: {{ $d.caSecret.key }}
+{{- end }}
+{{- if $d.clientCertSecret.name }}
+- name: datastore-client
+  secret:
+    secretName: {{ $d.clientCertSecret.name }}
+    defaultMode: 0400
+    items:
+      - key: {{ $d.clientCertSecret.certKey }}
+        path: tls.crt
+      - key: {{ $d.clientCertSecret.keyKey }}
+        path: tls.key
+{{- end }}
 {{- end -}}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
-	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -12,6 +11,9 @@ import (
 
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 	"github.com/bpalermo/cracha/broker/internal/authz"
+	"github.com/bpalermo/cracha/common/spicedb/conn"
+	"github.com/bpalermo/cracha/common/spiffetest"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -37,7 +39,7 @@ func fixture() *fakeSpiceDB {
 	bounded := parseRel("grant:prod-only#assignee_service@service:payments-api")
 	bounded.caveat, bounded.allowed = "in_clusters", []string{"prod-a", "prod-b"}
 	return newFake(token,
-		parseRel("service:payments-api#owner@team:payments"),
+		parseRel("service:payments-api#team@team:payments"),
 		parseRel("service:payments-api#member@workload:"+ledger),
 		parseRel("service:payments-api#member@workload:"+worker),
 		parseRel("grant:payments-ledger-rw#assignee_service@service:payments-api"),
@@ -196,9 +198,9 @@ func TestTags(t *testing.T) {
 			t.Errorf("trace %q does not say the subject is in 2 services", d.Trace)
 		}
 	})
-	t.Run("two owners", func(t *testing.T) {
+	t.Run("two teams", func(t *testing.T) {
 		f := fixture()
-		f.write(parseRel("service:payments-api#owner@team:finance"))
+		f.write(parseRel("service:payments-api#team@team:finance"))
 		d, err := newStore(f).ListGrants(context.Background(), subject, authz.Consistency{})
 		if err != nil {
 			t.Fatal(err)
@@ -241,11 +243,15 @@ func TestWatchMapping(t *testing.T) {
 		update("t1", parseRel("grant:break-glass#assignee_workload@workload:"+ledger)),
 		update("t2", parseRel("grant:prod-only#assignee_service@service:payments-api")),
 		update("t3", parseRel("service:payments-api#member@workload:"+worker)),
-		update("t4", parseRel("service:payments-api#owner@team:finance")),
+		update("t4", parseRel("service:payments-api#team@team:finance")),
 		update("t5", parseRel("workload:"+ledger+"#suspended@team:security")),
 		update("t6", parseRel("grant:break-glass#account@aws_account:111122223333")),
 		update("t7", parseRel("s3_bucket:data_2eraw#reader@workload:"+worker)),
 		update("t8", parseRel("s3_bucket:data-raw#writer@service:payments-api#member")),
+		// The write path's relations: nothing the broker reads.
+		update("t8a", parseRel("s3_bucket:data-raw#owner@workload:"+worker)),
+		update("t8b", parseRel("service:payments-api#approver@service:payments-api#member")),
+		update("t8c", parseRel("dynamodb_table:ledger#sensitive@workload:*")),
 		{ChangesThrough: &v1.ZedToken{Token: "t9"}, IsCheckpoint: true},
 	}
 	ch, err := newStore(f).Watch(context.Background(), "t0")
@@ -336,56 +342,21 @@ func TestWatchRefused(t *testing.T) {
 	}
 }
 
-func TestDialRefuses(t *testing.T) {
-	dir := t.TempDir()
-	tokenFile := dir + "/token"
-	if err := writeFile(tokenFile, "t0k3n\n"); err != nil {
-		t.Fatal(err)
-	}
-	tests := map[string]Config{
-		"no endpoint":        {TokenFile: tokenFile},
-		"no token file":      {Endpoint: "spicedb:50051"},
-		"missing token file": {Endpoint: "spicedb:50051", TokenFile: dir + "/missing"},
-		"empty token file":   {Endpoint: "spicedb:50051", TokenFile: dir + "/empty"},
-		"insecure with ca":   {Endpoint: "spicedb:50051", TokenFile: tokenFile, Insecure: true, CAFile: dir + "/ca.pem"},
-		"missing ca":         {Endpoint: "spicedb:50051", TokenFile: tokenFile, CAFile: dir + "/missing.pem"},
-		"ca without a cert":  {Endpoint: "spicedb:50051", TokenFile: tokenFile, CAFile: tokenFile},
-	}
-	if err := writeFile(dir+"/empty", " \n"); err != nil {
-		t.Fatal(err)
-	}
-	for name, cfg := range tests {
-		t.Run(name, func(t *testing.T) {
-			if s, err := Dial(cfg); err == nil {
-				s.Close()
-				t.Fatalf("accepted %+v", cfg)
-			}
-		})
-	}
-}
-
 func TestDial(t *testing.T) {
-	dir := t.TempDir()
-	if err := writeFile(dir+"/token", "t0k3n\n"); err != nil {
-		t.Fatal(err)
+	ca := spiffetest.NewCA(t, "cracha.test")
+	cfg := conn.Config{
+		Endpoint: "127.0.0.1:1",
+		Server:   spiffeid.RequireFromString("spiffe://cracha.test/ns/cracha-system/sa/cracha-spicedb"),
+		SVIDs:    ca.SVID(t, "spiffe://cracha.test/ns/cracha-system/sa/cracha-broker"),
+		Bundles:  ca.Bundle(),
 	}
-	for name, cfg := range map[string]Config{
-		"system roots": {Endpoint: "spicedb:50051", TokenFile: dir + "/token"},
-		"insecure":     {Endpoint: "spicedb:50051", TokenFile: dir + "/token", Insecure: true},
-	} {
-		t.Run(name, func(t *testing.T) {
-			s, err := Dial(cfg)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := s.Close(); err != nil {
-				t.Fatal(err)
-			}
-		})
+	if s, err := Dial(conn.Config{Endpoint: cfg.Endpoint}); err == nil {
+		s.Close()
+		t.Fatal("a configuration without an SVID source was accepted")
 	}
 	// The connection is lazy, so an endpoint nobody listens on fails the
 	// call, within the timeout, not Dial.
-	s, err := Dial(Config{Endpoint: "127.0.0.1:1", TokenFile: dir + "/token", Insecure: true}, WithTimeout(200*time.Millisecond))
+	s, err := Dial(cfg, WithTimeout(200*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -393,20 +364,6 @@ func TestDial(t *testing.T) {
 	if _, err := s.Check(context.Background(), subject, "g", authz.Consistency{}); err == nil {
 		t.Fatal("a call to nowhere succeeded")
 	}
-}
-
-func TestBearerToken(t *testing.T) {
-	md, err := bearerToken{token: "abc"}.GetRequestMetadata(context.Background())
-	if err != nil || md["authorization"] != "Bearer abc" {
-		t.Errorf("metadata %v, %v", md, err)
-	}
-	if !(bearerToken{}).RequireTransportSecurity() || (bearerToken{insecure: true}).RequireTransportSecurity() {
-		t.Error("transport security is required exactly when not insecure")
-	}
-}
-
-func writeFile(path, content string) error {
-	return os.WriteFile(path, []byte(content), 0o600)
 }
 
 func TestLookupResources(t *testing.T) {

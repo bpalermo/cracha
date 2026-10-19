@@ -1,0 +1,36 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "conn",
+    srcs = ["conn.go"],
+    importpath = "github.com/bpalermo/cracha/common/spicedb/conn",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_authzed_authzed_go//v1:authzed-go",
+        "@com_github_spiffe_go_spiffe_v2//bundle/x509bundle",
+        "@com_github_spiffe_go_spiffe_v2//spiffeid",
+        "@com_github_spiffe_go_spiffe_v2//spiffetls/tlsconfig",
+        "@com_github_spiffe_go_spiffe_v2//svid/x509svid",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//backoff",
+        "@org_golang_google_grpc//credentials",
+        "@org_golang_google_grpc//keepalive",
+    ],
+)
+
+go_test(
+    name = "conn_test",
+    srcs = ["conn_test.go"],
+    embed = [":conn"],
+    deps = [
+        "//common/spiffetest",
+        "@com_github_authzed_authzed_go//proto/authzed/api/v1:api",
+        "@com_github_spiffe_go_spiffe_v2//spiffeid",
+        "@com_github_spiffe_go_spiffe_v2//spiffetls/tlsconfig",
+        "@com_github_spiffe_go_spiffe_v2//svid/x509svid",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//credentials",
+        "@org_golang_google_grpc//metadata",
+        "@org_golang_google_grpc//peer",
+    ],
+)

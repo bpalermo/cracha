@@ -8,6 +8,10 @@ import (
 	"github.com/bpalermo/cracha/broker/internal/authz/spicedb"
 	"github.com/bpalermo/cracha/broker/internal/authz/static"
 	"github.com/bpalermo/cracha/broker/internal/bundle"
+	"github.com/bpalermo/cracha/common/spicedb/conn"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 )
 
 // authzStore is the broker's authorization store with whatever the backend
@@ -35,9 +39,10 @@ func (s authzStore) Close() error {
 // newStore opens the authorization backend the configuration names (design
 // 6.3): the static backend, with the assignments file read once or, empty
 // until the grant source verifies a first version, the published
-// assignments; or SpiceDB, dialed lazily so a SpiceDB that is down denies
-// requests rather than keeping the broker from starting.
-func newStore(cfg config, log *slog.Logger) (authzStore, error) {
+// assignments; or SpiceDB, dialed lazily through its gateway over SPIFFE
+// mTLS with the broker's own SVID and bundles (svids), so a SpiceDB that is
+// down denies requests rather than keeping the broker from starting.
+func newStore(cfg config, svids svidSource, log *slog.Logger) (authzStore, error) {
 	switch cfg.authzBackend {
 	case backendStatic:
 		if cfg.assignmentsSource == assignmentsPublished {
@@ -52,20 +57,50 @@ func newStore(cfg config, log *slog.Logger) (authzStore, error) {
 		log.Info("authorization backend static", "assignments_source", assignmentsFile, "path", cfg.assignments, "consistency_token", string(s.Token()))
 		return authzStore{Store: s}, nil
 	case backendSpiceDB:
-		s, err := spicedb.Dial(spicedb.Config{
-			Endpoint:  cfg.spicedbEndpoint,
-			TokenFile: cfg.spicedbTokenFile,
-			CAFile:    cfg.spicedbCA,
-			Insecure:  cfg.spicedbInsecure,
+		server, err := spicedbServerID(cfg, svids)
+		if err != nil {
+			return authzStore{}, err
+		}
+		s, err := spicedb.Dial(conn.Config{
+			Endpoint: cfg.spicedbEndpoint,
+			Server:   server,
+			SVIDs:    svids,
+			Bundles:  svids,
 		}, spicedb.WithTimeout(cfg.spicedbTimeout), spicedb.WithLogger(log))
 		if err != nil {
 			return authzStore{}, err
 		}
-		if cfg.spicedbInsecure {
-			log.Warn("speaking plaintext gRPC to SpiceDB; the preshared key travels in the clear")
-		}
-		log.Info("authorization backend spicedb", "endpoint", cfg.spicedbEndpoint, "ca", cfg.spicedbCA, "timeout", cfg.spicedbTimeout)
+		log.Info("authorization backend spicedb", "endpoint", cfg.spicedbEndpoint, "server_spiffe_id", server.String(), "timeout", cfg.spicedbTimeout)
 		return authzStore{Store: s, close: s.Close}, nil
 	}
 	return authzStore{}, fmt.Errorf("authorization backend %q is not static or spicedb", cfg.authzBackend)
+}
+
+// svidSource is the broker's X.509-SVID and its trust bundles: the
+// Workload API's X509Source in production.
+type svidSource interface {
+	x509svid.Source
+	x509bundle.Source
+}
+
+// spicedbServerID is the SPIFFE ID the SpiceDB gateway must present:
+// --spicedb-server-spiffe-id when it is a full ID, else that path, or the
+// default /ns/<namespace>/sa/cracha-spicedb, in the trust domain of the
+// broker's own SVID.
+func spicedbServerID(cfg config, svids x509svid.Source) (spiffeid.ID, error) {
+	if !cfg.spicedbServer.IsZero() {
+		return cfg.spicedbServer, nil
+	}
+	own, err := svids.GetX509SVID()
+	if err != nil {
+		return spiffeid.ID{}, fmt.Errorf("own X.509-SVID: %w", err)
+	}
+	if cfg.spicedbServerID == "" {
+		return conn.DefaultServerID(own.ID.TrustDomain(), cfg.namespace)
+	}
+	id, err := spiffeid.FromPath(own.ID.TrustDomain(), cfg.spicedbServerID)
+	if err != nil {
+		return spiffeid.ID{}, fmt.Errorf("--spicedb-server-spiffe-id %q: %w", cfg.spicedbServerID, err)
+	}
+	return id, nil
 }

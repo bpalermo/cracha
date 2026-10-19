@@ -1,0 +1,196 @@
+{{- if include "cracha.spicedbEnabled" . }}
+{{- $g := .Values.spicedb.gateway -}}
+{{- $read := list "authzed.api.v1.PermissionsService/CheckPermission" "authzed.api.v1.PermissionsService/LookupResources" "authzed.api.v1.PermissionsService/ReadRelationships" "authzed.api.v1.WatchService/Watch" -}}
+{{- $write := list "authzed.api.v1.PermissionsService/WriteRelationships" "authzed.api.v1.PermissionsService/DeleteRelationships" -}}
+{{- $schema := list "authzed.api.v1.SchemaService/WriteSchema" "authzed.api.v1.SchemaService/ReadSchema" -}}
+{{- $policies := list
+  (dict "client" "broker" "methods" $read)
+  (dict "client" "access" "methods" (concat $read $write))
+  (dict "client" "reconciler" "methods" $schema) -}}
+{{- if not (has $g.logLevel (list "trace" "debug" "info" "warning" "error" "critical")) -}}
+{{- fail (printf "spicedb.gateway.logLevel must be trace, debug, info, warning, error or critical, not %q" $g.logLevel) -}}
+{{- end -}}
+# The SpiceDB gateway's Envoy configuration (design 6.4): SPIFFE mTLS on
+# the pod's network with the pod's X.509-SVID from the SPIRE agent's SDS,
+# the RBAC table of spicedb.gateway (one policy per client SPIFFE ID, each
+# with exactly its gRPC methods; anything else PERMISSION_DENIED), and
+# SpiceDB on the pod's loopback behind it, with the preshared key added
+# from the environment (SPICEDB_PRESHARED_KEY, from the Secret this pod
+# alone mounts), never written here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cracha.name" . }}-spicedb-gateway
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: spicedb
+data:
+  envoy.yaml: |
+    node:
+      id: {{ include "cracha.name" . }}-spicedb-gateway
+      cluster: {{ include "cracha.name" . }}-spicedb-gateway
+    # The admin interface on the pod's loopback only: nothing outside the
+    # pod reaches it, and the health listener below forwards /ready alone.
+    admin:
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 9901 }
+    static_resources:
+      listeners:
+        - name: spicedb
+          address:
+            socket_address: { address: 0.0.0.0, port_value: {{ $g.port }} }
+          filter_chains:
+            - transport_socket:
+                name: envoy.transport_sockets.tls
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+                  # No client certificate, no handshake.
+                  require_client_certificate: true
+                  common_tls_context:
+                    alpn_protocols: [h2]
+                    tls_params:
+                      tls_minimum_protocol_version: TLSv1_2
+                    # The pod's own X.509-SVID and its trust domain's
+                    # bundle, as the SPIRE agent's SDS names them.
+                    tls_certificate_sds_secret_configs:
+                      - name: default
+                        sds_config:
+                          resource_api_version: V3
+                          api_config_source:
+                            api_type: GRPC
+                            transport_api_version: V3
+                            grpc_services:
+                              - envoy_grpc: { cluster_name: spire_agent }
+                    validation_context_sds_secret_config:
+                      name: ROOTCA
+                      sds_config:
+                        resource_api_version: V3
+                        api_config_source:
+                          api_type: GRPC
+                          transport_api_version: V3
+                          grpc_services:
+                            - envoy_grpc: { cluster_name: spire_agent }
+              filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: spicedb
+                    codec_type: HTTP2
+                    normalize_path: true
+                    merge_slashes: true
+                    path_with_escaped_slashes_action: REJECT_REQUEST
+                    # Watch streams stay open while nothing changes.
+                    stream_idle_timeout: 3600s
+                    route_config:
+                      name: spicedb
+                      virtual_hosts:
+                        - name: spicedb
+                          domains: ["*"]
+                          routes:
+                            - match: { prefix: "/" }
+                              route: { cluster: spicedb, timeout: 0s }
+                      # The key, on every call that passed the RBAC filter,
+                      # replacing anything the client sent.
+                      request_headers_to_add:
+                        - header:
+                            key: authorization
+                            value: "Bearer %ENVIRONMENT(SPICEDB_PRESHARED_KEY)%"
+                          append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                    http_filters:
+                      - name: envoy.filters.http.rbac
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+                          rules:
+                            action: ALLOW
+                            policies:
+                              {{- range $policies }}
+                              {{ .client }}:
+                                principals:
+                                  - authenticated:
+                                      principal_name:
+                                        exact: {{ include "cracha.gatewayIdentity" (dict "root" $ "client" .client) | quote }}
+                                permissions:
+                                  {{- range .methods }}
+                                  - url_path:
+                                      path:
+                                        exact: {{ printf "/%s" . | quote }}
+                                  {{- end }}
+                              {{- end }}
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+        # The kubelet's probes: /ready while SpiceDB passes its health
+        # checks, /live while Envoy serves; nothing else.
+        - name: health
+          address:
+            socket_address: { address: 0.0.0.0, port_value: {{ $g.healthPort }} }
+          filter_chains:
+            - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: health
+                    route_config:
+                      name: health
+                      virtual_hosts:
+                        - name: health
+                          domains: ["*"]
+                          routes:
+                            - match: { path: /live }
+                              direct_response: { status: 200, body: { inline_string: "ok\n" } }
+                            - match: { prefix: "/" }
+                              direct_response: { status: 404 }
+                    http_filters:
+                      - name: envoy.filters.http.health_check
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.health_check.v3.HealthCheck
+                          pass_through_mode: false
+                          headers:
+                            - name: ":path"
+                              string_match: { exact: /ready }
+                          cluster_min_healthy_percentages:
+                            spicedb: { value: 100 }
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      clusters:
+        # SpiceDB, on the pod's loopback.
+        - name: spicedb
+          type: STATIC
+          connect_timeout: 1s
+          typed_extension_protocol_options:
+            envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+              "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+              explicit_http_config:
+                http2_protocol_options: {}
+          load_assignment:
+            cluster_name: spicedb
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address: { address: 127.0.0.1, port_value: {{ .Values.spicedb.port }} }
+          health_checks:
+            - timeout: 1s
+              interval: 2s
+              unhealthy_threshold: 2
+              healthy_threshold: 1
+              grpc_health_check: {}
+        # The SPIRE agent's SDS, on the Workload API socket.
+        - name: spire_agent
+          type: STATIC
+          connect_timeout: 1s
+          typed_extension_protocol_options:
+            envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+              "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+              explicit_http_config:
+                http2_protocol_options: {}
+          load_assignment:
+            cluster_name: spire_agent
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        pipe: { path: /spiffe-workload-api/{{ .Values.spicedb.workloadAPI.socket }} }
+{{- end }}

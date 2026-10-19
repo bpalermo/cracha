@@ -1,7 +1,7 @@
-// Package mtlstest mints X.509-SVIDs for tests: a certificate authority for
+// Package spiffetest mints X.509-SVIDs for tests: a certificate authority for
 // one trust domain, the X.509 bundle that holds it, and SVIDs it signs, as
 // the static go-spiffe sources a TLS configuration takes.
-package mtlstest
+package spiffetest
 
 import (
 	"crypto/ecdsa"

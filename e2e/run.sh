@@ -11,12 +11,16 @@
 #
 # E2E_AUTHZ chooses the broker's authorization backend: static (the default)
 # reads the assignments grantc compiled from e2e/grants and published with
-# the bundle (broker.assignments.source published); spicedb also deploys
-# SpiceDB (e2e/manifests/spicedb.yaml) with a preshared key made here, has
-# cracha-reconciler, built from this checkout and run from the host through a
-# port-forward, write the schema and the relationships of e2e/grants, and
-# installs the chart with e2e/values-spicedb.yaml on top. The tests learn the
-# mode, the port-forward and the key from the environment (.bazelrc's
+# the bundle (broker.assignments.source published); spicedb installs the
+# chart with e2e/values-spicedb.yaml on top, which has it deploy SpiceDB on
+# its memory datastore behind its SPIFFE gateway, with a preshared key made
+# here that only the SpiceDB pod sees. The suite reaches the gateway from
+# the host through a port-forward, with X.509-SVIDs the SPIRE server mints
+# here for the identities it plays (spire-server x509 mint): the
+# reconciler, built from this checkout, writes the schema with its own, and
+# the tests write the suite's relationships with the access identity's and
+# probe the gateway's method table with all of them. The tests learn the
+# mode, the port-forward and the SVIDs from the environment (.bazelrc's
 # test:e2e); those that need SpiceDB skip in static mode.
 #
 # E2E_ENROL chooses how the agent enrols a pod (design 7.2): init (the
@@ -95,7 +99,13 @@ pulled="$(mktemp -d)"
 port_forward=""
 cleanup() {
 	if [[ -n "${port_forward}" ]]; then
+		# The loop first, then the kubectl it is waiting for.
+		children="$(pgrep -P "${port_forward}" || true)"
 		kill "${port_forward}" 2>/dev/null || true
+		if [[ -n "${children}" ]]; then
+			# shellcheck disable=SC2086 # one PID per word
+			kill ${children} 2>/dev/null || true
+		fi
 	fi
 	rm -rf "${kubeconfig}" "${bundle}" "${spicedb}" "${pulled}"
 	if [[ "${created}" == 1 && "${E2E_KEEP_CLUSTER:-0}" != 1 ]]; then
@@ -238,44 +248,18 @@ EOF
 } >"${bundle}/values.yaml"
 export E2E_BUNDLE_KEY="${bundle}/key.pem"
 
-# The authorization backend. In spicedb mode SpiceDB runs beside the chart
-# on its memory datastore, which supports the Watch API the broker's cache
-# flushes from and forgets everything when the pod restarts: it is restarted
-# here, so that it reads the preshared key just made (a kept cluster has an
-# older one), and never after. The reconciler, the writer of design 6.4,
-# runs from the host through a port-forward kubectl picks a local port for,
-# which stays open for the tests, with the schema first and then the
-# relationships of e2e/grants: the same tree the bundle and the published
-# assignments were compiled from.
+# The authorization backend. In spicedb mode the chart deploys SpiceDB, on
+# its memory datastore, behind the gateway; its preshared key is made here,
+# in a Secret only the SpiceDB pod mounts. The schema and the suite's
+# relationships are written once the release is up (below).
 authz_values=()
 if [[ "${authz}" == spicedb ]]; then
-	openssl rand -hex 32 >"${spicedb}/token"
+	# One line, no newline: the gateway sends it as a header value.
+	openssl rand -hex 32 | tr -d "\n" >"${spicedb}/token"
 	kubectl create secret generic cracha-e2e-spicedb -n cracha-system \
 		--from-file=token="${spicedb}/token" --dry-run=client -o yaml | kubectl apply -f -
-	kubectl apply -f e2e/manifests/spicedb.yaml
-	kubectl rollout restart deployment/cracha-spicedb -n cracha-system
-	kubectl rollout status deployment/cracha-spicedb -n cracha-system --timeout=300s
-	kubectl port-forward -n cracha-system svc/cracha-spicedb :50051 >"${spicedb}/port-forward.log" 2>&1 &
-	port_forward=$!
-	for _ in $(seq 1 60); do
-		if port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 50051$/\1/p' "${spicedb}/port-forward.log")" && [[ -n "${port}" ]]; then
-			break
-		fi
-		if ! kill -0 "${port_forward}" 2>/dev/null; then
-			break
-		fi
-		sleep 0.5
-	done
-	[[ -n "${port:-}" ]] || {
-		echo "e2e: kubectl port-forward to SpiceDB did not report a port:" >&2
-		cat "${spicedb}/port-forward.log" >&2
-		exit 1
-	}
-	spicedb_endpoint="127.0.0.1:${port}"
-	"${reconciler}" schema -endpoint "${spicedb_endpoint}" -token-file "${spicedb}/token" -insecure
-	"${reconciler}" apply -source e2e/grants -endpoint "${spicedb_endpoint}" -token-file "${spicedb}/token" -insecure
+	rm -f "${spicedb}/token"
 	authz_values=(--values e2e/values-spicedb.yaml)
-	export E2E_SPICEDB_ENDPOINT="${spicedb_endpoint}" E2E_SPICEDB_TOKEN_FILE="${spicedb}/token"
 fi
 export E2E_AUTHZ="${authz}"
 
@@ -310,6 +294,13 @@ kubectl apply -f e2e/manifests/stsstub.yaml
 # it pick up the images just loaded (against a published chart its workloads
 # are pinned by digest and the restart changes nothing). The STS stub starts
 # with an empty record either way.
+# In spicedb mode SpiceDB restarts first, which empties its memory
+# datastore and has it read the key just made (the schema is written
+# after), so that the broker restarted next connects to the new pod.
+if [[ "${authz}" == spicedb ]]; then
+	kubectl rollout restart deployment/cracha-spicedb -n cracha-system
+	kubectl rollout status deployment/cracha-spicedb -n cracha-system --timeout=300s
+fi
 workloads=(daemonset/cracha-agent deployment/cracha-broker deployment/cracha-webhook deployment/cracha-stsstub)
 for workload in "${workloads[@]}"; do
 	kubectl rollout restart "${workload}" -n cracha-system
@@ -320,6 +311,77 @@ done
 
 # The test namespace and its identities.
 kubectl apply -f e2e/manifests/e2e.yaml
+
+# SpiceDB's gateway, from the host: a port-forward kubectl picks a local
+# port for, which stays open for the tests, and an X.509-SVID for each
+# identity the suite plays, minted by the SPIRE server: the three the
+# gateway admits, under the release's service accounts (the reconciler's
+# runs nowhere: it is the identity of whoever writes the schema, CI or an
+# operator), and one it does not. Each is a directory of svid.pem, key.pem
+# and bundle.pem, the shape cracha-reconciler's -svid, -svid-key and
+# -bundle take. The reconciler writes the schema; the suite writes its
+# relationships as the access identity (e2e/spicedb_access_test.go).
+if [[ "${authz}" == spicedb ]]; then
+	# kubectl port-forward ends at the first connection the pod side
+	# resets, which a refused handshake does: it is started again, on the
+	# port it picked the first time.
+	(
+		target=":50051"
+		while true; do
+			kubectl port-forward -n cracha-system svc/cracha-spicedb "${target}" >>"${spicedb}/port-forward.log" 2>&1 || true
+			picked="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 50051$/\1/p' "${spicedb}/port-forward.log" | head -1)"
+			if [[ -n "${picked}" ]]; then
+				target="${picked}:50051"
+			fi
+			sleep 0.5
+		done
+	) &
+	port_forward=$!
+	for _ in $(seq 1 60); do
+		if port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 50051$/\1/p' "${spicedb}/port-forward.log" | head -1)" && [[ -n "${port}" ]]; then
+			break
+		fi
+		if ! kill -0 "${port_forward}" 2>/dev/null; then
+			break
+		fi
+		sleep 0.5
+	done
+	[[ -n "${port:-}" ]] || {
+		echo "e2e: kubectl port-forward to the SpiceDB gateway did not report a port:" >&2
+		cat "${spicedb}/port-forward.log" >&2
+		exit 1
+	}
+	spicedb_endpoint="127.0.0.1:${port}"
+	trust_domain=cracha.test
+	mint() {
+		local dir="${spicedb}/svids/$1"
+		mkdir -p "${dir}"
+		kubectl exec -n spire deployment/spire-server -- \
+			/opt/spire/bin/spire-server x509 mint -spiffeID "spiffe://${trust_domain}/$2" -ttl 1h >"${dir}/minted"
+		awk -v dir="${dir}" '
+			/^X509-SVID:/ { out = dir "/svid.pem"; next }
+			/^Private key:/ { out = dir "/key.pem"; next }
+			/^Root CAs:/ { out = dir "/bundle.pem"; next }
+			out != "" && NF { print > out }
+		' "${dir}/minted"
+		for file in svid.pem key.pem bundle.pem; do
+			[[ -s "${dir}/${file}" ]] || {
+				echo "e2e: spire-server x509 mint gave no ${file} for $2:" >&2
+				cat "${dir}/minted" >&2
+				exit 1
+			}
+		done
+	}
+	mint broker ns/cracha-system/sa/cracha-broker
+	mint access ns/cracha-system/sa/cracha-access
+	mint reconciler ns/cracha-system/sa/cracha-reconciler
+	mint intruder ns/e2e/sa/intruder
+	"${reconciler}" schema -endpoint "${spicedb_endpoint}" \
+		-server-spiffe-id "spiffe://${trust_domain}/ns/cracha-system/sa/cracha-spicedb" \
+		-svid "${spicedb}/svids/reconciler/svid.pem" -svid-key "${spicedb}/svids/reconciler/key.pem" \
+		-bundle "${spicedb}/svids/reconciler/bundle.pem"
+	export E2E_SPICEDB_ENDPOINT="${spicedb_endpoint}" E2E_SPICEDB_SVIDS="${spicedb}/svids"
+fi
 
 # E2E_FILTER runs only the tests whose name matches, for working on one.
 tests=()

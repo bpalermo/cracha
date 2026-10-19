@@ -109,25 +109,22 @@ broker:
   #   static   the assignments of `assignments` below, held in memory: a
   #            document of this install's, or the published ones.
   #   spicedb  the reference backend (design 6.4; broker/internal/authz/
-  #            spicedb), reached over gRPC with the knobs under `spicedb`:
-  #     endpoint     host:port of SpiceDB.
-  #     tokenSecret  a Secret you keep, with the preshared key under `key`.
-  #                  It is mounted as a file, never put in the environment.
-  #     ca           the PEM bundle SpiceDB's certificate is verified with
-  #                  when it is not the system roots; the chart puts it in a
-  #                  ConfigMap.
-  #     insecure     plaintext gRPC, the key in the clear: for kind only.
-  #                  Excludes ca.
-  #     timeout      how long one SpiceDB call may take.
+  #            spicedb), reached through SpiceDB's gateway over SPIFFE mTLS
+  #            with the broker's own X.509-SVID; the broker holds no key and
+  #            the gateway admits it to the read methods only. The chart
+  #            deploys SpiceDB and the gateway (`spicedb` below) unless
+  #            spicedb.enabled is false. The knobs under `spicedb`:
+  #     endpoint        host:port of the gateway; empty for the chart's own,
+  #                     <name>-spicedb.<namespace>.svc:<spicedb.gateway.port>.
+  #     serverSpiffeID  the SPIFFE ID the gateway must present: a full ID, or
+  #                     empty for /ns/<namespace>/sa/<name>-spicedb in the
+  #                     broker's own trust domain, the chart's gateway.
+  #     timeout         how long one SpiceDB call may take.
   authz:
     backend: static
     spicedb:
       endpoint: ""
-      tokenSecret:
-        name: ""
-        key: token
-      ca: ""
-      insecure: false
+      serverSpiffeID: ""
       timeout: 5s
 
   # The static backend's assignments (broker/internal/authz/static), used
@@ -541,4 +538,187 @@ webhook:
       memory: 32Mi
     limits:
       memory: 128Mi
+  podAnnotations: {}
+
+# SpiceDB, the store of the spicedb authorization backend (design 6.4),
+# rendered when broker.authz.backend is spicedb and `enabled` is true. Each
+# pod runs two containers: SpiceDB, listening in plaintext on the pod's
+# loopback only, with its preshared key from a Secret only this pod mounts;
+# and the gateway, an Envoy sidecar, the only thing reachable from outside
+# the pod. The gateway serves SPIFFE mTLS on `gateway.port` with the pod's
+# X.509-SVID from the SPIRE agent's SDS (the Workload API socket), admits
+# exactly the identities and gRPC methods of the table below (any other
+# call, or any other SPIFFE ID, is answered PERMISSION_DENIED; a client
+# without a certificate fails the handshake), and forwards to SpiceDB with
+# `authorization: Bearer <preshared key>`. The gateway is a sidecar rather
+# than a Deployment of its own so that nothing depends on a NetworkPolicy
+# being enforced: SpiceDB's port is not on the pod's network at all.
+#
+#   client      SPIFFE ID (default)                       methods
+#   broker      /ns/<namespace>/sa/<name>-broker      PermissionsService/CheckPermission,
+#                                                     /LookupResources, /ReadRelationships;
+#                                                     WatchService/Watch
+#   access      /ns/<namespace>/sa/<name>-access      the broker's, and PermissionsService/
+#                                                     WriteRelationships, /DeleteRelationships
+#   reconciler  /ns/<namespace>/sa/<name>-reconciler  SchemaService/WriteSchema, /ReadSchema
+spicedb:
+  enabled: true
+
+  # SpiceDB with a shared datastore is stateless; two replicas by default.
+  # The memory engine needs exactly one. A PodDisruptionBudget keeping all
+  # but one up is created when there is more than one.
+  replicas: 2
+
+  # The release authzed/spicedb publishes to ghcr.io, Docker Hub and quay.io
+  # under one index, pinned by tag and by the index digest, which
+  # `docker buildx imagetools inspect ghcr.io/authzed/spicedb:v1.56.2`
+  # reported. Pinned by hand, like every image the chart does not build.
+  image:
+    repository: ghcr.io/authzed/spicedb
+    tag: v1.56.2
+    digest: sha256:aa96009a0477f8a759149823407d47ad16d1a74390bae3102b3b0b7143502764
+    pullPolicy: IfNotPresent
+
+  # The port SpiceDB serves gRPC on, on the pod's loopback (127.0.0.1)
+  # only; the gateway forwards to it. Not on the pod's network.
+  port: 50052
+
+  # SpiceDB's preshared key: a Secret you keep, mounted by this pod alone
+  # (SpiceDB reads it, the gateway adds it to every call it forwards). No
+  # client of SpiceDB holds it. One line with no trailing newline, since it
+  # travels as a header value (`openssl rand -hex 32 | tr -d '\n'`).
+  # Required.
+  presharedKeySecret:
+    name: ""
+    key: preshared-key
+
+  # The datastore every replica shares:
+  #   engine            memory (development and kind: one replica, nothing
+  #                     survives a restart), mysql or postgres.
+  #   uriSecret         with mysql or postgres, a Secret you keep holding the
+  #                     connection URI under `key` (SpiceDB's
+  #                     --datastore-conn-uri), for the SpiceDB pods and the
+  #                     migration Job.
+  #   caSecret          optional: a Secret with the PEM of the authority the
+  #                     datastore server's certificate chains to, under
+  #                     `key`, mounted and named by SSL_CERT_FILE, so a URI
+  #                     with tls=true (mysql) or sslmode=verify-full
+  #                     (postgres) verifies a private root. It replaces the
+  #                     system roots in SpiceDB's containers, which make no
+  #                     other TLS connection (telemetry is off).
+  #   clientCertSecret  optional, postgres only: a Secret with a client
+  #                     certificate and key (`certKey`, `keyKey`) mounted at
+  #                     /etc/spicedb/datastore-client, for a URI that logs in
+  #                     by certificate:
+  #                       postgres://spicedb@db:5432/spicedb?sslmode=verify-full&sslrootcert=/etc/spicedb/datastore-ca/ca.pem&sslcert=/etc/spicedb/datastore-client/tls.crt&sslkey=/etc/spicedb/datastore-client/tls.key
+  #                     The chart does not rotate it: a new certificate in
+  #                     the Secret reaches the pods as the kubelet updates
+  #                     the volume.
+  datastore:
+    engine: memory
+    uriSecret:
+      name: ""
+      key: uri
+    caSecret:
+      name: ""
+      key: ca.pem
+    clientCertSecret:
+      name: ""
+      certKey: tls.crt
+      keyKey: tls.key
+
+  # The migration Job, the one owner of the datastore's schema migrations
+  # (SpiceDB's serve never migrates): `spicedb migrate head`, a Helm
+  # pre-install and pre-upgrade hook, so an upgrade migrates before the new
+  # pods start. Not rendered for the memory engine, which has nothing to
+  # migrate.
+  migration:
+    enabled: true
+    timeout: 1h
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
+
+  # SpiceDB's log level: trace, debug, info, warn or error.
+  logLevel: info
+
+  # The gateway (Envoy), the pod's one listener.
+  gateway:
+    # The official distroless Envoy image, pinned by tag and by the index
+    # digest, which `docker buildx imagetools inspect
+    # envoyproxy/envoy:distroless-v1.39.4` reported.
+    image:
+      repository: docker.io/envoyproxy/envoy
+      tag: distroless-v1.39.4
+      digest: sha256:ccb37e93d8274a525fe00d67287716dbe3d58bc4237d7627af9e64fae0fd25c8
+      pullPolicy: IfNotPresent
+
+    # The SPIFFE mTLS port, in the pod and on the Service <name>-spicedb.
+    port: 50051
+
+    # The plaintext port the kubelet's probes are answered on: /ready (the
+    # gateway is serving and SpiceDB answers its health checks) and /live.
+    # Nothing else is served on it, and Envoy's admin interface stays on
+    # the pod's loopback (127.0.0.1:9901).
+    healthPort: 8080
+
+    # The trust domain of the gateway's clients, for the default SPIFFE IDs
+    # of the table above. Required with the chart's SpiceDB.
+    trustDomain: ""
+
+    # The SPIFFE IDs the gateway admits, each to its methods; empty for the
+    # default of the table above. A full ID: spiffe://<td>/<path>.
+    identities:
+      broker: ""
+      access: ""
+      reconciler: ""
+
+    # The Envoy log level: trace, debug, info, warning, error or critical.
+    logLevel: info
+
+    resources:
+      requests:
+        cpu: 25m
+        memory: 32Mi
+      limits:
+        memory: 128Mi
+
+  # The SPIFFE Workload API the gateway's X.509-SVID and trust bundle come
+  # from (as SDS: the SPIRE agent serves Envoy's SDS on the Workload API
+  # socket, the SVID as "default" and the trust domain's bundle as
+  # "ROOTCA"), shaped as the broker's.
+  workloadAPI:
+    volume:
+      type: hostPath
+      hostPath:
+        path: /run/spire/agent-sockets
+        type: Directory
+      csi:
+        driver: csi.spiffe.io
+        readOnly: true
+    socket: spire-agent.sock
+
+  # A NetworkPolicy admitting traffic to the pods' gateway and health ports
+  # only (from `from`, a list of NetworkPolicyPeers; empty admits every
+  # source) and none to anything else. Off by default: the design does not
+  # rely on it, since SpiceDB is not on the pod's network, but where a CNI
+  # enforces it it narrows who can reach the gateway's handshake.
+  networkPolicy:
+    enabled: false
+    from: []
+
+  priorityClassName: ""
+  nodeSelector: {}
+  tolerations: []
+  # SpiceDB's own resources. Its memory grows with the caches it keeps;
+  # with the memory engine, with every relationship too.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 1Gi
   podAnnotations: {}

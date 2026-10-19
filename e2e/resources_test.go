@@ -11,7 +11,10 @@ import (
 	"testing"
 	"time"
 
+	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 	corev1 "k8s.io/api/core/v1"
+
+	schema "github.com/bpalermo/cracha/common/spicedb"
 )
 
 // Resource-level access (design 6.2 and 6.4, Level 3) through the
@@ -25,8 +28,9 @@ import (
 // it finds, and checks each against the account's envelope
 // (arn:aws:s3:::cracha-e2e-*), on the account role, which e2e-s3-reader
 // names as its own. The tests run in both modes: in static mode a change
-// is a new publication (published_test.go's), in spicedb mode a reconcile
-// (spicedb_test.go's), and both are put back.
+// is a new publication (published_test.go's), in spicedb mode a write of
+// the relationships as the access service (spicedb_access_test.go), and
+// both are put back.
 
 const (
 	lookupGrantName      = "account:e2e:s3_bucket:read"
@@ -115,18 +119,23 @@ func fetchingReader(ctx context.Context, t *testing.T, name string) *corev1.Pod 
 	return pod
 }
 
+// relChange is a change of the tree in spicedb mode's terms: the
+// relationships it adds and those it takes away.
+type relChange struct {
+	touch, delete []*v1.Relationship
+}
+
 // changeTree puts a changed grant tree in force the way the mode does:
 // in static mode a publication of its bundle and assignments (the bundle
-// from bundleTree, which is usually the same tree), in spicedb mode a
-// reconcile of its relationships (the broker's bundle is the one run.sh
-// published, so bundleTree is not used). The tree run.sh used is put back
-// when the test ends, or earlier through the function returned.
-func changeTree(ctx context.Context, t *testing.T, bundleTree, tree string) (restore func(context.Context)) {
+// from bundleTree, which is usually the same tree), in spicedb mode the
+// write of its relationships, change, as the access service (the broker's
+// bundle is the one run.sh published, so bundleTree is not used). What
+// run.sh and the suite put in force is put back when the test ends, or
+// earlier through the function returned.
+func changeTree(ctx context.Context, t *testing.T, bundleTree, tree string, change relChange) (restore func(context.Context)) {
 	t.Helper()
 	if os.Getenv(authzEnv) == spicedbMode {
-		restoreSource(t)
-		reconcile(ctx, t, tree)
-		return func(ctx context.Context) { reconcile(ctx, t, grantSource) }
+		return changeRelationships(ctx, t, change)
 	}
 	requireStatic(t)
 	original := bundleData(ctx, t)
@@ -151,6 +160,36 @@ func changeTree(ctx context.Context, t *testing.T, bundleTree, tree string) (res
 	at := time.Now()
 	setBundleData(ctx, t, mixedPublication(ctx, t, bundleTree, tree, original))
 	waitForVersion(ctx, t, at, republishedVersion)
+	return restore
+}
+
+// changeRelationships writes the change and returns its undoing, which
+// also runs when the test ends if nothing called it.
+func changeRelationships(ctx context.Context, t *testing.T, change relChange) func(context.Context) {
+	t.Helper()
+	restored := false
+	restore := func(ctx context.Context) {
+		if len(change.touch) > 0 {
+			mustWrite(ctx, t, v1.RelationshipUpdate_OPERATION_DELETE, change.touch...)
+		}
+		if len(change.delete) > 0 {
+			mustWrite(ctx, t, v1.RelationshipUpdate_OPERATION_TOUCH, change.delete...)
+		}
+		restored = true
+	}
+	t.Cleanup(func() {
+		if !restored {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			restore(ctx)
+		}
+	})
+	if len(change.delete) > 0 {
+		mustWrite(ctx, t, v1.RelationshipUpdate_OPERATION_DELETE, change.delete...)
+	}
+	if len(change.touch) > 0 {
+		mustWrite(ctx, t, v1.RelationshipUpdate_OPERATION_TOUCH, change.touch...)
+	}
 	return restore
 }
 
@@ -231,7 +270,7 @@ func TestImplicitGrantFollowsAccess(t *testing.T) {
 	defer cancel()
 	pod := fetchingReader(ctx, t, "reader-access")
 	changedAt := time.Now()
-	restore := changeTree(ctx, t, grantSource, modifiedSource(t, withoutReaderAccess))
+	restore := changeTree(ctx, t, grantSource, modifiedSource(t, withoutReaderAccess), relChange{delete: []*v1.Relationship{readerDataAccess}})
 	alone := waitForFetch(ctx, t, pod, changedAt, "credentials without the implicit grant", func(e *exchange) bool {
 		return e.Status == 200 && strings.Join(e.Headers["Cracha-Grants"], ",") == grantName
 	})
@@ -259,7 +298,9 @@ func TestImplicitOutsideEnvelopeIsRefused(t *testing.T) {
 	defer cancel()
 	pod := fetchingReader(ctx, t, "reader-outside")
 	changedAt := time.Now()
-	restore := changeTree(ctx, t, grantSource, modifiedSource(t, withOutsideAccess))
+	restore := changeTree(ctx, t, grantSource, modifiedSource(t, withOutsideAccess), relChange{touch: []*v1.Relationship{
+		rel(schema.TypeS3Bucket, bucketID(outsideBucket), schema.RelationReader, schema.TypeService, "e2e-reader", schema.RelationMember),
+	}})
 	denied := waitForFetch(ctx, t, pod, changedAt, "a refusal", status(403))
 	if r := denied.Exchange.reason(); r != reasonOutside {
 		t.Errorf("refused with %q, want %q: %s", r, reasonOutside, denied.Exchange.Body)
