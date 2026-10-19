@@ -20,7 +20,7 @@ exports_files([
     # //bazel/cosign:workflow_pin_test holds it to the Bazel pin.
     ".github/workflows/grants.yml",
     ".shellcheckrc",
-    # //third_party/spicedb:spicedb_test holds SpiceDB's version to it.
+    # //bazel/spicedb:spicedb_test holds SpiceDB's version to it.
     "go.mod",
     # The release being worked towards; see bazel/workspace_status.sh.
     "VERSION",

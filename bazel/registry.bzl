@@ -2,7 +2,7 @@
 
 Every published coordinate is derived from the constants below: the
 `image_push` of each `go_image` (//broker:image_push, //agent:image_push,
-//webhook:image_push, //third_party/spicedb:image_push), the chart push
+//webhook:image_push, //bazel/spicedb:image_push), the chart push
 (//charts/cracha:cracha.push_registry) and the chart's default image
 repositories (charts/cracha/values.yaml, which takes each from its
 image_push). Shell and the workflows read it through

@@ -1,5 +1,5 @@
 // Package spicedb_test is the smoke test of the SpiceDB binary Crachá builds
-// and publishes (//third_party/spicedb:spicedb): it reports this build's
+// and publishes (//bazel/spicedb:spicedb): it reports this build's
 // version, it has the flags of the MySQL client TLS patch, and it serves a
 // schema write, a relationship write and a permission check end to end on the
 // in-memory datastore.
@@ -83,7 +83,7 @@ func TestVersionMatchesGoMod(t *testing.T) {
 	release, _, _ := strings.Cut(os.Getenv("SPICEDB_VERSION"), "-cracha.")
 	want := "\tgithub.com/authzed/spicedb " + release + "\n"
 	if !strings.Contains(string(gomod), want) {
-		t.Fatalf("go.mod does not require github.com/authzed/spicedb %s, the release SPICEDB_VERSION of //third_party/spicedb names", release)
+		t.Fatalf("go.mod does not require github.com/authzed/spicedb %s, the release SPICEDB_VERSION of //bazel/spicedb names", release)
 	}
 }
 

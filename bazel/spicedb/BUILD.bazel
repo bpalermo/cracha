@@ -23,7 +23,7 @@ exports_files(glob(["*.patch"]))
 
 # The version `spicedb version` reports: upstream's release with a suffix
 # saying it is this build. Keep the release equal to go.mod's
-# (//third_party/spicedb:spicedb_test checks it), and bump the suffix when
+# (//bazel/spicedb:spicedb_test checks it), and bump the suffix when
 # the patch changes without the release changing.
 SPICEDB_VERSION = "v1.56.2-cracha.1"
 

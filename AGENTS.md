@@ -343,10 +343,11 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   a composition of two accounts is `accounts_mixed`, and one with neither
   a session policy nor managed policies is refused, since on a shared
   account role it would be the role's whole policy.
-- `bazel/` holds build rules; `docs/` the design; `charts/cracha` the Helm
+- `bazel/` holds build rules, and `bazel/spicedb` the third-party SpiceDB
+  binary Crachá builds and publishes from its upstream module plus the
+  patches beside it (below); `docs/` the design; `charts/cracha` the Helm
   chart; `e2e/` the end-to-end suite with its values files, the fixtures it
-  deploys beside the chart and the two images only it uses; `third_party/`
-  the third-party binaries Crachá builds and publishes (SpiceDB, below).
+  deploys beside the chart and the two images only it uses.
 
 ## Images and versions
 
@@ -355,7 +356,7 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 - Images are built with the `go_image` macro in `bazel/image/defs.bzl`, from
   pure-Go binaries on a digest-pinned distroless base. Image repositories are
   `broker`, `agent`, `webhook` and `spicedb`.
-- `spicedb` (`//third_party/spicedb`) is a third-party binary: SpiceDB built
+- `spicedb` (`//bazel/spicedb`) is a third-party binary: SpiceDB built
   from a pinned upstream release (`github.com/authzed/spicedb` in `go.mod`, a
   `tool`, so nothing imports it) plus one reviewed patch,
   `0001-mysql-client-tls.patch` (MySQL client TLS:
@@ -366,7 +367,7 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   patches after Gazelle runs. The binary is built as upstream's release is
   (cgo off, the `memoryprotection` tag, `-checklinkname=0`) and `spicedb
   version` reports `SPICEDB_VERSION` of its BUILD file, the release with a
-  `-cracha.<n>` suffix; `//third_party/spicedb:spicedb_test` checks the
+  `-cracha.<n>` suffix; `//bazel/spicedb:spicedb_test` checks the
   version against `go.mod`, the patch's flags, and a schema write and
   permission check against the binary. To bump SpiceDB: rebase Bruno's fork
   branch `mysql-client-tls-v<version>` of bpalermo/spicedb onto the new

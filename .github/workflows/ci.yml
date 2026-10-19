@@ -92,7 +92,7 @@ jobs:
             //broker:image_push //broker:image_index
             //agent:image_push //agent:image_index
             //webhook:image_push //webhook:image_index
-            //third_party/spicedb:image_push //third_party/spicedb:image_index
+            //bazel/spicedb:image_push //bazel/spicedb:image_index
             //charts/cracha:cracha //charts/cracha:cracha.push_registry
             //bazel/cosign:cosign //bazel/cosign:verify_image
             //grantc:grantc_linux_amd64 //grantc:grantc_linux_arm64

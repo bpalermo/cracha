@@ -83,7 +83,7 @@ go_deps.from_file(go_mod = "//:go.mod")
     ]
 ]
 
-# SpiceDB itself (//third_party/spicedb) commits its generated Go beside the
+# SpiceDB itself (//bazel/spicedb) commits its generated Go beside the
 # .proto sources. Its release build sets the `memoryprotection` tag, whose
 # files Gazelle leaves out of the BUILD files unless told the tag is on.
 go_deps.gazelle_override(
@@ -91,24 +91,24 @@ go_deps.gazelle_override(
     directives = [
         "gazelle:proto disable_global",
         "gazelle:build_tags memoryprotection",
-        # The binary is linked by //third_party/spicedb, which embeds the
+        # The binary is linked by //bazel/spicedb, which embeds the
         # library of cmd/spicedb, private to its package otherwise.
-        "gazelle:go_visibility @@//third_party/spicedb:__pkg__",
+        "gazelle:go_visibility @@//bazel/spicedb:__pkg__",
     ],
     path = "github.com/authzed/spicedb",
 )
 
 # SpiceDB, built from its pinned release (go.mod, a `tool` so nothing has to
 # import it) plus Crachá's one change, MySQL client TLS, and published as
-# Crachá's `spicedb` image (//third_party/spicedb). Patches apply after
+# Crachá's `spicedb` image (//bazel/spicedb). Patches apply after
 # Gazelle has generated the BUILD files, so the second patch adds the file
 # the first creates to its package's BUILD file. Bump procedure: AGENTS.md,
 # "Images and versions".
 go_deps.module_override(
     patch_strip = 1,
     patches = [
-        "//third_party/spicedb:0001-mysql-client-tls.patch",
-        "//third_party/spicedb:0002-bazel-build-files.patch",
+        "//bazel/spicedb:0001-mysql-client-tls.patch",
+        "//bazel/spicedb:0002-bazel-build-files.patch",
     ],
     path = "github.com/authzed/spicedb",
 )
