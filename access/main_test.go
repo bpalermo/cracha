@@ -199,4 +199,10 @@ func TestDialNeedsServer(t *testing.T) {
 	if _, _, err := dial(context.Background(), connFlags{server: "x:1", serverID: "nope"}); err == nil {
 		t.Error("dialed a bad SPIFFE ID")
 	}
+	if _, _, err := dial(context.Background(), connFlags{server: "x:1", serverID: "spiffe://example.org/x", svid: "/a"}); err == nil {
+		t.Error("dialed with an SVID file and no key or bundle")
+	}
+	if _, _, err := dial(context.Background(), connFlags{server: "x:1", serverID: "spiffe://example.org/x", svid: "/a", svidKey: "/b", bundle: "/c"}); err == nil {
+		t.Error("dialed with SVID files that do not exist")
+	}
 }

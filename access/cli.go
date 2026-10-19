@@ -10,7 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 
 	"github.com/bpalermo/cracha/access/internal/api"
@@ -50,7 +52,11 @@ type connFlags struct {
 	server      string
 	serverID    string
 	workloadAPI string
-	timeout     time.Duration
+	// svid, svidKey and bundle are PEM files of an X.509-SVID, its key and
+	// its trust bundle, instead of the Workload API: an SVID a job was
+	// handed (spire-server x509 mint, a CI system's issuer).
+	svid, svidKey, bundle string
+	timeout               time.Duration
 }
 
 func (f *connFlags) bind(fs *flag.FlagSet, e env, lookup func(string) (string, bool)) {
@@ -61,7 +67,34 @@ func (f *connFlags) bind(fs *flag.FlagSet, e env, lookup func(string) (string, b
 	fs.StringVar(&f.server, "server", e.str("access-server", ""), "cracha-access's gRPC address, host:port (CRACHA_ACCESS_SERVER)")
 	fs.StringVar(&f.serverID, "server-spiffe-id", e.str("access-spiffe-id", ""), "cracha-access's SPIFFE ID, which its certificate must carry (CRACHA_ACCESS_SPIFFE_ID)")
 	fs.StringVar(&f.workloadAPI, "workload-api-socket", socket, "the SPIFFE Workload API the caller's SVID comes from (SPIFFE_ENDPOINT_SOCKET)")
+	fs.StringVar(&f.svid, "svid", "", "PEM X.509-SVID to call with, instead of the Workload API's (with --svid-key and --bundle)")
+	fs.StringVar(&f.svidKey, "svid-key", "", "PEM private key of --svid")
+	fs.StringVar(&f.bundle, "bundle", "", "PEM trust bundle of --svid's trust domain, which verifies cracha-access")
 	fs.DurationVar(&f.timeout, "timeout", 30*time.Second, "deadline of the call")
+}
+
+// sources are the caller's SVID and bundles: the files given, or the
+// Workload API's, which close releases.
+func (f connFlags) sources(ctx context.Context) (x509svid.Source, x509bundle.Source, func(), error) {
+	if f.svid == "" && f.svidKey == "" && f.bundle == "" {
+		src, err := workloadapi.NewX509Source(ctx, workloadapi.WithClientOptions(workloadapi.WithAddr(f.workloadAPI)))
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("workload api %s: %w", f.workloadAPI, err)
+		}
+		return src, src, func() { _ = src.Close() }, nil
+	}
+	if f.svid == "" || f.svidKey == "" || f.bundle == "" {
+		return nil, nil, nil, errors.New("--svid, --svid-key and --bundle go together")
+	}
+	svid, err := x509svid.Load(f.svid, f.svidKey)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("--svid: %w", err)
+	}
+	bundle, err := x509bundle.Load(svid.ID.TrustDomain(), f.bundle)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("--bundle: %w", err)
+	}
+	return svid, bundle, func() {}, nil
 }
 
 // dial connects to the service with the caller's SVID. Tests replace it.
@@ -73,16 +106,16 @@ var dial = func(ctx context.Context, f connFlags) (accessAPI, func(), error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("--server-spiffe-id: %w", err)
 	}
-	src, err := workloadapi.NewX509Source(ctx, workloadapi.WithClientOptions(workloadapi.WithAddr(f.workloadAPI)))
+	svids, bundles, release, err := f.sources(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("workload api %s: %w", f.workloadAPI, err)
-	}
-	conn, err := api.Dial(f.server, src, src, id)
-	if err != nil {
-		_ = src.Close()
 		return nil, nil, err
 	}
-	return api.NewClient(conn), func() { _ = conn.Close(); _ = src.Close() }, nil
+	conn, err := api.Dial(f.server, svids, bundles, id)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	return api.NewClient(conn), func() { _ = conn.Close(); release() }, nil
 }
 
 func runCLI(ctx context.Context, name string, cmd command, args []string, lookup func(string) (string, bool), stdout, stderr io.Writer) int {
