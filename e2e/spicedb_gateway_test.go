@@ -99,6 +99,21 @@ func watch(ctx context.Context, c *authzed.Client) error {
 	return err
 }
 
+// answer is the code the gateway answers a probe with. UNAVAILABLE is
+// never the answer looked for, but what the client sees when the suite's
+// port-forward, which ends at a connection the pod side resets, is being
+// started again (run.sh): the probe is retried then.
+func answer(ctx context.Context, c *authzed.Client, call probe) codes.Code {
+	for range 5 {
+		code := grpcstatus.Code(call(ctx, c))
+		if code != codes.Unavailable {
+			return code
+		}
+		time.Sleep(time.Second)
+	}
+	return codes.Unavailable
+}
+
 // The method table, each identity against every method: allowed is
 // answered by SpiceDB (OK), anything else PERMISSION_DENIED by the gateway.
 func TestSpiceDBGatewayMethodTable(t *testing.T) {
@@ -131,7 +146,7 @@ func TestSpiceDBGatewayMethodTable(t *testing.T) {
 						want = codes.OK
 					}
 				}
-				if got := grpcstatus.Code(call(ctx, c)); got != want {
+				if got := answer(ctx, c, call); got != want {
 					t.Errorf("%s as %s: %v, want %v", name, identity, got, want)
 				}
 			}
@@ -146,14 +161,17 @@ func TestSpiceDBGatewayBrokerCannotWrite(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	c := mustDialAs(t, identityBroker)
-	if err := checkPermission(ctx, c); err != nil {
-		t.Fatalf("the broker cannot read: %v", err)
+	if code := answer(ctx, c, checkPermission); code != codes.OK {
+		t.Fatalf("the broker cannot read: %v", code)
 	}
-	_, err := c.WriteRelationships(ctx, &v1.WriteRelationshipsRequest{Updates: []*v1.RelationshipUpdate{
-		{Operation: v1.RelationshipUpdate_OPERATION_TOUCH, Relationship: rel(schema.TypeGrant, "e2e-s3-reader", schema.RelationAssigneeWorkload, schema.TypeWorkload, workloadID(unassignedSA), "")},
-	}})
-	if grpcstatus.Code(err) != codes.PermissionDenied {
-		t.Fatalf("the broker's write: %v, want PERMISSION_DENIED", err)
+	write := func(ctx context.Context, c *authzed.Client) error {
+		_, err := c.WriteRelationships(ctx, &v1.WriteRelationshipsRequest{Updates: []*v1.RelationshipUpdate{
+			{Operation: v1.RelationshipUpdate_OPERATION_TOUCH, Relationship: rel(schema.TypeGrant, "e2e-s3-reader", schema.RelationAssigneeWorkload, schema.TypeWorkload, workloadID(unassignedSA), "")},
+		}})
+		return err
+	}
+	if code := answer(ctx, c, write); code != codes.PermissionDenied {
+		t.Fatalf("the broker's write: %v, want PERMISSION_DENIED", code)
 	}
 }
 
