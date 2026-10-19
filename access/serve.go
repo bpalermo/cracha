@@ -17,10 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/accessanalyzer"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/spiffe/go-spiffe/v2/spiffegrpc/grpccredentials"
-	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
-	"google.golang.org/grpc"
 
 	"github.com/bpalermo/cracha/access/internal/api"
 	"github.com/bpalermo/cracha/access/internal/audit"
@@ -29,6 +26,7 @@ import (
 	"github.com/bpalermo/cracha/access/internal/store"
 	"github.com/bpalermo/cracha/common/grant"
 	"github.com/bpalermo/cracha/common/publication"
+	"github.com/bpalermo/cracha/common/spicedb/conn"
 	"github.com/bpalermo/cracha/common/version"
 )
 
@@ -40,9 +38,9 @@ func newLogger(level string) (*slog.Logger, error) {
 	return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: l})), nil
 }
 
-// dialSpiceDB opens the client to SpiceDB through the gateway: SPIFFE mTLS
-// with cracha-access's own SVID, the gateway verified by its SPIFFE ID
-// (design 6.9). The connection is lazy.
+// dialSpiceDB opens the client to SpiceDB through the gateway
+// (common/spicedb/conn): SPIFFE mTLS with cracha-access's own SVID, the
+// gateway verified by its SPIFFE ID (design 6.9). The connection is lazy.
 func dialSpiceDB(f spicedbFlags, src *workloadapi.X509Source) (*authzed.Client, error) {
 	own, err := src.GetX509SVID()
 	if err != nil {
@@ -52,12 +50,7 @@ func dialSpiceDB(f spicedbFlags, src *workloadapi.X509Source) (*authzed.Client, 
 	if err != nil {
 		return nil, err
 	}
-	creds := grpccredentials.MTLSClientCredentials(src, src, tlsconfig.AuthorizeID(server))
-	c, err := authzed.NewClient(f.endpoint, grpc.WithTransportCredentials(creds))
-	if err != nil {
-		return nil, fmt.Errorf("spicedb: dial %s: %w", f.endpoint, err)
-	}
-	return c, nil
+	return conn.Dial(conn.Config{Endpoint: f.endpoint, Server: server, SVIDs: src, Bundles: src})
 }
 
 func runServe(ctx context.Context, cfg serveConfig) error {

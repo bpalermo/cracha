@@ -119,7 +119,7 @@ func (tb *treeBuilder) addServiceRelation(r store.Relationship) {
 	case r.Relation == spicedb.RelationMember && r.SubjectType == spicedb.TypeWorkload:
 		s := tb.service(r.ResourceID)
 		s.Spec.Members = append(s.Spec.Members, r.SubjectID)
-	case (r.Relation == store.RelationTeam || r.Relation == spicedb.RelationOwner) && r.SubjectType == spicedb.TypeTeam:
+	case r.Relation == spicedb.RelationTeam && r.SubjectType == spicedb.TypeTeam:
 		tb.service(r.ResourceID).Spec.Team = r.SubjectID
 	}
 }

@@ -751,12 +751,14 @@ access:
   healthPort: 8081
 
   # SpiceDB, through the gateway that lets only cracha-access write
-  # (design 6.4): its address, empty for the chart's <name>-spicedb
-  # Service on 50051, and its SPIFFE ID, empty for
-  # spiffe://<trust domain>/ns/<release namespace>/sa/<name>-spicedb.
+  # (design 6.4; its RBAC admits spicedb.gateway.identities.access, by
+  # default .../sa/<name>-access): its address and SPIFFE ID (a full ID, or
+  # a path in cracha-access's own trust domain), empty for the broker's
+  # (broker.authz.spicedb), which default to the chart's SpiceDB:
+  # <name>-spicedb on spicedb.gateway.port, /ns/<namespace>/sa/<name>-spicedb.
   spicedb:
     endpoint: ""
-    spiffeID: ""
+    serverSpiffeID: ""
     timeout: 10s
 
   # Approvals and expiry (design 6.9).

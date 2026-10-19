@@ -109,7 +109,7 @@ func (s *Store) Holds(ctx context.Context, permission, targetType, targetID, wor
 // Sensitive reports whether the target is flagged sensitive: any
 // relationship of its sensitive relation.
 func (s *Store) Sensitive(ctx context.Context, targetType, targetID string) (bool, error) {
-	rels, err := s.read(ctx, &v1.RelationshipFilter{ResourceType: targetType, OptionalResourceId: targetID, OptionalRelation: RelationSensitive})
+	rels, err := s.read(ctx, &v1.RelationshipFilter{ResourceType: targetType, OptionalResourceId: targetID, OptionalRelation: spicedb.RelationSensitive})
 	if err != nil {
 		return false, err
 	}

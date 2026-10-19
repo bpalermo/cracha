@@ -65,13 +65,13 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 	fake := storetest.New(
 		rel(spicedb.TypeGrant, "data-read", spicedb.RelationAssigneeWorkload, spicedb.TypeWorkload, ledger, ""),
 		rel(grant.ResourceS3Bucket, "data-a", spicedb.RelationReader, spicedb.TypeWorkload, ledger, ""),
-		rel(grant.ResourceS3Bucket, "data-secure", store.RelationSensitive, spicedb.TypeWorkload, "*", ""),
+		rel(grant.ResourceS3Bucket, "data-secure", spicedb.RelationSensitive, spicedb.TypeWorkload, "*", ""),
 	)
 	for _, b := range []string{"data-a", "data-b", "data-secure", "secrets"} {
-		fake.Allow(store.PermissionManage, grant.ResourceS3Bucket, b, workloadOf(owner))
-		fake.Allow(store.PermissionApprove, grant.ResourceS3Bucket, b, workloadOf(owner))
+		fake.Allow(spicedb.PermissionManage, grant.ResourceS3Bucket, b, workloadOf(owner))
+		fake.Allow(spicedb.PermissionApprove, grant.ResourceS3Bucket, b, workloadOf(owner))
 	}
-	fake.Allow(store.PermissionApprove, grant.ResourceS3Bucket, "data-secure", workloadOf(approver))
+	fake.Allow(spicedb.PermissionApprove, grant.ResourceS3Bucket, "data-secure", workloadOf(approver))
 	labels, err := idenc.NewLabels(map[string]string{"example.org": "prod"})
 	if err != nil {
 		t.Fatal(err)
@@ -215,7 +215,7 @@ func TestGrantSizeBudget(t *testing.T) {
 	n := checktest.MaxResources(t, checktest.Bundle(t, "v1"), "data-read")
 	for i := 1; i < n; i++ {
 		name := fmt.Sprintf("data-%03d", i)
-		f.fake.Allow(store.PermissionManage, grant.ResourceS3Bucket, name, workloadOf(owner))
+		f.fake.Allow(spicedb.PermissionManage, grant.ResourceS3Bucket, name, workloadOf(owner))
 		if _, err := f.svc.Grant(as(owner), grantOf(name)); err != nil {
 			t.Fatalf("bucket %d of %d: %v", i+1, n, err)
 		}
@@ -295,7 +295,7 @@ func TestSensitiveApproval(t *testing.T) {
 		t.Fatalf("approve = %+v, held %v", out, f.fake.Keys())
 	}
 	for _, k := range f.fake.Keys() {
-		if strings.HasPrefix(k, store.DefinitionPendingRequest+":") {
+		if strings.HasPrefix(k, spicedb.DefinitionPendingRequest+":") {
 			t.Errorf("pending request left: %s", k)
 		}
 	}
@@ -405,7 +405,7 @@ func TestRevoke(t *testing.T) {
 
 func TestMembership(t *testing.T) {
 	f := newFixture(t, Config{})
-	f.fake.Allow(store.PermissionManage, spicedb.TypeService, "other", workloadOf(owner))
+	f.fake.Allow(spicedb.PermissionManage, spicedb.TypeService, "other", workloadOf(owner))
 	// other's members hold a grant of another shape: ledger joining it
 	// would make its composition ambiguous.
 	if _, err := f.svc.store.Write(context.Background(), []store.Update{{Relationship: store.Relationship{
@@ -516,7 +516,7 @@ func TestWatchAudit(t *testing.T) {
 // composition, and only an owner may make it.
 func TestOwnership(t *testing.T) {
 	f := newFixture(t, Config{})
-	req := &api.GrantRequest{Subject: "prod/tools/bob", Resource: api.Resource{Kind: grant.ResourceS3Bucket, Name: "data-b"}, Relation: store.RelationApprover, Reason: "rota"}
+	req := &api.GrantRequest{Subject: "prod/tools/bob", Resource: api.Resource{Kind: grant.ResourceS3Bucket, Name: "data-b"}, Relation: spicedb.RelationApprover, Reason: "rota"}
 	if _, err := f.svc.Grant(as(stranger), req); err == nil {
 		t.Fatal("an approver made by a stranger")
 	}
@@ -525,7 +525,7 @@ func TestOwnership(t *testing.T) {
 		t.Fatalf("resp = %+v, %v, held %v", resp, err, f.fake.Keys())
 	}
 	list, err := f.svc.List(as(stranger), &api.ListRequest{Resource: &api.Resource{Kind: grant.ResourceS3Bucket, Name: "data-b"}})
-	if err != nil || len(list.Relationships) != 1 || list.Relationships[0].Relation != store.RelationApprover {
+	if err != nil || len(list.Relationships) != 1 || list.Relationships[0].Relation != spicedb.RelationApprover {
 		t.Errorf("list = %+v, %v", list, err)
 	}
 	req.ExpiresAt = "2026-10-19T00:00:00Z"

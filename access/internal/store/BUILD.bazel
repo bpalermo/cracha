@@ -5,7 +5,6 @@ go_library(
     srcs = [
         "pending.go",
         "relationship.go",
-        "schema.go",
         "store.go",
         "tuple.go",
         "watch.go",

@@ -21,7 +21,7 @@ func envOf(m map[string]string) func(string) (string, bool) {
 }
 
 var serveArgs = []string{
-	"--spicedb-endpoint", "cracha-spicedb:50051", "--spicedb-spiffe-id", "spiffe://example.org/ns/cracha/sa/cracha-spicedb",
+	"--spicedb-endpoint", "cracha-spicedb:50051", "--spicedb-server-spiffe-id", "spiffe://example.org/ns/cracha/sa/cracha-spicedb",
 	"--bundle-source", "s3://grants/prod", "--bundle-verify-key", "/k/a.pem,/k/b.pem",
 }
 
@@ -35,7 +35,7 @@ func TestParseServe(t *testing.T) {
 		t.Errorf("config = %+v", c)
 	}
 	env := envOf(map[string]string{
-		"CRACHA_SPICEDB_ENDPOINT": "x:1", "CRACHA_SPICEDB_SPIFFE_ID": "spiffe://example.org/x", "CRACHA_BUNDLE_SOURCE": "local:/b",
+		"CRACHA_SPICEDB_ENDPOINT": "x:1", "CRACHA_SPICEDB_SERVER_SPIFFE_ID": "spiffe://example.org/x", "CRACHA_BUNDLE_SOURCE": "local:/b",
 		"CRACHA_BUNDLE_KMS_KEY": "alias/k", "CRACHA_ACCESS_ANALYZER": "true", "CRACHA_BREAK_GLASS_MAX": "1h",
 	})
 	c, err = parseServe(nil, env, &bytes.Buffer{})
@@ -47,7 +47,7 @@ func TestParseServe(t *testing.T) {
 		"unknown kind":   {"--max-expiry", "queue=1h"},
 		"bad duration":   {"--max-expiry", "s3_bucket=soon"},
 		"bad source":     {"--bundle-source", "/tmp"},
-		"bad spicedb id": {"--spicedb-spiffe-id", "nope"},
+		"bad spicedb id": {"--spicedb-server-spiffe-id", "nope"},
 		"bad labels":     {"--trust-domain-labels", "x"},
 		"zero cap":       {"--break-glass-max", "0s"},
 		"stray argument": {"extra"},
@@ -68,7 +68,15 @@ func TestParseServe(t *testing.T) {
 	if id, err := c.spicedb.resolve(td); err != nil || id.String() != "spiffe://example.org/ns/cracha/sa/cracha-spicedb" {
 		t.Errorf("derived gateway ID = %v, %v", id, err)
 	}
-	if _, err := parseServe(append(derived, "--spicedb-service-account", ""), noEnv, &bytes.Buffer{}); err == nil {
+	c, err = parseServe(append(derived, "--spicedb-server-spiffe-id", "/ns/cracha/sa/custom-spicedb"), noEnv, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, err := c.spicedb.resolve(td); err != nil || id.String() != "spiffe://example.org/ns/cracha/sa/custom-spicedb" {
+		t.Errorf("gateway ID from a path = %v, %v", id, err)
+	}
+	noNamespace := []string{"--spicedb-endpoint", "s:1", "--bundle-source", "local:/b", "--bundle-verify-key", "/k"}
+	if _, err := parseServe(noNamespace, noEnv, &bytes.Buffer{}); err == nil {
 		t.Error("no way to name the gateway accepted")
 	}
 }

@@ -11,6 +11,8 @@ import (
 
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 	"google.golang.org/protobuf/types/known/structpb"
+
+	"github.com/bpalermo/cracha/common/spicedb"
 )
 
 // Pending is a write waiting for an approval (design 6.9). It lives in
@@ -57,7 +59,7 @@ func PendingRelationship(p Pending) (Relationship, error) {
 	if err != nil {
 		return Relationship{}, err
 	}
-	return Relationship{ResourceType: DefinitionPendingRequest, ResourceID: p.ID, Relation: RelationTarget, SubjectType: p.Tuple.Kind, SubjectID: id}, nil
+	return Relationship{ResourceType: spicedb.DefinitionPendingRequest, ResourceID: p.ID, Relation: spicedb.RelationTarget, SubjectType: p.Tuple.Kind, SubjectID: id}, nil
 }
 
 // PutPending stores a new pending request; an ID already in use fails.
@@ -74,11 +76,11 @@ func (s *Store) PutPending(ctx context.Context, p Pending, metadata map[string]a
 	if err != nil {
 		return "", err
 	}
-	cctx, err := structpb.NewStruct(map[string]any{CaveatContextRequest: string(payload)})
+	cctx, err := structpb.NewStruct(map[string]any{spicedb.CaveatContextRequest: string(payload)})
 	if err != nil {
 		return "", err
 	}
-	proto.OptionalCaveat = &v1.ContextualizedCaveat{CaveatName: CaveatPendingPayload, Context: cctx}
+	proto.OptionalCaveat = &v1.ContextualizedCaveat{CaveatName: spicedb.CaveatPendingPayload, Context: cctx}
 	req := &v1.WriteRelationshipsRequest{Updates: []*v1.RelationshipUpdate{{Operation: v1.RelationshipUpdate_OPERATION_CREATE, Relationship: proto}}}
 	if req.OptionalTransactionMetadata, err = structpb.NewStruct(metadata); err != nil {
 		return "", err
@@ -97,7 +99,7 @@ func (s *Store) PutPending(ctx context.Context, p Pending, metadata map[string]a
 // is returned as a Pending with only its ID, so it can be seen and
 // dropped.
 func (s *Store) ListPending(ctx context.Context, id string) ([]Pending, error) {
-	stream, err := s.readRaw(ctx, &v1.RelationshipFilter{ResourceType: DefinitionPendingRequest, OptionalResourceId: id, OptionalRelation: RelationTarget})
+	stream, err := s.readRaw(ctx, &v1.RelationshipFilter{ResourceType: spicedb.DefinitionPendingRequest, OptionalResourceId: id, OptionalRelation: spicedb.RelationTarget})
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +120,7 @@ func (s *Store) ListPending(ctx context.Context, id string) ([]Pending, error) {
 // ID wins over whatever the payload says.
 func decodePending(rel *v1.Relationship) Pending {
 	id := rel.GetResource().GetObjectId()
-	v, ok := rel.GetOptionalCaveat().GetContext().GetFields()[CaveatContextRequest]
+	v, ok := rel.GetOptionalCaveat().GetContext().GetFields()[spicedb.CaveatContextRequest]
 	var p Pending
 	if !ok || json.Unmarshal([]byte(v.GetStringValue()), &p) != nil {
 		return Pending{ID: id}

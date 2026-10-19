@@ -16,8 +16,8 @@ func TestTupleRoundTrip(t *testing.T) {
 		{Kind: grant.ResourceS3Bucket, Name: "data-raw", Relation: grant.RelationWriter, Service: "payments", ExpiresAt: "2026-12-31T00:00:00Z", Clusters: []string{"a", "b"}},
 		{Kind: grant.ResourceDynamoDBTable, Name: "orders_1", Relation: grant.RelationReader, Subject: "prod/a/b", Clusters: []string{"a"}},
 		{Kind: KindService, Name: "payments", Relation: spicedb.RelationMember, Subject: "prod/a/b"},
-		{Kind: KindService, Name: "payments", Relation: RelationOwner, Service: "platform"},
-		{Kind: grant.ResourceS3Bucket, Name: "data.raw", Relation: RelationApprover, Subject: "prod/a/b"},
+		{Kind: KindService, Name: "payments", Relation: spicedb.RelationOwner, Service: "platform"},
+		{Kind: grant.ResourceS3Bucket, Name: "data.raw", Relation: spicedb.RelationApprover, Subject: "prod/a/b"},
 	} {
 		if err := tt.Validate(); err != nil {
 			t.Errorf("%+v: %v", tt, err)
@@ -48,9 +48,9 @@ func TestTupleValidate(t *testing.T) {
 		"bad member rel":    {Kind: KindService, Name: "s", Relation: grant.RelationReader, Subject: "prod/a/b"},
 		"bad expiry":        {Kind: KindService, Name: "s", Relation: spicedb.RelationMember, Subject: "prod/a/b", ExpiresAt: "tomorrow"},
 		"bad subject":       {Kind: grant.ResourceS3Bucket, Name: "data-a", Relation: grant.RelationReader, Subject: "no spaces"},
-		"bounded owner":     {Kind: KindService, Name: "s", Relation: RelationOwner, Subject: "prod/a/b", ExpiresAt: "2026-12-31T00:00:00Z"},
-		"owner of nothing":  {Kind: "queue", Name: "q", Relation: RelationOwner, Subject: "prod/a/b"},
-		"two owners":        {Kind: KindService, Name: "s", Relation: RelationApprover, Subject: "prod/a/b", Service: "t"},
+		"bounded owner":     {Kind: KindService, Name: "s", Relation: spicedb.RelationOwner, Subject: "prod/a/b", ExpiresAt: "2026-12-31T00:00:00Z"},
+		"owner of nothing":  {Kind: "queue", Name: "q", Relation: spicedb.RelationOwner, Subject: "prod/a/b"},
+		"two owners":        {Kind: KindService, Name: "s", Relation: spicedb.RelationApprover, Subject: "prod/a/b", Service: "t"},
 	} {
 		if err := tt.Validate(); err == nil {
 			t.Errorf("%s: valid", name)

@@ -6,6 +6,8 @@ import (
 	"time"
 
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+
+	"github.com/bpalermo/cracha/common/spicedb"
 )
 
 // Change is one relationship change SpiceDB's Watch reported.
@@ -23,7 +25,7 @@ type Change struct {
 
 // WatchTypes are the object types the audit watch follows: every type
 // cracha-access writes, and those it reads its checks from.
-var WatchTypes = append(append([]string{}, SnapshotTypes...), DefinitionPendingRequest)
+var WatchTypes = append(append([]string{}, SnapshotTypes...), spicedb.DefinitionPendingRequest)
 
 // Watch follows SpiceDB's change feed for the types from the revision
 // start (empty: from now), handing every change to fn, until ctx ends. A

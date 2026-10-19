@@ -281,7 +281,7 @@ access:
   healthPort: 9082
   spicedb:
     endpoint: spicedb-gateway.spicedb.svc:443
-    spiffeID: spiffe://prod.example.org/ns/spicedb/sa/gateway
+    serverSpiffeID: spiffe://prod.example.org/ns/spicedb/sa/gateway
     timeout: 3s
   approval:
     pendingTTL: 24h

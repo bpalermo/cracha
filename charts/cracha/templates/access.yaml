@@ -14,8 +14,8 @@
 {{- if not .Values.broker.bundle.source }}{{ fail "access.enabled needs broker.bundle.source: cracha-access checks every write against the signed bundle the broker reads" }}{{ end -}}
 {{- $bundleKey := include "cracha.bundleKey" . -}}
 {{- $bundleDir := include "cracha.bundleDir" . -}}
-{{- with .Values.access.spicedb.spiffeID -}}
-{{- if not (hasPrefix "spiffe://" .) }}{{ fail (printf "access.spicedb.spiffeID must be a SPIFFE ID, not %q" .) }}{{ end -}}
+{{- with .Values.access.spicedb.serverSpiffeID -}}
+{{- if not (or (hasPrefix "spiffe://" .) (hasPrefix "/" .)) }}{{ fail (printf "access.spicedb.serverSpiffeID must be a SPIFFE ID or a path, not %q" .) }}{{ end -}}
 {{- end -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -74,12 +74,8 @@ spec:
             {{- if $labels }}
             - --trust-domain-labels={{ join "," $labels }}
             {{- end }}
-            - --spicedb-endpoint={{ .Values.access.spicedb.endpoint | default (printf "%s-spicedb.%s.svc:50051" $name .Release.Namespace) }}
-            {{- with .Values.access.spicedb.spiffeID }}
-            - --spicedb-spiffe-id={{ . }}
-            {{- else }}
-            - --spicedb-service-account={{ $name }}-spicedb
-            {{- end }}
+            - --spicedb-endpoint={{ .Values.access.spicedb.endpoint | default (include "cracha.spicedbEndpoint" .) }}
+            - --spicedb-server-spiffe-id={{ .Values.access.spicedb.serverSpiffeID | default (include "cracha.spicedbServerSpiffeID" .) }}
             - --spicedb-timeout={{ .Values.access.spicedb.timeout }}
             - --bundle-source={{ .Values.broker.bundle.source }}
             {{- if eq $bundleKey "kms" }}
@@ -100,8 +96,7 @@ spec:
             {{- end }}
             - --log-level={{ include "cracha.logLevel" .Values.access.logLevel }}
           env:
-            # The namespace the SpiceDB gateway runs in, for its derived
-            # SPIFFE ID.
+            # The namespace of the SpiceDB gateway's default SPIFFE ID.
             - name: CRACHA_NAMESPACE
               valueFrom:
                 fieldRef:

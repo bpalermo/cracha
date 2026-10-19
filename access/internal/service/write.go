@@ -11,6 +11,7 @@ import (
 	"github.com/bpalermo/cracha/access/internal/audit"
 	"github.com/bpalermo/cracha/access/internal/check"
 	"github.com/bpalermo/cracha/access/internal/store"
+	"github.com/bpalermo/cracha/common/spicedb"
 )
 
 // tupleOf is a request's tuple, validated by the grant tree's rules, its
@@ -59,7 +60,7 @@ func (s *Service) grant(ctx context.Context, c caller, t store.Tuple, breakGlass
 	if err := requireReason(ev.Reason); err != nil {
 		return nil, err
 	}
-	if err := s.authorize(ctx, c, store.PermissionManage, t); err != nil {
+	if err := s.authorize(ctx, c, spicedb.PermissionManage, t); err != nil {
 		return nil, err
 	}
 	now := s.now()
@@ -186,7 +187,7 @@ func (s *Service) Revoke(ctx context.Context, req *api.RevokeRequest) (*api.Writ
 		err = requireReason(req.Reason)
 	}
 	if err == nil {
-		err = s.authorize(ctx, c, store.PermissionManage, t)
+		err = s.authorize(ctx, c, spicedb.PermissionManage, t)
 	}
 	if err != nil {
 		return nil, s.refused(ctx, ev, err)

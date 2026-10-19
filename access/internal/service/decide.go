@@ -10,6 +10,7 @@ import (
 	"github.com/bpalermo/cracha/access/internal/api"
 	"github.com/bpalermo/cracha/access/internal/audit"
 	"github.com/bpalermo/cracha/access/internal/store"
+	"github.com/bpalermo/cracha/common/spicedb"
 )
 
 // Approve implements api.Server: a caller who holds approve on the
@@ -30,7 +31,7 @@ func (s *Service) approve(ctx context.Context, req *api.DecideRequest, ev *audit
 	if err != nil {
 		return nil, err
 	}
-	if err := s.authorize(ctx, c, store.PermissionApprove, p.Tuple); err != nil {
+	if err := s.authorize(ctx, c, spicedb.PermissionApprove, p.Tuple); err != nil {
 		return nil, err
 	}
 	if c.id == p.Caller || (req.Requester != "" && req.Requester == p.Requester) {
@@ -110,7 +111,7 @@ func (s *Service) reject(ctx context.Context, req *api.DecideRequest, ev *audit.
 		return nil, err
 	}
 	if c.id != p.Caller {
-		if err := s.authorize(ctx, c, store.PermissionApprove, p.Tuple); err != nil {
+		if err := s.authorize(ctx, c, spicedb.PermissionApprove, p.Tuple); err != nil {
 			return nil, err
 		}
 	}

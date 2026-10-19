@@ -18,6 +18,7 @@ go_library(
         "//access/internal/store",
         "//common/grant",
         "//common/idenc",
+        "//common/spicedb",
         "@org_golang_google_grpc//codes",
     ],
 )

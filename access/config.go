@@ -15,6 +15,7 @@ import (
 	"github.com/bpalermo/cracha/common/grant"
 	"github.com/bpalermo/cracha/common/idenc"
 	"github.com/bpalermo/cracha/common/publication"
+	"github.com/bpalermo/cracha/common/spicedb/conn"
 )
 
 // env resolves a flag's default from the environment: CRACHA_<FLAG> with
@@ -41,53 +42,56 @@ func (e env) duration(flag string, def time.Duration) time.Duration {
 }
 
 // spicedbFlags is how cracha-access reaches SpiceDB: through the gateway,
-// over SPIFFE mTLS with its own SVID (design 6.9).
+// over SPIFFE mTLS with its own SVID (design 6.9), as the broker does.
 type spicedbFlags struct {
-	endpoint       string
-	serverID       string
-	namespace      string
-	serviceAccount string
-	timeout        time.Duration
-	// id is --spicedb-spiffe-id parsed; zero when it is derived from the
-	// caller's own trust domain (resolve).
+	endpoint  string
+	serverID  string
+	namespace string
+	timeout   time.Duration
+	// id is --spicedb-server-spiffe-id when it is a full SPIFFE ID; zero
+	// when it is a path, or empty, completed in the caller's own trust
+	// domain (resolve).
 	id spiffeid.ID
 }
 
 func (f *spicedbFlags) bind(fs *flag.FlagSet, e env) {
 	fs.StringVar(&f.endpoint, "spicedb-endpoint", e.str("spicedb-endpoint", ""), "the SpiceDB gateway's gRPC address, host:port")
-	fs.StringVar(&f.serverID, "spicedb-spiffe-id", e.str("spicedb-spiffe-id", ""), "the SpiceDB gateway's SPIFFE ID, which its certificate must carry; empty derives spiffe://<own trust domain>/ns/<--namespace>/sa/<--spicedb-service-account>")
-	fs.StringVar(&f.namespace, "namespace", e.str("namespace", ""), "the namespace the SpiceDB gateway runs in, for its derived SPIFFE ID")
-	fs.StringVar(&f.serviceAccount, "spicedb-service-account", e.str("spicedb-service-account", "cracha-spicedb"), "the SpiceDB gateway's service account, for its derived SPIFFE ID")
+	fs.StringVar(&f.serverID, "spicedb-server-spiffe-id", e.str("spicedb-server-spiffe-id", ""), "the SpiceDB gateway's SPIFFE ID, or its path in cracha-access's own trust domain; empty is /ns/<--namespace>/sa/cracha-spicedb")
+	fs.StringVar(&f.namespace, "namespace", e.str("namespace", ""), "the namespace of the SpiceDB gateway's default SPIFFE ID")
 	fs.DurationVar(&f.timeout, "spicedb-timeout", e.duration("spicedb-timeout", 10*time.Second), "deadline of one SpiceDB call")
 }
 
 func (f *spicedbFlags) validate() error {
-	if f.endpoint == "" {
+	switch {
+	case f.endpoint == "":
 		return errors.New("--spicedb-endpoint is required")
-	}
-	if f.serverID == "" {
-		if f.namespace == "" || f.serviceAccount == "" {
-			return errors.New("--spicedb-spiffe-id, or --namespace and --spicedb-service-account to derive it, are required")
+	case f.serverID == "" && f.namespace == "":
+		return errors.New("--spicedb-server-spiffe-id, or --namespace for its default, is required")
+	case strings.HasPrefix(f.serverID, "spiffe://"):
+		id, err := spiffeid.FromString(f.serverID)
+		if err != nil {
+			return fmt.Errorf("--spicedb-server-spiffe-id: %w", err)
 		}
-		return nil
+		f.id = id
+	case f.serverID != "" && !strings.HasPrefix(f.serverID, "/"):
+		return fmt.Errorf("--spicedb-server-spiffe-id %q: a SPIFFE ID or a path", f.serverID)
 	}
-	id, err := spiffeid.FromString(f.serverID)
-	if err != nil {
-		return fmt.Errorf("--spicedb-spiffe-id: %w", err)
-	}
-	f.id = id
 	return nil
 }
 
-// resolve is the gateway's SPIFFE ID: --spicedb-spiffe-id, or derived in
-// the trust domain of cracha-access's own SVID.
+// resolve is the gateway's SPIFFE ID: the full ID given, or the path given
+// (by default conn's /ns/<namespace>/sa/cracha-spicedb) in the trust
+// domain of cracha-access's own SVID.
 func (f *spicedbFlags) resolve(td spiffeid.TrustDomain) (spiffeid.ID, error) {
 	if !f.id.IsZero() {
 		return f.id, nil
 	}
-	id, err := spiffeid.FromSegments(td, "ns", f.namespace, "sa", f.serviceAccount)
+	if f.serverID == "" {
+		return conn.DefaultServerID(td, f.namespace)
+	}
+	id, err := spiffeid.FromPath(td, f.serverID)
 	if err != nil {
-		return spiffeid.ID{}, fmt.Errorf("the SpiceDB gateway's SPIFFE ID in namespace %q: %w", f.namespace, err)
+		return spiffeid.ID{}, fmt.Errorf("--spicedb-server-spiffe-id %q: %w", f.serverID, err)
 	}
 	return id, nil
 }

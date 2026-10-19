@@ -52,7 +52,7 @@ func (t Tuple) IsAccess() bool {
 func (t Tuple) IsOwnership() bool { return isOwnership(t.Relation) }
 
 func isOwnership(relation string) bool {
-	return relation == RelationOwner || relation == RelationApprover
+	return relation == spicedb.RelationOwner || relation == spicedb.RelationApprover
 }
 
 // Holder is who the tuple relates: "workload <subject>" or "service
@@ -153,7 +153,7 @@ func (t Tuple) validateMembership() error {
 		return errors.New("a membership makes a workload (subject) a member of a service")
 	}
 	if t.Relation != spicedb.RelationMember {
-		return fmt.Errorf("relation %q on a service: want %s, %s or %s", t.Relation, spicedb.RelationMember, RelationOwner, RelationApprover)
+		return fmt.Errorf("relation %q on a service: want %s, %s or %s", t.Relation, spicedb.RelationMember, spicedb.RelationOwner, spicedb.RelationApprover)
 	}
 	if err := t.validateService(); err != nil {
 		return err
@@ -212,3 +212,7 @@ func (t Tuple) Access(name string) *grant.Access {
 		Relation: t.Relation, ExpiresAt: t.ExpiresAt, Clusters: t.Clusters,
 	}}
 }
+
+// KindService is the target kind of a membership write, and of an owner or
+// an approver of a service: the service is the resource.
+const KindService = spicedb.TypeService

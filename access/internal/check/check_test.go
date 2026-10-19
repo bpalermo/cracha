@@ -202,7 +202,7 @@ func TestTreeReadsRelationships(t *testing.T) {
 	b := checktest.Bundle(t, "v1")
 	rels := []store.Relationship{
 		member("payments", "prod/payments/api"),
-		{ResourceType: spicedb.TypeService, ResourceID: "payments", Relation: store.RelationTeam, SubjectType: spicedb.TypeTeam, SubjectID: "pay"},
+		{ResourceType: spicedb.TypeService, ResourceID: "payments", Relation: spicedb.RelationTeam, SubjectType: spicedb.TypeTeam, SubjectID: "pay"},
 		serviceGrant("data-read", "payments"),
 		bucket("data-a", grant.RelationReader, "prod/payments/api"),
 	}
