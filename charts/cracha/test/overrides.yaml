@@ -266,3 +266,57 @@ spicedb:
       memory: 256Mi
   podAnnotations:
     example.com/scrape: "true"
+# cracha-access with every knob: it reads the broker's local bundle source
+# and its inline keys, and reaches SpiceDB at a given address and ID;
+# test/access.yaml renders the defaults (the chart's SpiceDB gateway, a
+# KMS key).
+access:
+  enabled: true
+  image:
+    repository: registry.example.com/cracha/access
+    tag: v9.9.9
+    digest: ""
+    pullPolicy: Always
+  port: 9444
+  healthPort: 9082
+  spicedb:
+    endpoint: spicedb-gateway.spicedb.svc:443
+    serverSpiffeID: spiffe://prod.example.org/ns/spicedb/sa/gateway
+    timeout: 3s
+  approval:
+    pendingTTL: 24h
+    breakGlassMax: 1h
+    maxExpiry:
+      s3_bucket: 720h
+      service: 2160h
+  accessAnalyzer: true
+  watchAudit: false
+  awsRegion: eu-west-1
+  logLevel: debug
+  workloadAPI:
+    volume:
+      type: csi
+      csi:
+        driver: csi.spiffe.io
+        readOnly: true
+    socket: socket
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/cracha-access
+  env:
+    - name: HTTPS_PROXY
+      value: http://proxy:3128
+  envFrom:
+    - configMapRef:
+        name: access-env
+  priorityClassName: system-cluster-critical
+  nodeSelector:
+    kubernetes.io/os: linux
+  tolerations:
+    - key: dedicated
+      operator: Exists
+  resources:
+    requests:
+      cpu: 10m
+  podAnnotations:
+    example.com/scrape: "true"

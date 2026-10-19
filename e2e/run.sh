@@ -87,6 +87,7 @@ if [[ -z "${chart_version}" ]]; then
 		cracha-broker=//broker:image_load
 		cracha-agent=//agent:image_load
 		cracha-webhook=//webhook:image_load
+		cracha-access=//access:image_load
 		"${images[@]}"
 	)
 fi
@@ -96,9 +97,10 @@ kubeconfig="$(mktemp)"
 bundle="$(mktemp -d)"
 spicedb="$(mktemp -d)"
 pulled="$(mktemp -d)"
-port_forward=""
+port_forwards=()
+forwarded=""
 cleanup() {
-	if [[ -n "${port_forward}" ]]; then
+	for port_forward in "${port_forwards[@]}"; do
 		# The loop first, then the kubectl it is waiting for.
 		children="$(pgrep -P "${port_forward}" || true)"
 		kill "${port_forward}" 2>/dev/null || true
@@ -106,7 +108,7 @@ cleanup() {
 			# shellcheck disable=SC2086 # one PID per word
 			kill ${children} 2>/dev/null || true
 		fi
-	fi
+	done
 	rm -rf "${kubeconfig}" "${bundle}" "${spicedb}" "${pulled}"
 	if [[ "${created}" == 1 && "${E2E_KEEP_CLUSTER:-0}" != 1 ]]; then
 		kind delete cluster --name "${cluster}"
@@ -302,6 +304,9 @@ if [[ "${authz}" == spicedb ]]; then
 	kubectl rollout status deployment/cracha-spicedb -n cracha-system --timeout=300s
 fi
 workloads=(daemonset/cracha-agent deployment/cracha-broker deployment/cracha-webhook deployment/cracha-stsstub)
+if [[ "${authz}" == spicedb ]]; then
+	workloads+=(deployment/cracha-access)
+fi
 for workload in "${workloads[@]}"; do
 	kubectl rollout restart "${workload}" -n cracha-system
 done
@@ -311,6 +316,38 @@ done
 
 # The test namespace and its identities.
 kubectl apply -f e2e/manifests/e2e.yaml
+
+# forward <service> <port> keeps a port-forward to the service of
+# cracha-system open for the tests, on a local port kubectl picks, and sets
+# forwarded to that port. kubectl port-forward ends at the first connection the
+# pod side resets, which a refused handshake does: it is started again, on
+# the port it picked the first time.
+forward() {
+	local svc="$1" remote="$2" log="${spicedb}/port-forward-$1.log" port=""
+	(
+		target=":${remote}"
+		while true; do
+			kubectl port-forward -n cracha-system "svc/${svc}" "${target}" >>"${log}" 2>&1 || true
+			picked="$(sed -n "s/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> ${remote}\$/\1/p" "${log}" | head -1)"
+			if [[ -n "${picked}" ]]; then
+				target="${picked}:${remote}"
+			fi
+			sleep 0.5
+		done
+	) >/dev/null 2>&1 &
+	port_forwards+=($!)
+	for _ in $(seq 1 60); do
+		port="$(sed -n "s/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> ${remote}\$/\1/p" "${log}" 2>/dev/null | head -1)"
+		if [[ -n "${port}" ]]; then
+			forwarded="${port}"
+			return
+		fi
+		sleep 0.5
+	done
+	echo "e2e: kubectl port-forward to ${svc} did not report a port:" >&2
+	cat "${log}" >&2
+	exit 1
+}
 
 # SpiceDB's gateway, from the host: a port-forward kubectl picks a local
 # port for, which stays open for the tests, and an X.509-SVID for each
@@ -322,36 +359,11 @@ kubectl apply -f e2e/manifests/e2e.yaml
 # -bundle take. The reconciler writes the schema; the suite writes its
 # relationships as the access identity (e2e/spicedb_access_test.go).
 if [[ "${authz}" == spicedb ]]; then
-	# kubectl port-forward ends at the first connection the pod side
-	# resets, which a refused handshake does: it is started again, on the
-	# port it picked the first time.
-	(
-		target=":50051"
-		while true; do
-			kubectl port-forward -n cracha-system svc/cracha-spicedb "${target}" >>"${spicedb}/port-forward.log" 2>&1 || true
-			picked="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 50051$/\1/p' "${spicedb}/port-forward.log" | head -1)"
-			if [[ -n "${picked}" ]]; then
-				target="${picked}:50051"
-			fi
-			sleep 0.5
-		done
-	) &
-	port_forward=$!
-	for _ in $(seq 1 60); do
-		if port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 50051$/\1/p' "${spicedb}/port-forward.log" | head -1)" && [[ -n "${port}" ]]; then
-			break
-		fi
-		if ! kill -0 "${port_forward}" 2>/dev/null; then
-			break
-		fi
-		sleep 0.5
-	done
-	[[ -n "${port:-}" ]] || {
-		echo "e2e: kubectl port-forward to the SpiceDB gateway did not report a port:" >&2
-		cat "${spicedb}/port-forward.log" >&2
-		exit 1
-	}
-	spicedb_endpoint="127.0.0.1:${port}"
+	forward cracha-spicedb 50051
+	spicedb_endpoint="127.0.0.1:${forwarded}"
+	# cracha-access's API, which the access tests call with the CLI.
+	forward cracha-access 8443
+	access_endpoint="127.0.0.1:${forwarded}"
 	trust_domain=cracha.test
 	mint() {
 		local dir="${spicedb}/svids/$1"
@@ -376,11 +388,16 @@ if [[ "${authz}" == spicedb ]]; then
 	mint access ns/cracha-system/sa/cracha-access
 	mint reconciler ns/cracha-system/sa/cracha-reconciler
 	mint intruder ns/e2e/sa/intruder
+	# The callers of cracha-access: a target's owner, its approver, and
+	# a workload that is neither (e2e/write_path_test.go).
+	mint access-owner ns/e2e/sa/access-owner
+	mint access-approver ns/e2e/sa/access-approver
+	mint access-stranger ns/e2e/sa/access-stranger
 	"${reconciler}" schema -endpoint "${spicedb_endpoint}" \
 		-server-spiffe-id "spiffe://${trust_domain}/ns/cracha-system/sa/cracha-spicedb" \
 		-svid "${spicedb}/svids/reconciler/svid.pem" -svid-key "${spicedb}/svids/reconciler/key.pem" \
 		-bundle "${spicedb}/svids/reconciler/bundle.pem"
-	export E2E_SPICEDB_ENDPOINT="${spicedb_endpoint}" E2E_SPICEDB_SVIDS="${spicedb}/svids"
+	export E2E_SPICEDB_ENDPOINT="${spicedb_endpoint}" E2E_SPICEDB_SVIDS="${spicedb}/svids" E2E_ACCESS_ENDPOINT="${access_endpoint}"
 fi
 
 # E2E_FILTER runs only the tests whose name matches, for working on one.

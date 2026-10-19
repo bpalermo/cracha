@@ -1,0 +1,44 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "service",
+    srcs = [
+        "decide.go",
+        "read.go",
+        "service.go",
+        "watch.go",
+        "write.go",
+    ],
+    importpath = "github.com/bpalermo/cracha/access/internal/service",
+    visibility = ["//access:__subpackages__"],
+    deps = [
+        "//access/internal/api",
+        "//access/internal/audit",
+        "//access/internal/check",
+        "//access/internal/store",
+        "//common/grant",
+        "//common/idenc",
+        "//common/spicedb",
+        "@org_golang_google_grpc//codes",
+    ],
+)
+
+go_test(
+    name = "service_test",
+    srcs = ["service_test.go"],
+    embed = [":service"],
+    deps = [
+        "//access/internal/api",
+        "//access/internal/audit",
+        "//access/internal/check",
+        "//access/internal/check/checktest",
+        "//access/internal/store",
+        "//access/internal/store/storetest",
+        "//common/grant",
+        "//common/idenc",
+        "//common/spicedb",
+        "@com_github_authzed_authzed_go//proto/authzed/api/v1:api",
+        "@com_github_spiffe_go_spiffe_v2//spiffeid",
+        "@org_golang_google_grpc//codes",
+    ],
+)

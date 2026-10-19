@@ -1,0 +1,204 @@
+{{- if .Values.access.enabled }}
+{{- $selector := dict "root" . "component" "access" -}}
+{{- $name := include "cracha.name" . -}}
+{{- $labels := list -}}
+{{- range $domain, $label := .Values.broker.trustDomainLabels -}}
+{{- $labels = append $labels (printf "%s=%s" $domain $label) -}}
+{{- end -}}
+{{- $maxExpiry := list -}}
+{{- range $kind, $d := .Values.access.approval.maxExpiry -}}
+{{- if not (has $kind (list "s3_bucket" "dynamodb_table" "service")) }}{{ fail (printf "access.approval.maxExpiry: %q is not s3_bucket, dynamodb_table or service" $kind) }}{{ end -}}
+{{- $maxExpiry = append $maxExpiry (printf "%s=%s" $kind $d) -}}
+{{- end -}}
+{{- if ne (include "cracha.authzBackend" .) "spicedb" }}{{ fail "access.enabled needs broker.authz.backend spicedb: cracha-access writes SpiceDB's relationships" }}{{ end -}}
+{{- if not .Values.broker.bundle.source }}{{ fail "access.enabled needs broker.bundle.source: cracha-access checks every write against the signed bundle the broker reads" }}{{ end -}}
+{{- $bundleKey := include "cracha.bundleKey" . -}}
+{{- $bundleDir := include "cracha.bundleDir" . -}}
+{{- with .Values.access.spicedb.serverSpiffeID -}}
+{{- if not (or (hasPrefix "spiffe://" .) (hasPrefix "/" .)) }}{{ fail (printf "access.spicedb.serverSpiffeID must be a SPIFFE ID or a path, not %q" .) }}{{ end -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-access
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: access
+spec:
+  # One writer: cracha-access serializes the writes it checks, so two
+  # replicas, or an old pod beside a new one, must never run together.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "cracha.selectorLabels" $selector | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cracha.labels" . | nindent 8 }}
+        app.kubernetes.io/component: access
+      {{- with .Values.access.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.access.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      serviceAccountName: {{ $name }}-access
+      # cracha-access has no use for the Kubernetes API.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.access.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.access.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: access
+          image: {{ include "cracha.image" (dict "root" . "image" .Values.access.image) }}
+          imagePullPolicy: {{ .Values.access.image.pullPolicy }}
+          args:
+            - serve
+            - --listen=:{{ .Values.access.port }}
+            - --health-listen=:{{ .Values.access.healthPort }}
+            - --workload-api-socket=unix:///spiffe-workload-api/{{ .Values.access.workloadAPI.socket }}
+            {{- if $labels }}
+            - --trust-domain-labels={{ join "," $labels }}
+            {{- end }}
+            - --spicedb-endpoint={{ .Values.access.spicedb.endpoint | default (include "cracha.spicedbEndpoint" .) }}
+            - --spicedb-server-spiffe-id={{ .Values.access.spicedb.serverSpiffeID | default (include "cracha.spicedbServerSpiffeID" .) }}
+            - --spicedb-timeout={{ .Values.access.spicedb.timeout }}
+            - --bundle-source={{ .Values.broker.bundle.source }}
+            {{- if eq $bundleKey "kms" }}
+            - --bundle-kms-key={{ .Values.broker.bundle.kmsKey }}
+            {{- else }}
+            - --bundle-verify-key=/etc/cracha/bundle-key/public.pem
+            {{- end }}
+            - --bundle-poll-interval={{ .Values.broker.bundle.pollInterval }}
+            - --pending-ttl={{ .Values.access.approval.pendingTTL }}
+            - --break-glass-max={{ .Values.access.approval.breakGlassMax }}
+            {{- if $maxExpiry }}
+            - --max-expiry={{ join "," $maxExpiry }}
+            {{- end }}
+            - --access-analyzer={{ .Values.access.accessAnalyzer }}
+            - --watch-audit={{ .Values.access.watchAudit }}
+            {{- with .Values.access.awsRegion }}
+            - --aws-region={{ . }}
+            {{- end }}
+            - --log-level={{ include "cracha.logLevel" .Values.access.logLevel }}
+          env:
+            # The namespace of the SpiceDB gateway's default SPIFFE ID.
+            - name: CRACHA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- with .Values.access.awsRegion }}
+            - name: AWS_REGION
+              value: {{ . | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.access.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.access.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.access.port }}
+            - name: health
+              containerPort: {{ .Values.access.healthPort }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+          securityContext:
+            {{- include "cracha.restrictedSecurityContext" . | nindent 12 }}
+          {{- with .Values.access.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- if $bundleDir }}
+            - name: bundle
+              mountPath: {{ $bundleDir }}
+              readOnly: true
+            {{- end }}
+            {{- if has $bundleKey (list "inline" "secret") }}
+            - name: bundle-key
+              mountPath: /etc/cracha/bundle-key
+              readOnly: true
+            {{- end }}
+            - name: spire-workload-api
+              mountPath: /spiffe-workload-api
+              readOnly: true
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        {{- if $bundleDir }}
+        # The broker's publication, as the broker mounts it.
+        - name: bundle
+          {{- toYaml .Values.broker.bundle.volume | nindent 10 }}
+        {{- end }}
+        {{- if has $bundleKey (list "inline" "secret") }}
+        # The broker's verification keys: the same versions verify for both.
+        - name: bundle-key
+          secret:
+            secretName: {{ .Values.broker.bundle.existingSecret | default (printf "%s-bundle-key" $name) }}
+        {{- end }}
+        - name: spire-workload-api
+          {{- include "cracha.workloadAPIVolumeSource" (dict "component" "access" "volume" .Values.access.workloadAPI.volume) | nindent 10 }}
+---
+# The service account names cracha-access's SPIFFE ID
+# (.../sa/<name>-access), the one identity the SpiceDB gateway lets write,
+# and carries its platform identity. No Kubernetes permissions.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}-access
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: access
+  {{- with .Values.access.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: false
+---
+# What the CLI calls (--server <name>-access.<namespace>.svc:<port>).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-access
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: access
+spec:
+  selector:
+    {{- include "cracha.selectorLabels" $selector | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.access.port }}
+      targetPort: grpc
+      appProtocol: grpc
+{{- end }}

@@ -1,0 +1,28 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "check",
+    srcs = [
+        "evaluate.go",
+        "tree.go",
+    ],
+    importpath = "github.com/bpalermo/cracha/access/internal/check",
+    visibility = ["//access:__subpackages__"],
+    deps = [
+        "//access/internal/store",
+        "//common/grant",
+        "//common/spicedb",
+    ],
+)
+
+go_test(
+    name = "check_test",
+    srcs = ["check_test.go"],
+    embed = [":check"],
+    deps = [
+        "//access/internal/check/checktest",
+        "//access/internal/store",
+        "//common/grant",
+        "//common/spicedb",
+    ],
+)

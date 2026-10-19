@@ -1,0 +1,9 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "checktest",
+    srcs = ["checktest.go"],
+    importpath = "github.com/bpalermo/cracha/access/internal/check/checktest",
+    visibility = ["//access:__subpackages__"],
+    deps = ["//common/grant"],
+)

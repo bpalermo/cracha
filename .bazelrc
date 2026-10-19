@@ -32,6 +32,7 @@ test:e2e --test_env=E2E_HELM
 test:e2e --test_env=E2E_CHART_PACKAGE
 test:e2e --test_env=E2E_SPICEDB_ENDPOINT
 test:e2e --test_env=E2E_SPICEDB_SVIDS
+test:e2e --test_env=E2E_ACCESS_ENDPOINT
 # The key run.sh signed the publication with, for the test that republishes
 # the grant tree.
 test:e2e --test_env=E2E_BUNDLE_KEY

@@ -722,3 +722,106 @@ spicedb:
     limits:
       memory: 1Gi
   podAnnotations: {}
+
+# cracha-access (design 6.9): the only writer of the authorization
+# relationships of an install whose broker uses the spicedb backend. Every
+# write (a workload's or a service's relation to a resource, a service's
+# membership) is authorized in SpiceDB, checked against the signed bundle
+# the broker reads (broker.bundle, the same source and keys) the way CI
+# checks a grant tree, put up for approval when its target is sensitive,
+# and logged as a JSON line on stdout. Callers are SPIFFE IDs of the trust
+# domain over mTLS; the CLI (`cracha-access grant|revoke|approve|reject|
+# list|explain|pending`) calls it with the caller's SVID. One replica:
+# writes are serialized in the process. Needs broker.authz.backend spicedb
+# and broker.bundle.source.
+access:
+  enabled: false
+  image:
+    repository: "{@//access:image_push.repository}"
+    tag: ""
+    digest: "{@//access:image_push.digest}"
+    pullPolicy: IfNotPresent
+
+  # The gRPC port, in the pod and on the Service <name>-access: SPIFFE
+  # mTLS with cracha-access's own X.509-SVID.
+  port: 8443
+
+  # The plaintext probe port (/healthz, /readyz: ready once the SVID is
+  # there and a bundle has verified). Not on the Service.
+  healthPort: 8081
+
+  # SpiceDB, through the gateway that lets only cracha-access write
+  # (design 6.4; its RBAC admits spicedb.gateway.identities.access, by
+  # default .../sa/<name>-access): its address and SPIFFE ID (a full ID, or
+  # a path in cracha-access's own trust domain), empty for the broker's
+  # (broker.authz.spicedb), which default to the chart's SpiceDB:
+  # <name>-spicedb on spicedb.gateway.port, /ns/<namespace>/sa/<name>-spicedb.
+  spicedb:
+    endpoint: ""
+    serverSpiffeID: ""
+    timeout: 10s
+
+  # Approvals and expiry (design 6.9).
+  #   pendingTTL     how long a write on a sensitive target waits for an
+  #                  approver before it is dropped.
+  #   breakGlassMax  the furthest a break-glass write's expiresAt may be;
+  #                  break-glass applies a write on a sensitive target at
+  #                  once, by a caller that manages it, logged at WARN.
+  #   maxExpiry      per target kind (s3_bucket, dynamodb_table, service),
+  #                  makes expiresAt required and caps it:
+  #                    maxExpiry:
+  #                      s3_bucket: 720h
+  approval:
+    pendingTTL: 72h
+    breakGlassMax: 4h
+    maxExpiry: {}
+
+  # Run IAM Access Analyzer's ValidatePolicy and CheckNoNewAccess on every
+  # composed policy a write changes (CI's steps 2 and 3), with the pod's
+  # own AWS credentials (serviceAccount below): access-analyzer:ValidatePolicy
+  # and access-analyzer:CheckNoNewAccess.
+  accessAnalyzer: false
+
+  # Log every relationship change SpiceDB's Watch reports, whoever made it;
+  # a change not made by cracha-access is logged at WARN.
+  watchAudit: true
+
+  # The AWS region for S3, KMS and Access Analyzer; empty uses the SDK's
+  # default chain.
+  awsRegion: ""
+
+  # The log level of the service's own log (stderr); the audit log is
+  # stdout, always.
+  logLevel: info
+
+  # The SPIFFE Workload API cracha-access's X.509-SVID comes from, shaped
+  # as the broker's.
+  workloadAPI:
+    volume:
+      type: hostPath
+      hostPath:
+        path: /run/spire/agent-sockets
+        type: Directory
+      csi:
+        driver: csi.spiffe.io
+        readOnly: true
+    socket: spire-agent.sock
+
+  # The platform identity for an S3 bundle source, a KMS verify key and
+  # Access Analyzer (an IAM role annotation, an EKS Pod Identity
+  # association). It holds no Kubernetes permissions.
+  serviceAccount:
+    annotations: {}
+
+  env: []
+  envFrom: []
+  priorityClassName: ""
+  nodeSelector: {}
+  tolerations: []
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  podAnnotations: {}

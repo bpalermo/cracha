@@ -64,6 +64,7 @@ jobs:
       agent: ${{ steps.digest.outputs.agent }}
       webhook: ${{ steps.digest.outputs.webhook }}
       spicedb: ${{ steps.digest.outputs.spicedb }}
+      access: ${{ steps.digest.outputs.access }}
       chart: ${{ steps.chart.outputs.ref }}
       chart_version: ${{ steps.check.outputs.chart_version }}
     steps:
@@ -128,7 +129,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
-          for pkg in broker agent webhook bazel/spicedb; do
+          for pkg in broker agent webhook bazel/spicedb access; do
             echo "common:ci --//${pkg}:image_tag=${GITHUB_REF_NAME}" >> user.bazelrc
           done
           cat user.bazelrc
@@ -172,6 +173,7 @@ jobs:
             //agent:image_push //agent:image_index \
             //webhook:image_push //webhook:image_index \
             //bazel/spicedb:image_push //bazel/spicedb:image_index \
+            //access:image_push //access:image_index \
             //charts/cracha:cracha //charts/cracha:cracha.push_registry \
             //bazel/cosign //bazel/cosign:verify_image
 
@@ -239,6 +241,7 @@ jobs:
           pinned //webhook:image_index "${WEBHOOK_IMAGE}"
           # Not yet //bazel/spicedb:image_index: the chart deploys
           # SpiceDB from upstream's image until it is pointed at this one.
+          pinned //access:image_index "${ACCESS_IMAGE}"
 
       # One login covers everything below: image_push (rules_img) and cosign
       # read the Docker config this writes. The chart push logs in on its own,
@@ -252,7 +255,7 @@ jobs:
       - name: Push the multi-arch images
         run: |
           set -euo pipefail
-          for target in //broker:image_push //agent:image_push //webhook:image_push //bazel/spicedb:image_push; do
+          for target in //broker:image_push //agent:image_push //webhook:image_push //bazel/spicedb:image_push //access:image_push; do
             bazel run --config=ci "${target}"
           done
 
@@ -290,6 +293,7 @@ jobs:
           record agent //agent:image_index "${AGENT_IMAGE}"
           record webhook //webhook:image_index "${WEBHOOK_IMAGE}"
           record spicedb //bazel/spicedb:image_index "${SPICEDB_IMAGE}"
+          record access //access:image_index "${ACCESS_IMAGE}"
 
       # --recursive signs the index and every child manifest. Without it, anyone
       # pulling the amd64 or arm64 manifest by its own digest gets something
@@ -308,6 +312,7 @@ jobs:
             ${{ steps.digest.outputs.agent }}
             ${{ steps.digest.outputs.webhook }}
             ${{ steps.digest.outputs.spicedb }}
+            ${{ steps.digest.outputs.access }}
           REGISTRY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           REGISTRY_PASSWORD: ${{ secrets.QUAY_TOKEN }}
           REGISTRY_CREDENTIAL_HOST: ${{ env.IMAGE_REGISTRY_HOST }}
@@ -367,7 +372,8 @@ jobs:
             "${{ steps.digest.outputs.broker }}" \
             "${{ steps.digest.outputs.agent }}" \
             "${{ steps.digest.outputs.webhook }}" \
-            "${{ steps.digest.outputs.spicedb }}"
+            "${{ steps.digest.outputs.spicedb }}" \
+            "${{ steps.digest.outputs.access }}"
 
       # The chart carries the digest of every image it deploys, pinned at
       # package time, so this publishes a chart that can only ever reference
@@ -583,9 +589,10 @@ jobs:
           AGENT_REF: ${{ needs.publish.outputs.agent }}
           WEBHOOK_REF: ${{ needs.publish.outputs.webhook }}
           SPICEDB_REF: ${{ needs.publish.outputs.spicedb }}
+          ACCESS_REF: ${{ needs.publish.outputs.access }}
         run: |
           set -euo pipefail
-          for v in CHART_VERSION CHART_REF BROKER_REF AGENT_REF WEBHOOK_REF SPICEDB_REF; do
+          for v in CHART_VERSION CHART_REF BROKER_REF AGENT_REF WEBHOOK_REF SPICEDB_REF ACCESS_REF; do
             if [ -z "${!v}" ]; then
               echo "::error::publish reported no ${v}" >&2
               exit 1
@@ -630,6 +637,7 @@ jobs:
           pinned "${BROKER_REF}"
           pinned "${AGENT_REF}"
           pinned "${WEBHOOK_REF}"
+          pinned "${ACCESS_REF}"
 
       # No REGISTRY_* credentials: the repositories are public, and this is
       # the check a consumer can run.
@@ -639,10 +647,11 @@ jobs:
           AGENT_REF: ${{ needs.publish.outputs.agent }}
           WEBHOOK_REF: ${{ needs.publish.outputs.webhook }}
           SPICEDB_REF: ${{ needs.publish.outputs.spicedb }}
+          ACCESS_REF: ${{ needs.publish.outputs.access }}
           CHART_REF: ${{ needs.publish.outputs.chart }}
         run: |
           set -euo pipefail
-          bazel run --config=ci //bazel/cosign:verify_image -- "${BROKER_REF}" "${AGENT_REF}" "${WEBHOOK_REF}" "${SPICEDB_REF}"
+          bazel run --config=ci //bazel/cosign:verify_image -- "${BROKER_REF}" "${AGENT_REF}" "${WEBHOOK_REF}" "${SPICEDB_REF}" "${ACCESS_REF}"
           bazel run --config=ci //bazel/cosign:verify_image -- --single "${CHART_REF}"
 
   # The GitHub Release of a tag: how to install it, what was published, by
@@ -694,6 +703,7 @@ jobs:
           AGENT_REF: ${{ needs.publish.outputs.agent }}
           WEBHOOK_REF: ${{ needs.publish.outputs.webhook }}
           SPICEDB_REF: ${{ needs.publish.outputs.spicedb }}
+          ACCESS_REF: ${{ needs.publish.outputs.access }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
@@ -735,6 +745,7 @@ jobs:
           | agent | \`${AGENT_REF}\` |
           | webhook | \`${WEBHOOK_REF}\` |
           | spicedb | \`${SPICEDB_REF}\` |
+          | access | \`${ACCESS_REF}\` |
 
           The images are also tagged \`${tag}\`. \`spicedb\` is SpiceDB built from
           its upstream release plus Crachá's one patch, MySQL client TLS

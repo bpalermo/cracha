@@ -497,6 +497,46 @@ Authentication:
 
 Optionally triggered automatically when Watch observes an assignment deletion.
 
+### 6.9 Write path: cracha-access
+
+On an install whose authorization store is SpiceDB, the relationships (who reaches which resource, service membership, ownership, approvers, their expiry) live in SpiceDB only; Git keeps the signed definitions the broker already verifies (grants, templates, envelopes). Every relationship write goes through `cracha-access`, which applies to it, before anything reaches SpiceDB, the checks CI applies to a grant tree (6.2), and adds authorization, approval and an audit trail. SpiceDB's gateway (6.4) lets cracha-access's SVID (`spiffe://<td>/ns/<namespace>/sa/<release>-access`) and nothing else write, so there is no other path.
+
+API: the gRPC service `cracha.access.v1.Access`, over SPIFFE mTLS with cracha-access's own X.509-SVID. The messages are JSON in gRPC frames (content subtype `json`), so the build needs no protoc; status codes, deadlines and HTTP/2 are plain gRPC. A refusal is a status error whose message starts with its reason code, which the trailer `cracha-reason` also carries.
+
+| Operation | Does |
+|---|---|
+| `Grant` | Relates a workload (`subject`, the authz encoding of 4.3) or every member of a service (`service`) to a resource (`{kind, name}`) by `reader` or `writer` (what an Access document says), makes a workload a `member` of a service, or makes a workload or a service's members an `owner` or `approver` of a resource or a service. Optional `expiresAt` and `clusters` (none on owner and approver); `reason` required; `requester` recorded; `breakGlass` below. |
+| `Revoke` | Removes such a relationship. |
+| `Approve` / `Reject` | Applies or drops a pending request by ID. |
+| `List` | The relationships of a workload (its own and its service's), of a service, or of a resource. |
+| `Explain` | What a workload's credential is composed of now, per cluster scope: the composition lint's rendering (grants, resources per lookup grant, the composed policy, problems). |
+| `Pending` | The requests waiting for an approval, all or one target's. |
+
+The CLI is the same binary, `cracha-access grant|revoke|approve|reject|list|explain|pending`, which calls the service with the caller's SVID from the Workload API (an in-cluster tool pod), or from files (`--svid`, `--svid-key`, `--bundle`: a job handed an SVID). There is no OIDC: a person acts through such a job or tool, and names themselves in `requester`, which is recorded, never authenticated; the caller's SPIFFE ID is.
+
+Authorization, per request, in SpiceDB. Any SPIFFE ID of the trust domain may connect; its workload (the authz encoding of its SPIFFE ID, 4.3) must hold `manage` on the target of a write (the resource, or the service for a membership), `approve` on it to approve or reject, and nothing to read (`List`, `Explain`, `Pending`). A caller outside the SPIFFE ID scheme is refused.
+
+Every write, before it reaches SpiceDB, is checked against the bundle in service and the relationships SpiceDB holds now (read fully consistent; writes are serialized in the one replica):
+
+1. The request is checked by the grant tree's own validation (`common/grant`): a known kind, a name valid for it (S3's rules for a bucket), a relation of the kind, a subject encoding or a service name, well-formed bounds.
+2. The tree the write would leave is rebuilt, the bundle's grants and accounts (`grant.BundleSource`: the implicit grants of the accounts' access tables included) with the Services, Assignments and Access documents SpiceDB's relationships say, and the composition lint (step 5 of 6.2, `LintComposition`) runs on it for every workload the write reaches: one shape, the size budget, the managed-policy count, each lookup grant within its compiled maximum and its envelope.
+3. A resource relation must be rendered by some lookup grant its holder has, an assigned one or its account's implicit one (a lookup of its kind whose permission the relation gives), and the resource, rendered alone, must fall within that grant's envelope: a relation no envelope bounds, or one outside it, is refused before any write.
+4. With `--access-analyzer`, every composed policy the write changes goes through Access Analyzer's `ValidatePolicy` and `CheckNoNewAccess` against the envelope of its grants (steps 2 and 3 of 6.2), with the pod's own AWS credentials.
+
+A check refuses a write only for a problem the write adds: a workload whose composition was already faulty keeps it, and a write that does not make it worse passes. A revocation narrows and is never refused by a check. A refusal carries the code the broker would deny the workload with (`no_grant`, `ambiguous`, `accounts_mixed`, `envelope_violation`, `policy_too_large`, `resource_outside_envelope`), `invalid_policy` for a blocking Access Analyzer finding, and for the request itself `invalid`, `not_authorized`, `self_approval`, `expiry_required`, `expiry_over_cap`, `expiry_past`, `not_found`, `expired`, or `unavailable` when SpiceDB, the bundle or Access Analyzer cannot answer: the write path fails closed like the broker. Before a bundle has verified, every write is refused.
+
+Bootstrap. An owner is made by an owner, so a target's first owner, and its sensitive flag, have no request: whoever runs SpiceDB writes them through the gateway with the access identity, as the end-to-end suite does. Grant assignments, teams and suspensions have none yet either.
+
+Approvals. A target is sensitive when it carries the wildcard relation `sensitive` (`workload:*`). A write on a sensitive target is stored as a pending request instead of written; a caller holding `approve` on the target that is not the identity that asked (and does not name the same `requester`) applies it, after the checks run again against the bundle and relationships of that moment, the write and the request's removal in one transaction. Owners hold `approve` too, so the rule that the approver is not the requester is what separates the two. The asker may withdraw its own request; an approver may reject it; it expires unapproved after `--pending-ttl` (72 h by default) and is then dropped and logged. Pending requests live in SpiceDB itself, one relationship each, `pending_request:<id>#target@<target>`, whose `pending_payload` caveat carries the request as JSON: no other store, nothing written outside the gateway, and the caveat is never evaluated, since no permission reads the relation.
+
+Break-glass (`breakGlass: true`) applies a write on a sensitive target at once, without an approval, by a caller holding `manage` on it, and requires `expiresAt` within `--break-glass-max` (4 h by default). It is logged at WARN. Expiry is otherwise optional; `--max-expiry kind=duration` makes it required for a kind and caps it.
+
+Audit. Every request, approval, rejection, write, refusal and expiry is one JSON line on stdout, for the log pipeline: the caller's SPIFFE ID, the requester, the reason, the request ID, the relationship before and after, and the policy delta, the composition of every workload the write reaches before and after (grants, resources per lookup grant, the composed policy). Every write carries the same who and why in SpiceDB's transaction metadata. A Watch on SpiceDB (`--watch-audit`, or `cracha-access watch-audit` on its own) logs every relationship change of the types cracha-access writes or checks against, with that metadata; a change without it was written around the service and is logged at WARN.
+
+Trust boundary. This moves the writer of the authorization store from a Git review (the reconciler applying a reviewed tree) to a service holding SpiceDB's only write identity. What bounds it is unchanged: a relationship can only relate a workload to grants and resources the signed bundle defines, every rendered policy is still checked against its grant's envelope by the broker at issuance (11), and the bundle stays under CODEOWNERS and signing. cracha-access adds the CI checks in front of every write, so a write the broker would deny is refused at the source, and the audit log and the Watch make every write attributable. A compromise of cracha-access is a compromise of the store's writes (9): misassignment within the envelopes, never beyond them.
+
+The chart deploys it with `access.enabled` (6.4's backend and a bundle source required): one replica, `Recreate`, its ServiceAccount `<name>-access` and Service `<name>-access`, reading `broker.bundle` with the broker's keys.
+
 ## 7. Delivery: cracha-agent (node agent)
 
 cracha-agent has one job: answer the AWS SDK's credential requests from inside every enrolled pod, with an answer the broker issued for that pod's identity. It exists because the SDK and the broker cannot talk to each other on acceptable terms: the SDK's container-credentials provider accepts only a loopback or an HTTPS endpoint, HTTPS means a certificate every workload image trusts, and the issuer's agent hands a pod's token only to a node component that asks on the pod's behalf. A loopback listener inside the pod asks nothing of the image: no CA, no file, no volume.
@@ -697,11 +737,12 @@ A workload on an SDK that ignores the variables and needs more room sets it in t
 | Authz store writes | Misassignment and misrelation within envelopes | One writer (the access service), change-feed audit log, envelope check |
 | SpiceDB gateway (the authorization point for the store) | What the gateway admits: any method of SpiceDB with its key | Only the gateway and SpiceDB's own pod hold the key; every client is authorized by SPIFFE ID and method there, the broker to reads only, so a compromised broker cannot write; the gateway is a sidecar, SpiceDB listening on the pod's loopback, so nothing depends on a NetworkPolicy being enforced |
 | SpiceDB or its datastore | Any relationship: who holds which grant, which resources a lookup reaches | Bounded by the signed definitions: a relationship can only name a grant of the signed bundle, and every rendered policy, lookup resources included, is checked against the grant's signed envelope before STS is called (11), so a store compromise is misassignment and misrelation within envelopes, never a wider grant |
+| cracha-access (6.9) | Misassignment within the bundle's envelopes, on any target | The gateway's single write identity, the CI checks on every write, approvals for sensitive targets, the audit log and the Watch, which logs a write made around it at WARN |
 | Identity issuer (e.g. SPIRE server) | Mint any identity | Tier-0 controls, KMS/HSM keys |
 
 ## 10. Open questions
 
-- Q1: Approval flow for temporary access. The model already has the primitive: a time-bounded assignment (`grant#assignee_workload` with the `within_window` condition) written by a trusted `access-approver` (6.4), which the broker picks up at the next fetch and which expires on its own. What is undecided is the human side:
+- Q1 (decided for SpiceDB installs: option (c), cracha-access, 6.9): Approval flow for temporary access. The model already has the primitive: a time-bounded assignment (`grant#assignee_workload` with the `within_window` condition) written by a trusted `access-approver` (6.4), which the broker picks up at the next fetch and which expires on its own. What is undecided is the human side:
   - Who may request, and who approves: the owning team from `service#owner` is the natural approver, with a second approver for production shapes.
   - Where the request and approval are recorded, so the decision log can point at an attributable approval, and how break-glass (pre-approved, short expiry, loud audit) differs from planned access.
   - Options: (a) a Git change carrying `expiresAt`, approved through CODEOWNERS and published with the static backend's assignments (with SpiceDB, relationships do not come from Git). Reuses existing review tooling, no new service, minutes of latency. (b) Integration with an existing access-request or just-in-time tool that calls the `access-approver` writer. Fastest for users, one more integration to secure. (c) A small purpose-built approver (CLI or chat bot). Most flexible, most to build and to harden, since it holds write access to the authorization store.
@@ -712,6 +753,7 @@ A workload on an SDK that ignores the variables and needs more room sets it in t
 These hold regardless of backend, issuer or platform. Any implementation must be able to demonstrate each one.
 
 - Never fail open: an unavailable authz store, issuer or bundle results in denial, or in serving already-issued credentials within bounded staleness, never in broader access.
+- Every relationship write passes the same checks a grant tree does (6.2): cracha-access refuses, before SpiceDB sees it, a write that would leave a workload's composition with a problem the grant pipeline would refuse (6.9).
 - Every rendered session policy is checked against the grant's envelope before STS is called, including every resource a lookup grant, implicit or not, is rendered with at issuance: the store relates a workload to resources, it never widens a grant beyond its envelope.
 - Every credential carries a session policy or managed session policies, so none is ever issued with an account role's whole identity policy.
 - One credential is one `AssumeRole` in one account: grants of two accounts are refused (`accounts_mixed`), never split or merged.

@@ -5,10 +5,11 @@ Guidance for agents working in this repository.
 ## What this is
 
 Crachá issues AWS credentials to Kubernetes workloads from their SPIFFE
-identity. Three binaries: the credential broker (`broker`), the node agent
-that serves each pod's credentials over a loopback listener bound inside the
-pod's network namespace (`agent`), and the mutating webhook that wires pods
-up (`webhook`). [docs/design.md](docs/design.md)
+identity. Four binaries with images: the credential broker (`broker`), the
+node agent that serves each pod's credentials over a loopback listener bound
+inside the pod's network namespace (`agent`), the mutating webhook that wires
+pods up (`webhook`), and, on an install whose authorization store is SpiceDB,
+the only writer of its relationships (`access`, design 6.9). [docs/design.md](docs/design.md)
 is the design; read it before changing behaviour, and update it in the same
 pull request when behaviour changes. Its invariants (section 11) must hold in
 every change.
@@ -37,7 +38,7 @@ E2E_CHART=0.1.0 e2e/run.sh      # a published chart and its images, not the chec
 Needs docker, kind and kubectl; helm comes from Bazel. The suite in `e2e/` is
 tagged `e2e` and excluded from `bazel test //...`; `e2e/run.sh` creates or
 reuses the kind cluster `cracha-e2e`, loads the images built from the
-checkout (the broker, the agent, the webhook and the suite's own two,
+checkout (the broker, the agent, the webhook, cracha-access and the suite's own two,
 `e2e/client` and `e2e/stsstub`), deploys SPIRE (`e2e/spire.sh`: the server
 and agent of `e2e/spire.yaml`, with the agent's Broker API open to
 `cracha-agent` alone, and the entries of the three components and the test
@@ -65,10 +66,18 @@ SPIRE server mint X.509-SVIDs for the identities the suite plays (broker,
 access, reconciler and one the gateway does not know; `spire-server x509
 mint`, handed to the tests as `E2E_SPICEDB_SVIDS`) and runs
 `cracha-reconciler schema` built from the checkout on the host through a
-`kubectl port-forward` to the gateway; the suite writes its relationships
-(`e2e/spicedb_access_test.go`, the relationships `e2e/grants` gives the
-static mode) as the access identity, and checks the gateway's method table
-identity by identity. `E2E_ENROL` picks how the agent enrols a
+`kubectl port-forward` to the gateway; the suite writes the relationships
+`e2e/grants` gives the static mode (`e2e/spicedb_access_test.go`): the
+services' members and the buckets' readers through cracha-access, which
+the spicedb leg deploys (`access.enabled`, its own port-forward handed to
+the tests as `E2E_ACCESS_ENDPOINT`), with its CLI as `access-owner`, and
+what cracha-access has no request for (the grant's account, the teams and
+grants, every target's first owner, approver and sensitive flag) directly
+as the access identity; `e2e/write_path_test.go` drives the write path through
+the CLI with minted SVIDs (`access-owner`, `access-approver`,
+`access-stranger`): grant and revoke reaching the reader's credentials,
+refusals, approval, break-glass and the audit lines. It also checks the
+gateway's method table identity by identity. `E2E_ENROL` picks how the agent enrols a
 pod (design 7.2): `init` (the default, the chart's) has the webhook inject
 the `cracha-enrol` init container; `cni` installs the chart with
 `e2e/values-cni.yaml` on top, which switches the agent to the `cracha-cni`
@@ -167,7 +176,7 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 ## Layout
 
 - No `cmd/`. Each binary lives in a root-level directory with its `main.go`:
-  `broker/`, `agent/`, `webhook/`, `grantc/`, `reconciler/`.
+  `broker/`, `agent/`, `webhook/`, `access/`, `grantc/`, `reconciler/`.
 - `agent/` is `cracha-agent` (design 7). `internal/listener` is the registry
   of loopback listeners, one per enrolled pod, bound inside the pod's network
   namespace by `internal/netns` (setns on a dedicated locked thread) and
@@ -343,6 +352,25 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   a composition of two accounts is `accounts_mixed`, and one with neither
   a session policy nor managed policies is refused, since on a shared
   account role it would be the role's whole policy.
+- `access/` is `cracha-access` (design 6.9): `serve` is a gRPC API
+  (`cracha.access.v1.Access`, JSON messages in gRPC frames, so no protoc:
+  `internal/api`) over SPIFFE mTLS that any SPIFFE ID of the trust domain
+  may call, `watch-audit` logs SpiceDB's Watch, and the other subcommands
+  are its CLI, which calls it with the caller's SVID. `internal/store` is
+  its SpiceDB adapter (relationships as `Tuple`s, `manage`/`approve`
+  checks, the `sensitive` flag, pending requests as `pending_request`
+  relationships, Watch); `internal/check` the safeguards, which rebuild
+  the grant tree a write leaves from the bundle and SpiceDB's
+  relationships (`grant.BundleSource`, the implicit grants included) and
+  run `common/grant`'s `LintComposition` on it, refusing
+  with the broker's reason codes; `internal/service` the write path
+  (authorization, expiry, approvals, break-glass, audit);
+  `internal/audit` the JSON audit lines on stdout. Its tests run against
+  `internal/store/storetest`, an in-memory SpiceDB, and a bundle
+  `internal/check/checktest` compiles with `common/grant`. It reads the
+  bundle with `common/publication`, the fetchers the broker uses
+  (`broker/internal/bundle` aliases them) and a verifying poller that
+  keeps the last good version.
 - `bazel/` holds build rules, and `bazel/spicedb` the third-party SpiceDB
   binary Crachá builds and publishes from its upstream module plus the
   patches beside it (below); `docs/` the design; `charts/cracha` the Helm
@@ -355,7 +383,7 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   may spell it out.
 - Images are built with the `go_image` macro in `bazel/image/defs.bzl`, from
   pure-Go binaries on a digest-pinned distroless base. Image repositories are
-  `broker`, `agent`, `webhook` and `spicedb`.
+  `broker`, `agent`, `webhook`, `access` and `spicedb`.
 - `spicedb` (`//bazel/spicedb`) is a third-party binary: SpiceDB built
   from a pinned upstream release (`github.com/authzed/spicedb` in `go.mod`, a
   `tool`, so nothing imports it) plus one reviewed patch,
@@ -383,8 +411,13 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 
 ## Chart
 
-- `charts/cracha` is the Helm chart: the agent DaemonSet, the broker and
-  the webhook. It is built, linted, templated and
+- `charts/cracha` is the Helm chart: the agent DaemonSet, the broker,
+  the webhook and, with `access.enabled` (off by default; it needs
+  `broker.authz.backend` spicedb and `broker.bundle.source`), cracha-access:
+  one replica with the `Recreate` strategy, since it serializes the writes
+  it checks, its ServiceAccount `<name>-access` (the SPIFFE ID the SpiceDB
+  gateway lets write) and Service, reading the broker's bundle source and
+  keys (`access_test.go` asserts its arguments). It is built, linted, templated and
   installed with the helm that rules_helm pins (`@helm//:helm`, the version
   in `MODULE.bazel` and `.bazelrc`); never a helm from PATH.
   `bazel build //charts/cracha:cracha` packages it as

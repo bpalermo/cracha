@@ -15,3 +15,7 @@ webhook:
   image:
     <<: *local
     repository: localhost/cracha-webhook
+access:
+  image:
+    <<: *local
+    repository: localhost/cracha-access

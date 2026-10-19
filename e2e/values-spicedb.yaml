@@ -6,8 +6,10 @@
 # like every component's (e2e/spire.sh registers its service account). The
 # preshared key is the Secret e2e/run.sh creates with a random value, which
 # only the SpiceDB pod mounts; the broker reaches the gateway with its own
-# SVID. run.sh has cracha-reconciler write the schema and the suite writes
-# its relationships as the access identity.
+# SVID. run.sh has cracha-reconciler write the schema; the suite writes
+# the relationships nothing else can (e2e/spicedb_access_test.go) as the
+# access identity and the rest through cracha-access, which runs here
+# (design 6.9), on the broker's bundle and keys.
 broker:
   assignments:
     source: file
@@ -28,3 +30,6 @@ spicedb:
         path: /run/spire/agent-sockets
         type: Directory
     socket: spire-agent.sock
+access:
+  enabled: true
+  logLevel: debug

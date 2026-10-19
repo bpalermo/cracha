@@ -100,26 +100,59 @@ func bucketID(name string) string {
 
 // The suite's relationships: what e2e/grants gives the static mode in its
 // published assignments, in SpiceDB, where the spicedb backend's
-// relationships live (design 6.4). The services' teams and members, their
-// grants, and the Access documents' buckets; the account's implicit grants
-// are the bundle's, never relationships.
+// relationships live (design 6.4). The account's implicit grants are the
+// bundle's, never relationships.
+//
+// They reach SpiceDB two ways. What cracha-access writes (design 6.9) it
+// writes here too, through its CLI as the owner (viaAccess): the services'
+// members and the buckets' readers, checked against the bundle like any
+// write. What it has no request for is fixture setup, written directly as
+// the access identity, the one the gateway lets write (bootstrap): the
+// grant's account, the services' teams and grants, and the first owner,
+// approver and sensitive flag of every target the tests use. A target's
+// first owner has no API path (an owner is made by an owner), so whoever
+// runs SpiceDB seeds it this way.
 var (
 	clientAssignment = rel(schema.TypeGrant, "e2e-s3-reader", schema.RelationAssigneeService, schema.TypeService, "e2e-client", "")
 	readerDataAccess = rel(schema.TypeS3Bucket, bucketID("cracha-e2e-data"), schema.RelationReader, schema.TypeService, "e2e-reader", schema.RelationMember)
 	clientSuspension = rel(schema.TypeWorkload, workloadID(assignedSA), schema.RelationSuspended, schema.TypeTeam, "platform", "")
 )
 
-func suiteRelationships() []*v1.Relationship {
-	return []*v1.Relationship{
+// The targets the access tests write, and who owns and approves them.
+const (
+	grantedBucket   = "cracha-e2e-granted"
+	sensitiveBucket = "cracha-e2e-sensitive"
+	glassBucket     = "cracha-e2e-glass"
+)
+
+func bootstrapRelationships() []*v1.Relationship {
+	owner, approver := workloadID(identityOwner), workloadID(identityApprover)
+	out := []*v1.Relationship{
 		rel(schema.TypeGrant, "e2e-s3-reader", schema.RelationAccount, schema.TypeAWSAccount, "111122223333", ""),
 		rel(schema.TypeService, "e2e-client", schema.RelationTeam, schema.TypeTeam, "platform", ""),
-		rel(schema.TypeService, "e2e-client", schema.RelationMember, schema.TypeWorkload, workloadID(assignedSA), ""),
 		clientAssignment,
 		rel(schema.TypeService, "e2e-reader", schema.RelationTeam, schema.TypeTeam, "platform", ""),
-		rel(schema.TypeService, "e2e-reader", schema.RelationMember, schema.TypeWorkload, workloadID(readerSA), ""),
 		rel(schema.TypeGrant, "e2e-s3-reader", schema.RelationAssigneeService, schema.TypeService, "e2e-reader", ""),
-		rel(schema.TypeS3Bucket, bucketID("cracha-e2e-other"), schema.RelationReader, schema.TypeWorkload, workloadID("bystander"), ""),
-		readerDataAccess,
+		rel(schema.TypeService, "e2e-client", schema.RelationOwner, schema.TypeWorkload, owner, ""),
+		rel(schema.TypeService, "e2e-reader", schema.RelationOwner, schema.TypeWorkload, owner, ""),
+		rel(schema.TypeS3Bucket, bucketID(sensitiveBucket), schema.RelationApprover, schema.TypeWorkload, approver, ""),
+		rel(schema.TypeS3Bucket, bucketID(sensitiveBucket), schema.RelationSensitive, schema.TypeWorkload, "*", ""),
+		rel(schema.TypeS3Bucket, bucketID(glassBucket), schema.RelationSensitive, schema.TypeWorkload, "*", ""),
+	}
+	for _, b := range []string{"cracha-e2e-data", "cracha-e2e-other", grantedBucket, sensitiveBucket, glassBucket, outsideBucket} {
+		out = append(out, rel(schema.TypeS3Bucket, bucketID(b), schema.RelationOwner, schema.TypeWorkload, owner, ""))
+	}
+	return out
+}
+
+// viaAccess are the suite's relationships cracha-access writes, as the
+// arguments of its CLI's grant.
+func viaAccess() [][]string {
+	return [][]string{
+		{"--subject", workloadID(assignedSA), "--resource", "service:e2e-client", "--relation", "member"},
+		{"--subject", workloadID(readerSA), "--resource", "service:e2e-reader", "--relation", "member"},
+		{"--service", "e2e-reader", "--resource", "s3_bucket:cracha-e2e-data", "--relation", "reader"},
+		{"--subject", workloadID("bystander"), "--resource", "s3_bucket:cracha-e2e-other", "--relation", "reader"},
 	}
 }
 
@@ -150,31 +183,53 @@ func mustWrite(ctx context.Context, t *testing.T, op v1.RelationshipUpdate_Opera
 	}
 }
 
-// seedSpiceDB writes the suite's relationships in spicedb mode, and takes
-// away whatever a test of an earlier run on a kept cluster may have left
-// (a suspension); nothing outside spicedb mode. SpiceDB's memory datastore
+// seedSpiceDB writes the suite's relationships in spicedb mode, the
+// bootstrap directly and the rest through cracha-access, and takes away
+// whatever a test of an earlier run on a kept cluster may have left (a
+// suspension); nothing outside spicedb mode. SpiceDB's memory datastore
 // forgets everything when its pod restarts, so every run writes them. The
 // schema is already there: run.sh has the reconciler write it.
 func seedSpiceDB() error {
 	if os.Getenv(authzEnv) != spicedbMode {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	var err error
-	for range 30 {
-		if _, err = write(ctx, v1.RelationshipUpdate_OPERATION_TOUCH, suiteRelationships()...); err == nil {
-			break
+	if err := retry(ctx, func() error {
+		_, err := write(ctx, v1.RelationshipUpdate_OPERATION_TOUCH, bootstrapRelationships()...)
+		return err
+	}); err != nil {
+		return err
+	}
+	if _, err := write(ctx, v1.RelationshipUpdate_OPERATION_DELETE, clientSuspension); err != nil {
+		return err
+	}
+	for _, args := range viaAccess() {
+		args := append([]string{"grant"}, append(args, "--reason", "e2e seed", "--requester", "e2e")...)
+		if err := retry(ctx, func() error {
+			_, err := accessCLI(ctx, identityOwner, args...)
+			return err
+		}); err != nil {
+			return fmt.Errorf("seeding through cracha-access: %w", err)
 		}
-		time.Sleep(2 * time.Second)
-	}
-	if err != nil {
-		return err
-	}
-	if _, err = write(ctx, v1.RelationshipUpdate_OPERATION_DELETE, clientSuspension); err != nil {
-		return err
 	}
 	return awaitVisible(ctx)
+}
+
+// retry calls f every two seconds until it succeeds, 30 times at most.
+func retry(ctx context.Context, f func() error) error {
+	var err error
+	for range 30 {
+		if err = f(); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w (last: %v)", ctx.Err(), err)
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return err
 }
 
 // awaitVisible waits until the client's membership is visible at the
