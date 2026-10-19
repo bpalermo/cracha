@@ -1,0 +1,81 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_test")
+load("//bazel:registry.bzl", "IMAGE_REGISTRY", "image_repository")
+load("//bazel/image:defs.bzl", "go_image")
+
+# SpiceDB, the authorization backend the chart deploys, built from a pinned
+# upstream release plus one reviewed patch and published as Crachá's `spicedb`
+# image.
+#
+#   go.mod                           github.com/authzed/spicedb, as a `tool`
+#   0001-mysql-client-tls.patch      the change: MySQL client TLS
+#                                    (--datastore-tls-{ca,cert,key}-path,
+#                                    --datastore-tls-server-name), reloaded on
+#                                    rotation; `git diff v<version>..` of the
+#                                    fork branch over its non-test Go files
+#   0002-bazel-build-files.patch     Bazel only: adds the file 0001 creates to
+#                                    the BUILD file Gazelle generated before
+#                                    the patches applied
+#
+# Both are applied by go_deps.module_override in MODULE.bazel. Bumping
+# SpiceDB: AGENTS.md, "Images and versions".
+
+exports_files(glob(["*.patch"]))
+
+# The version `spicedb version` reports: upstream's release with a suffix
+# saying it is this build. Keep the release equal to go.mod's
+# (//bazel/spicedb:spicedb_test checks it), and bump the suffix when
+# the patch changes without the release changing.
+SPICEDB_VERSION = "v1.56.2-cracha.1"
+
+# Built the way upstream's release is (.goreleaser.yml of the module): cgo
+# off, the `memoryprotection` tag, whose memory-usage provider reads the
+# runtime's internals through go:linkname and so links only with
+# -checklinkname=0, and the version stamped into cobrautil. Kept: the
+# package has no Go sources of its own, so Gazelle would delete the rule.
+# keep
+go_binary(
+    name = "spicedb",
+    embed = ["@com_github_authzed_spicedb//cmd/spicedb:spicedb_lib"],
+    gc_linkopts = [
+        "-s",
+        "-w",
+        "-checklinkname=0",
+    ],
+    gotags = ["memoryprotection"],
+    pure = "on",
+    visibility = ["//visibility:public"],
+    x_defs = {"github.com/jzelinskie/cobrautil/v2.Version": SPICEDB_VERSION},
+)
+
+# At upstream's path, so `spicedb` is the entrypoint as in its image. No
+# grpc_health_probe: Kubernetes probes the gRPC health service natively.
+go_image(
+    name = "image",
+    base = "@distroless_static",
+    binary = ":spicedb",
+    load_tag = "localhost/cracha-spicedb:e2e",
+    path = "/usr/local/bin/spicedb",
+    registry = IMAGE_REGISTRY,
+    repository = image_repository("spicedb"),
+)
+
+go_test(
+    name = "spicedb_test",
+    srcs = ["spicedb_test.go"],
+    data = [
+        ":spicedb",
+        "//:go.mod",
+    ],
+    env = {
+        "GO_MOD_RLOCATIONPATH": "$(rlocationpath //:go.mod)",
+        "SPICEDB_RLOCATIONPATH": "$(rlocationpath :spicedb)",
+        "SPICEDB_VERSION": SPICEDB_VERSION,
+    },
+    deps = [
+        "@com_github_authzed_authzed_go//proto/authzed/api/v1:api",
+        "@com_github_authzed_authzed_go//v1:authzed-go",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//credentials/insecure",
+        "@rules_go//go/runfiles",
+    ],
+)

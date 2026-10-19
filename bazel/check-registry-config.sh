@@ -12,7 +12,11 @@
 #      of spelling them out. The values are data, so they cannot be Starlark;
 #      the package-time substitution is what derives them, and
 #      //charts/cracha:pin_test asserts the result equals image_reference().
-#   3. No tracked file outside the allow-list contains `<host>/<namespace>`,
+#   3. Every image a BUILD file publishes (`image_repository("<name>")`) is
+#      one bazel/registry.sh prints as <NAME>_IMAGE: the workflows push, sign
+#      and verify what that prints, so an image missing from it is published
+#      by nothing.
+#   4. No tracked file outside the allow-list contains `<host>/<namespace>`,
 #      computed from the setting, not typed here.
 #
 # The literal hunt runs a positive control first, so it cannot pass by matching
@@ -63,7 +67,27 @@ for target in //broker:image_push //agent:image_push //webhook:image_push; do
 	fi
 done
 
-# --- 3. no literal outside the allow-list ------------------------------------
+# --- 3. every published image is in registry.sh's environment ---------------
+if ! env_lines="$(bazel/registry.sh)"; then
+	echo "::error::bazel/registry.sh cannot print its environment" >&2
+	exit 2
+fi
+components="$(git grep -hoP -- 'image_repository\("\K[a-z0-9._-]+(?="\))' -- '*BUILD.bazel' '*BUILD' | sort -u)"
+if [ -z "$components" ]; then
+	echo "::error::no BUILD file publishes an image with image_repository(...) -- the search is broken" >&2
+	exit 2
+fi
+for component in $components; do
+	key="$(printf '%s' "$component" | tr 'a-z.-' 'A-Z__')_IMAGE"
+	want="${key}=${host}/${namespace}/${component}"
+	if ! grep -qxF -- "$want" <<<"$env_lines"; then
+		bad "a BUILD file publishes image_repository(\"${component}\"), but bazel/registry.sh does not print ${want}: add it, and the image to the lists of ci.yml and publish.yml"
+	else
+		echo "ok: bazel/registry.sh prints ${key}"
+	fi
+done
+
+# --- 4. no literal outside the allow-list ------------------------------------
 allow=(
 	':(exclude)bazel/registry.bzl'
 	':(exclude)bazel/registry.sh'

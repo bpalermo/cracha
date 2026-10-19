@@ -2,9 +2,10 @@
 
 Every published coordinate is derived from the constants below: the
 `image_push` of each `go_image` (//broker:image_push, //agent:image_push,
-//webhook:image_push), the chart push (//charts/cracha:cracha.push_registry)
-and the chart's default image repositories (charts/cracha/values.yaml, which
-takes each from its image_push). Shell and the workflows read it through
+//webhook:image_push, //bazel/spicedb:image_push), the chart push
+(//charts/cracha:cracha.push_registry) and the chart's default image
+repositories (charts/cracha/values.yaml, which takes each from its
+image_push). Shell and the workflows read it through
 bazel/registry.sh, and bazel/check-registry-config.sh fails CI on a registry
 spelled out anywhere else. Nothing else may spell the registry out.
 
@@ -13,7 +14,8 @@ The coordinates:
     <IMAGE_REGISTRY>/<IMAGE_NAMESPACE>/broker
     <IMAGE_REGISTRY>/<IMAGE_NAMESPACE>/agent
     <IMAGE_REGISTRY>/<IMAGE_NAMESPACE>/webhook
-    oci://<IMAGE_REGISTRY>/<IMAGE_NAMESPACE>/cracha        (the chart)
+    <IMAGE_REGISTRY>/<IMAGE_NAMESPACE>/spicedb       (SpiceDB: upstream plus a patch)
+    oci://<IMAGE_REGISTRY>/<IMAGE_NAMESPACE>/cracha  (the chart)
 
 Repositories are not prefixed with the project name: the namespace already is
 the project. The chart is `cracha` because no image is.
@@ -39,7 +41,7 @@ def image_repository(component):
     """Repository path (no host) of a component's image.
 
     Args:
-      component: "broker", "agent" or "webhook".
+      component: "broker", "agent", "webhook" or "spicedb".
 
     Returns:
       e.g. "cracha/agent".
@@ -50,7 +52,7 @@ def image_reference(component):
     """Host-qualified image repository of a component.
 
     Args:
-      component: "broker", "agent" or "webhook".
+      component: "broker", "agent", "webhook" or "spicedb".
 
     Returns:
       e.g. "quay.io/cracha/agent".
