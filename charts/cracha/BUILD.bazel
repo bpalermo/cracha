@@ -31,6 +31,7 @@ PINNED_COMPONENTS = [
     "agent",
     "webhook",
     "access",
+    "spicedb",
 ]
 
 # Chart.yaml, with its versions from the workspace status. rules_helm stamps
@@ -63,6 +64,7 @@ helm_chart(
         "//agent:image_push",
         "//webhook:image_push",
         "//access:image_push",
+        "//bazel/spicedb:image_push",
     ],
     registry_url = chart_push_url(),
     templates = glob(["templates/**"]),
@@ -129,6 +131,7 @@ helm_lint_test(
         "bundle-secret",
         "spicedb-external",
         "spicedb-memory",
+        "spicedb-mysql-spiffe",
         "spicedb-postgres",
         "static-configmap",
     ]
@@ -179,6 +182,10 @@ helm_template_test(
             REQUIRED_VALUES + ["test/spicedb-postgres.yaml"],
         ),
         (
+            "spicedb_mysql_spiffe",
+            REQUIRED_VALUES + ["test/spicedb-mysql-spiffe.yaml"],
+        ),
+        (
             "access",
             REQUIRED_VALUES + ["test/access.yaml"],
         ),
@@ -205,6 +212,7 @@ go_test(
         ":rendered_pod_labels",
         ":rendered_published",
         ":rendered_spicedb_memory",
+        ":rendered_spicedb_mysql_spiffe",
         ":rendered_spicedb_postgres",
     ],
     deps = [

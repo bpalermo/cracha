@@ -330,6 +330,81 @@ func TestSpiceDBDatastore(t *testing.T) {
 	}
 }
 
+// With spicedb.datastore.spiffe, SpiceDB and the migration Job log in with
+// their SPIFFE IDs from the Workload API: the flags, the socket mounted, the
+// label the issuer's entry selects, the Job's own ServiceAccount created
+// before it, and no CA.
+func TestSpiceDBDatastoreSPIFFE(t *testing.T) {
+	docs := rendered(t, "spicedb_mysql_spiffe")
+	dep := object(t, docs, "Deployment", "cracha-spicedb")
+	job := object(t, docs, "Job", "cracha-spicedb-migrate")
+	sa := object(t, docs, "ServiceAccount", "cracha-spicedb-migrate")
+	if hook := path(sa, "metadata", "annotations", "helm.sh/hook"); hook != "pre-install,pre-upgrade" {
+		t.Errorf("migration ServiceAccount hook %v", hook)
+	}
+	if w := path(sa, "metadata", "annotations", "helm.sh/hook-weight"); w != "-1" {
+		t.Errorf("migration ServiceAccount hook weight %v, want -1 (before the Job's 0)", w)
+	}
+	if got := path(job, "spec", "template", "spec", "serviceAccountName"); got != "cracha-spicedb-migrate" {
+		t.Errorf("Job serviceAccountName %v", got)
+	}
+	for _, tt := range []struct {
+		what string
+		obj  document
+		id   string
+	}{
+		{"SpiceDB", dep, "spiffe://prod.example.org/ns/default/sa/cracha-spicedb"},
+		{"the migration Job", job, "spiffe://prod.example.org/spicedb/migrate"},
+	} {
+		pod := path(tt.obj, "spec", "template")
+		if l := path(pod, "metadata", "labels", "cracha.dev/datastore-client"); l != "true" {
+			t.Errorf("%s: label cracha.dev/datastore-client %v", tt.what, l)
+		}
+		c := path(pod, "spec", "containers", 0)
+		args := stringList(path(c, "args"))
+		for _, want := range []string{
+			"--datastore-spiffe",
+			"--datastore-spiffe-socket=unix:///spiffe-workload-api/spire-agent.sock",
+			"--datastore-spiffe-id=" + tt.id,
+			"--datastore-spiffe-server-id=spiffe://db.example.org/mysql/server",
+		} {
+			if !slices.Contains(args, want) {
+				t.Errorf("%s: args %q lack %s", tt.what, args, want)
+			}
+		}
+		if !slices.Contains(stringListOf(path(c, "volumeMounts"), "mountPath"), "/spiffe-workload-api") {
+			t.Errorf("%s: the Workload API socket is not mounted", tt.what)
+		}
+		for _, e := range path(c, "env").([]any) {
+			if path(e, "name") == "SSL_CERT_FILE" {
+				t.Errorf("%s: SSL_CERT_FILE set with spiffe", tt.what)
+			}
+		}
+		var csi bool
+		for _, v := range path(pod, "spec", "volumes").([]any) {
+			if path(v, "name") == "spire-workload-api" {
+				csi = path(v, "csi") != nil && path(v, "hostPath") == nil
+			}
+		}
+		if !csi {
+			t.Errorf("%s: no spire-workload-api volume of the csi source", tt.what)
+		}
+	}
+	// Without spiffe, nothing of it.
+	for _, rendering := range []string{"overrides", "spicedb_postgres"} {
+		for _, d := range rendered(t, rendering) {
+			if d.kind() == "ServiceAccount" && strings.HasSuffix(d.name(), "-spicedb-migrate") {
+				t.Errorf("%s: migration ServiceAccount rendered without spiffe", rendering)
+			}
+			if d.kind() == "Deployment" || d.kind() == "Job" {
+				if l := path(d, "spec", "template", "metadata", "labels", "cracha.dev/datastore-client"); l != nil {
+					t.Errorf("%s: %s %s labelled cracha.dev/datastore-client without spiffe", rendering, d.kind(), d.name())
+				}
+			}
+		}
+	}
+}
+
 // The static backend renders no SpiceDB at all.
 func TestNoSpiceDBWithStatic(t *testing.T) {
 	for _, d := range rendered(t, "defaults") {

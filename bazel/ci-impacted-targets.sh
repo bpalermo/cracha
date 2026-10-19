@@ -76,7 +76,7 @@ BUILDABLE_RULES="kind(rule, //...) except ${MANUAL}"
 RUNNABLE_TESTS="tests(//...) except (${MANUAL} union ${E2E_TAGGED})"
 # What the end-to-end job deploys or runs. The image_load targets are the
 # ones e2e/run.sh loads (its `images`): keep in step.
-E2E_SET="//e2e/... union //charts/cracha:cracha union //broker:image_load union //agent:image_load union //webhook:image_load union //access:image_load"
+E2E_SET="//e2e/... union //charts/cracha:cracha union //broker:image_load union //agent:image_load union //webhook:image_load union //access:image_load union //bazel/spicedb:image_load"
 
 emit() { # name value
 	[ -n "${GITHUB_OUTPUT:-}" ] && echo "$1=$2" >>"${GITHUB_OUTPUT}"

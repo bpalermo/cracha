@@ -399,7 +399,12 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
   and adds its files and that package to the BUILD files Gazelle generated,
   since `go_deps.module_override` applies patches after Gazelle runs (a
   BUILD file in it loads `@io_bazel_rules_go`, as Gazelle's do, and is a
-  `git diff`, the format Bazel's patcher reads). The binary is built as upstream's release is
+  `git diff`, the format Bazel's patcher reads). The chart deploys this image (`spicedb.image`, pinned like the
+  others). Beside the binary it carries `grpc_health_probe` at upstream's
+  path, for the chart's probes of SpiceDB's loopback-only gRPC: our own
+  (`bazel/spicedb/healthprobe`, `-addr` and the timeouts of
+  grpc-ecosystem's, plaintext, the overall service), since upstream's
+  links dynamically from its module and trips nogo when embedded. The binary is built as upstream's release is
   (cgo off, the `memoryprotection` tag, `-checklinkname=0`) and `spicedb
   version` reports `SPICEDB_VERSION` of its BUILD file, the release with a
   `-cracha.<n>` suffix; `//bazel/spicedb:spicedb_test` checks the

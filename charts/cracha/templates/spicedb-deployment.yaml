@@ -3,6 +3,7 @@
 {{- $s := .Values.spicedb -}}
 {{- $g := $s.gateway -}}
 {{- $engine := include "cracha.spicedbEngine" . -}}
+{{- $spiffe := $s.datastore.spiffe.enabled -}}
 {{- if not $s.presharedKeySecret.name }}{{ fail "spicedb.presharedKeySecret.name is required with the chart's SpiceDB: the Secret holding its preshared key" }}{{ end -}}
 {{- if not (has $s.logLevel (list "trace" "debug" "info" "warn" "error")) -}}
 {{- fail (printf "spicedb.logLevel must be trace, debug, info, warn or error, not %q" $s.logLevel) -}}
@@ -28,6 +29,10 @@ spec:
       labels:
         {{- include "cracha.labels" . | nindent 8 }}
         app.kubernetes.io/component: spicedb
+        {{- if $spiffe }}
+        # Selects the issuer's entry for the datastore's client identity.
+        cracha.dev/datastore-client: "true"
+        {{- end }}
       annotations:
         # A new gateway configuration restarts the pods: Envoy reads it once.
         checksum/gateway: {{ include (print .Template.BasePath "/spicedb-gateway-config.yaml") . | sha256sum }}
@@ -70,6 +75,9 @@ spec:
             - --log-format=json
             - --log-level={{ $s.logLevel }}
             - --datastore-engine={{ $engine }}
+            {{- with (include "cracha.spicedbDatastoreSpiffeArgs" (dict "root" . "id" (include "cracha.spicedbDatastoreSpiffeID" (dict "root" . "id" $s.datastore.spiffe.id "serviceAccount" (printf "%s-spicedb" (include "cracha.name" .)))))) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           env:
             - name: SPICEDB_GRPC_PRESHARED_KEY
               valueFrom:
@@ -103,9 +111,17 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with (include "cracha.spicedbDatastoreMounts" .) }}
+          {{- if or $spiffe (include "cracha.spicedbDatastoreMounts" .) }}
           volumeMounts:
+            {{- with (include "cracha.spicedbDatastoreMounts" .) }}
             {{- . | nindent 12 }}
+            {{- end }}
+            {{- if $spiffe }}
+            # The datastore's client identity, from the same Workload API.
+            - name: spire-workload-api
+              mountPath: /spiffe-workload-api
+              readOnly: true
+            {{- end }}
           {{- end }}
         - name: gateway
           image: {{ include "cracha.image" (dict "root" . "image" $g.image) }}
