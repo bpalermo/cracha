@@ -748,8 +748,8 @@ jobs:
           | access | \`${ACCESS_REF}\` |
 
           The images are also tagged \`${tag}\`. \`spicedb\` is SpiceDB built from
-          its upstream release plus Crachá's one patch, MySQL client TLS
-          (\`bazel/spicedb\`); \`spicedb version\` names the build.
+          its upstream release plus Crachá's one patch, a SPIFFE workload
+          identity for the MySQL datastore (\`bazel/spicedb\`); \`spicedb version\` names the build.
 
           ## Verify
 
