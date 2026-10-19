@@ -38,7 +38,7 @@ E2E_CHART=0.1.0 e2e/run.sh      # a published chart and its images, not the chec
 Needs docker, kind and kubectl; helm comes from Bazel. The suite in `e2e/` is
 tagged `e2e` and excluded from `bazel test //...`; `e2e/run.sh` creates or
 reuses the kind cluster `cracha-e2e`, loads the images built from the
-checkout (the broker, the agent, the webhook and the suite's own two,
+checkout (the broker, the agent, the webhook, cracha-access and the suite's own two,
 `e2e/client` and `e2e/stsstub`), deploys SPIRE (`e2e/spire.sh`: the server
 and agent of `e2e/spire.yaml`, with the agent's Broker API open to
 `cracha-agent` alone, and the entries of the three components and the test
@@ -66,10 +66,18 @@ SPIRE server mint X.509-SVIDs for the identities the suite plays (broker,
 access, reconciler and one the gateway does not know; `spire-server x509
 mint`, handed to the tests as `E2E_SPICEDB_SVIDS`) and runs
 `cracha-reconciler schema` built from the checkout on the host through a
-`kubectl port-forward` to the gateway; the suite writes its relationships
-(`e2e/spicedb_access_test.go`, the relationships `e2e/grants` gives the
-static mode) as the access identity, and checks the gateway's method table
-identity by identity. `E2E_ENROL` picks how the agent enrols a
+`kubectl port-forward` to the gateway; the suite writes the relationships
+`e2e/grants` gives the static mode (`e2e/spicedb_access_test.go`): the
+services' members and the buckets' readers through cracha-access, which
+the spicedb leg deploys (`access.enabled`, its own port-forward handed to
+the tests as `E2E_ACCESS_ENDPOINT`), with its CLI as `access-owner`, and
+what cracha-access has no request for (the grant's account, the teams and
+grants, every target's first owner, approver and sensitive flag) directly
+as the access identity; `e2e/write_path_test.go` drives the write path through
+the CLI with minted SVIDs (`access-owner`, `access-approver`,
+`access-stranger`): grant and revoke reaching the reader's credentials,
+refusals, approval, break-glass and the audit lines. It also checks the
+gateway's method table identity by identity. `E2E_ENROL` picks how the agent enrols a
 pod (design 7.2): `init` (the default, the chart's) has the webhook inject
 the `cracha-enrol` init container; `cni` installs the chart with
 `e2e/values-cni.yaml` on top, which switches the agent to the `cracha-cni`
