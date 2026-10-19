@@ -1,6 +1,28 @@
 {{- if include "cracha.spicedbEnabled" . }}
 {{- $s := .Values.spicedb -}}
 {{- if and $s.migration.enabled (ne (include "cracha.spicedbEngine" .) "memory") }}
+{{- $spiffe := $s.datastore.spiffe.enabled -}}
+{{- $sa := printf "%s-spicedb-migrate" (include "cracha.name" .) -}}
+{{- if $spiffe }}
+# The migration's identity with spicedb.datastore.spiffe: the issuer gives
+# this ServiceAccount the SPIFFE ID the Job presents to the datastore. A hook
+# like the Job, created before it (the release's own objects come after the
+# pre-install hooks), and kept between releases. No Kubernetes permissions.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cracha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: spicedb-migrate
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-1"
+    helm.sh/hook-delete-policy: before-hook-creation
+automountServiceAccountToken: false
+---
+{{- end }}
 # The one owner of the datastore's migrations (design 6.4): `spicedb migrate
 # head` before an install or an upgrade starts the new pods, which never
 # migrate themselves. A failed migration fails the release.
@@ -23,8 +45,14 @@ spec:
       labels:
         {{- include "cracha.labels" . | nindent 8 }}
         app.kubernetes.io/component: spicedb-migrate
+        {{- if $spiffe }}
+        cracha.dev/datastore-client: "true"
+        {{- end }}
     spec:
       restartPolicy: Never
+      {{- if $spiffe }}
+      serviceAccountName: {{ $sa }}
+      {{- end }}
       automountServiceAccountToken: false
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -49,6 +77,9 @@ spec:
             - --migration-timeout={{ $s.migration.timeout }}
             - --log-format=json
             - --log-level={{ $s.logLevel }}
+            {{- with (include "cracha.spicedbDatastoreSpiffeArgs" (dict "root" . "id" (include "cracha.spicedbDatastoreSpiffeID" (dict "root" . "id" $s.datastore.spiffe.migrationID "serviceAccount" $sa)))) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           env:
             {{- include "cracha.spicedbDatastoreEnv" . | nindent 12 }}
           securityContext:
@@ -57,9 +88,16 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with (include "cracha.spicedbDatastoreMounts" .) }}
+          {{- if or $spiffe (include "cracha.spicedbDatastoreMounts" .) }}
           volumeMounts:
+            {{- with (include "cracha.spicedbDatastoreMounts" .) }}
             {{- . | nindent 12 }}
+            {{- end }}
+            {{- if $spiffe }}
+            - name: spire-workload-api
+              mountPath: /spiffe-workload-api
+              readOnly: true
+            {{- end }}
           {{- end }}
       securityContext:
         runAsNonRoot: true
@@ -67,9 +105,15 @@ spec:
         runAsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
-      {{- with (include "cracha.spicedbDatastoreVolumes" .) }}
+      {{- if or $spiffe (include "cracha.spicedbDatastoreVolumes" .) }}
       volumes:
+        {{- with (include "cracha.spicedbDatastoreVolumes" .) }}
         {{- . | nindent 8 }}
+        {{- end }}
+        {{- if $spiffe }}
+        - name: spire-workload-api
+          {{- include "cracha.workloadAPIVolumeSource" (dict "component" "spicedb" "volume" $s.workloadAPI.volume) | nindent 10 }}
+        {{- end }}
       {{- end }}
 {{- end }}
 {{- end }}

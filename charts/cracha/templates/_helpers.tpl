@@ -181,7 +181,46 @@ mysql or postgres, which need the connection URI's Secret.
 {{- if not $d.uriSecret.name }}{{ fail (printf "spicedb.datastore.uriSecret.name is required with engine %s: the Secret holding the connection URI" $d.engine) }}{{ end -}}
 {{- if and $d.clientCertSecret.name (ne $d.engine "postgres") }}{{ fail "spicedb.datastore.clientCertSecret needs engine postgres" }}{{ end -}}
 {{- end -}}
+{{- if $d.spiffe.enabled -}}
+{{- if ne $d.engine "mysql" }}{{ fail "spicedb.datastore.spiffe needs engine mysql" }}{{ end -}}
+{{- if not $d.spiffe.serverID }}{{ fail "spicedb.datastore.spiffe.serverID is required with spicedb.datastore.spiffe.enabled: the SPIFFE ID, or trust domain, the datastore server presents" }}{{ end -}}
+{{- if $d.caSecret.name }}{{ fail "spicedb.datastore.caSecret and spicedb.datastore.spiffe exclude each other: with spiffe the server is verified against the Workload API's bundle" }}{{ end -}}
+{{- range $k, $v := (dict "serverID" $d.spiffe.serverID "id" $d.spiffe.id "migrationID" $d.spiffe.migrationID) }}
+{{- if and $v (not (hasPrefix "spiffe://" $v)) }}{{ fail (printf "spicedb.datastore.spiffe.%s must be a SPIFFE ID, spiffe://..., not %q" $k $v) }}{{ end -}}
+{{- end -}}
+{{- end -}}
 {{ $d.engine }}
+{{- end -}}
+
+{{/*
+The SPIFFE ID a SpiceDB container presents to the datastore with
+spicedb.datastore.spiffe: the value given, or the path of its
+ServiceAccount in spicedb.gateway.trustDomain. Call with (dict "root" .
+"id" <value> "serviceAccount" <name>).
+*/}}
+{{- define "cracha.spicedbDatastoreSpiffeID" -}}
+{{- if .id -}}
+{{ .id }}
+{{- else -}}
+{{- $td := .root.Values.spicedb.gateway.trustDomain -}}
+{{- if not $td }}{{ fail "spicedb.gateway.trustDomain is required with spicedb.datastore.spiffe and no spicedb.datastore.spiffe.id" }}{{ end -}}
+spiffe://{{ $td }}/ns/{{ .root.Release.Namespace }}/sa/{{ .serviceAccount }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The arguments of SpiceDB's SPIFFE datastore identity (serve and migrate),
+nothing without spicedb.datastore.spiffe. Call with (dict "root" . "id"
+<the SPIFFE ID to present>).
+*/}}
+{{- define "cracha.spicedbDatastoreSpiffeArgs" -}}
+{{- $s := .root.Values.spicedb -}}
+{{- if $s.datastore.spiffe.enabled -}}
+- --datastore-spiffe
+- --datastore-spiffe-socket=unix:///spiffe-workload-api/{{ $s.workloadAPI.socket }}
+- --datastore-spiffe-id={{ .id }}
+- --datastore-spiffe-server-id={{ $s.datastore.spiffe.serverID }}
+{{- end -}}
 {{- end -}}
 
 {{/*

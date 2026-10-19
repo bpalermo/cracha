@@ -50,12 +50,16 @@ go_binary(
     x_defs = {"github.com/jzelinskie/cobrautil/v2.Version": SPICEDB_VERSION},
 )
 
-# At upstream's path, so `spicedb` is the entrypoint as in its image. No
-# grpc_health_probe: Kubernetes probes the gRPC health service natively.
+# At upstream's paths, so `spicedb` is the entrypoint and grpc_health_probe on
+# the PATH as in its image. The probe is //bazel/spicedb/healthprobe, not
+# upstream's: the chart serves SpiceDB's gRPC on the pod's loopback only, out
+# of the kubelet's native gRPC probe's reach, so the probe runs in the
+# container.
 go_image(
     name = "image",
     base = "@distroless_static",
     binary = ":spicedb",
+    files = {"/usr/local/bin/grpc_health_probe": "//bazel/spicedb/healthprobe:grpc_health_probe"},
     load_tag = "localhost/cracha-spicedb:e2e",
     path = "/usr/local/bin/spicedb",
     registry = IMAGE_REGISTRY,

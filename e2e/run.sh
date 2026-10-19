@@ -88,6 +88,7 @@ if [[ -z "${chart_version}" ]]; then
 		cracha-agent=//agent:image_load
 		cracha-webhook=//webhook:image_load
 		cracha-access=//access:image_load
+		cracha-spicedb=//bazel/spicedb:image_load
 		"${images[@]}"
 	)
 fi

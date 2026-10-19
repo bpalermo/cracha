@@ -569,14 +569,14 @@ spicedb:
   # but one up is created when there is more than one.
   replicas: 2
 
-  # The release authzed/spicedb publishes to ghcr.io, Docker Hub and quay.io
-  # under one index, pinned by tag and by the index digest, which
-  # `docker buildx imagetools inspect ghcr.io/authzed/spicedb:v1.56.2`
-  # reported. Pinned by hand, like every image the chart does not build.
+  # Crachá's SpiceDB (//bazel/spicedb): upstream's release plus one patch,
+  # the SPIFFE workload identity of `datastore.spiffe`, with
+  # grpc_health_probe beside it as in upstream's image. Pinned at package
+  # time like the chart's own images.
   image:
-    repository: ghcr.io/authzed/spicedb
-    tag: v1.56.2
-    digest: sha256:aa96009a0477f8a759149823407d47ad16d1a74390bae3102b3b0b7143502764
+    repository: "{@//bazel/spicedb:image_push.repository}"
+    tag: ""
+    digest: "{@//bazel/spicedb:image_push.digest}"
     pullPolicy: IfNotPresent
 
   # The port SpiceDB serves gRPC on, on the pod's loopback (127.0.0.1)
@@ -614,6 +614,30 @@ spicedb:
   #                     The chart does not rotate it: a new certificate in
   #                     the Secret reaches the pods as the kubelet updates
   #                     the volume.
+  #   spiffe            mysql only: SpiceDB logs in with its X.509-SVID from
+  #                     the SPIFFE Workload API (`workloadAPI` below, mounted
+  #                     into SpiceDB's container and the migration Job) and
+  #                     verifies the server against the Workload API's bundle
+  #                     of the server's trust domain, by SPIFFE ID: no
+  #                     password, no CA Secret, nothing on disk, rotation
+  #                     without a restart. The MySQL user is `REQUIRE
+  #                     SUBJECT` the SVID's subject, which the issuer's entry
+  #                     sets (SPIRE: its first DNS name becomes the CN). The
+  #                     pods of both carry the label
+  #                     cracha.dev/datastore-client: "true" for that entry to
+  #                     select them. The URI's tls= must be empty or true.
+  #                       enabled    turns it on
+  #                       serverID   required: the SPIFFE ID the server
+  #                                  presents, or a trust domain
+  #                                  (spiffe://example.org) for any of its
+  #                                  workloads; a federated one needs the
+  #                                  issuer's entry to federate with it
+  #                       id         the SVID SpiceDB presents, and no other
+  #                                  (empty: spiffe://<gateway.trustDomain>
+  #                                  /ns/<namespace>/sa/<name>-spicedb)
+  #                       migrationID the migration Job's (empty: the same
+  #                                  path with its ServiceAccount,
+  #                                  <name>-spicedb-migrate)
   datastore:
     engine: memory
     uriSecret:
@@ -626,12 +650,19 @@ spicedb:
       name: ""
       certKey: tls.crt
       keyKey: tls.key
+    spiffe:
+      enabled: false
+      serverID: ""
+      id: ""
+      migrationID: ""
 
   # The migration Job, the one owner of the datastore's schema migrations
   # (SpiceDB's serve never migrates): `spicedb migrate head`, a Helm
   # pre-install and pre-upgrade hook, so an upgrade migrates before the new
   # pods start. Not rendered for the memory engine, which has nothing to
-  # migrate.
+  # migrate. With a datastore several clusters share, enable it on one
+  # cluster only, and upgrade that one first: every cluster runs the same
+  # SpiceDB version.
   migration:
     enabled: true
     timeout: 1h
