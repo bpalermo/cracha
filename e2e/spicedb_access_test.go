@@ -13,6 +13,8 @@ import (
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/bpalermo/cracha/common/idenc"
 	schema "github.com/bpalermo/cracha/common/spicedb"
@@ -176,9 +178,20 @@ func write(ctx context.Context, op v1.RelationshipUpdate_Operation, rels ...*v1.
 }
 
 // mustWrite is write for a test.
+// A write answered UNAVAILABLE is retried for a few seconds: that is the
+// suite's port-forward being started again after a connection the pod side
+// reset (run.sh's forward, the gateway tests' refused handshakes), and a
+// TOUCH or a DELETE written twice is written once.
 func mustWrite(ctx context.Context, t *testing.T, op v1.RelationshipUpdate_Operation, rels ...*v1.Relationship) {
 	t.Helper()
-	if _, err := write(ctx, op, rels...); err != nil {
+	var err error
+	for range 10 {
+		if _, err = write(ctx, op, rels...); grpcstatus.Code(err) != codes.Unavailable {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
 }
