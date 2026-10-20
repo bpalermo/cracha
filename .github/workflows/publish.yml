@@ -239,8 +239,7 @@ jobs:
           pinned //broker:image_index "${BROKER_IMAGE}"
           pinned //agent:image_index "${AGENT_IMAGE}"
           pinned //webhook:image_index "${WEBHOOK_IMAGE}"
-          # Not yet //bazel/spicedb:image_index: the chart deploys
-          # SpiceDB from upstream's image until it is pointed at this one.
+          pinned //bazel/spicedb:image_index "${SPICEDB_IMAGE}"
           pinned //access:image_index "${ACCESS_IMAGE}"
 
       # One login covers everything below: image_push (rules_img) and cosign
@@ -638,6 +637,7 @@ jobs:
           pinned "${AGENT_REF}"
           pinned "${WEBHOOK_REF}"
           pinned "${ACCESS_REF}"
+          pinned "${SPICEDB_REF}"
 
       # No REGISTRY_* credentials: the repositories are public, and this is
       # the check a consumer can run.

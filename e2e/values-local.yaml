@@ -19,3 +19,7 @@ access:
   image:
     <<: *local
     repository: localhost/cracha-access
+spicedb:
+  image:
+    <<: *local
+    repository: localhost/cracha-spicedb

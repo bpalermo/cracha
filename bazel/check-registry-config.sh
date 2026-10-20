@@ -56,7 +56,7 @@ esc() { printf '%s' "$1" | sed -E 's/[][\.^$*+?(){}|/]/\\&/g'; }
 
 # --- 2. the chart's image defaults are derived --------------------------------
 values=charts/cracha/values.yaml
-for target in //broker:image_push //agent:image_push //webhook:image_push //access:image_push; do
+for target in //broker:image_push //agent:image_push //webhook:image_push //access:image_push //bazel/spicedb:image_push; do
 	t="$(esc "$target")"
 	n_repo="$(grep -cE "^[[:space:]]*repository:[[:space:]]*\"\{@${t}\.repository\}\"[[:space:]]*\$" "$values" || true)"
 	n_digest="$(grep -cE "^[[:space:]]*digest:[[:space:]]*\"\{@${t}\.digest\}\"[[:space:]]*\$" "$values" || true)"

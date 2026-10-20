@@ -1,0 +1,23 @@
+# The chart's SpiceDB on mysql logging in with its SPIFFE workload identity
+# (spicedb.datastore.spiffe), which excludes the CA Secret the overrides
+# set: the server is verified against the Workload API's bundle. The
+# migration Job's ID is given, SpiceDB's derived.
+broker:
+  authz:
+    backend: spicedb
+spicedb:
+  presharedKeySecret:
+    name: spicedb-key
+  datastore:
+    engine: mysql
+    uriSecret:
+      name: spicedb-datastore
+    spiffe:
+      enabled: true
+      serverID: spiffe://db.example.org/mysql/server
+      migrationID: spiffe://prod.example.org/spicedb/migrate
+  workloadAPI:
+    volume:
+      type: csi
+  gateway:
+    trustDomain: prod.example.org
