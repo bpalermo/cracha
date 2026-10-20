@@ -99,15 +99,16 @@ go_deps.gazelle_override(
 )
 
 # SpiceDB, built from its pinned release (go.mod, a `tool` so nothing has to
-# import it) plus Crachá's one change, MySQL client TLS, and published as
-# Crachá's `spicedb` image (//bazel/spicedb). Patches apply after
-# Gazelle has generated the BUILD files, so the second patch adds the file
-# the first creates to its package's BUILD file. Bump procedure: AGENTS.md,
+# import it) plus Crachá's one change, a SPIFFE workload identity for the
+# MySQL datastore, and published as Crachá's `spicedb` image
+# (//bazel/spicedb). Patches apply after Gazelle has generated the BUILD
+# files, so the second patch writes the BUILD file of the package the first
+# creates and adds the new files and package to the others. Bump procedure: AGENTS.md,
 # "Images and versions".
 go_deps.module_override(
     patch_strip = 1,
     patches = [
-        "//bazel/spicedb:0001-mysql-client-tls.patch",
+        "//bazel/spicedb:0001-mysql-spiffe.patch",
         "//bazel/spicedb:0002-bazel-build-files.patch",
     ],
     path = "github.com/authzed/spicedb",

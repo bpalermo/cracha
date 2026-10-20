@@ -7,14 +7,17 @@ load("//bazel/image:defs.bzl", "go_image")
 # image.
 #
 #   go.mod                           github.com/authzed/spicedb, as a `tool`
-#   0001-mysql-client-tls.patch      the change: MySQL client TLS
-#                                    (--datastore-tls-{ca,cert,key}-path,
-#                                    --datastore-tls-server-name), reloaded on
-#                                    rotation; `git diff v<version>..` of the
-#                                    fork branch over its non-test Go files
-#   0002-bazel-build-files.patch     Bazel only: adds the file 0001 creates to
-#                                    the BUILD file Gazelle generated before
-#                                    the patches applied
+#   0001-mysql-spiffe.patch          the change: the MySQL datastore
+#                                    authenticates with a SPIFFE workload
+#                                    identity from the Workload API
+#                                    (--datastore-spiffe and its -socket, -id
+#                                    and -server-id); `git diff v<version>..`
+#                                    of the fork branch over its non-test Go
+#                                    files
+#   0002-bazel-build-files.patch     Bazel only: the BUILD file of the
+#                                    package 0001 creates, and its files and
+#                                    package in the BUILD files Gazelle
+#                                    generated before the patches applied
 #
 # Both are applied by go_deps.module_override in MODULE.bazel. Bumping
 # SpiceDB: AGENTS.md, "Images and versions".
@@ -25,7 +28,7 @@ exports_files(glob(["*.patch"]))
 # saying it is this build. Keep the release equal to go.mod's
 # (//bazel/spicedb:spicedb_test checks it), and bump the suffix when
 # the patch changes without the release changing.
-SPICEDB_VERSION = "v1.56.2-cracha.1"
+SPICEDB_VERSION = "v1.56.2-cracha.2"
 
 # Built the way upstream's release is (.goreleaser.yml of the module): cgo
 # off, the `memoryprotection` tag, whose memory-usage provider reads the

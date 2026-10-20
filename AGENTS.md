@@ -387,22 +387,29 @@ The decision after bazel-diff is covered by `//bazel:ci_impacted_targets_test`.
 - `spicedb` (`//bazel/spicedb`) is a third-party binary: SpiceDB built
   from a pinned upstream release (`github.com/authzed/spicedb` in `go.mod`, a
   `tool`, so nothing imports it) plus one reviewed patch,
-  `0001-mysql-client-tls.patch` (MySQL client TLS:
-  `--datastore-tls-{ca,cert,key}-path`, `--datastore-tls-server-name`,
-  reloaded on rotation). That patch is the only change Crachá makes to
-  SpiceDB; `0002-bazel-build-files.patch` only adds the file it creates to the
-  BUILD file Gazelle generated, since `go_deps.module_override` applies
-  patches after Gazelle runs. The binary is built as upstream's release is
+  `0001-mysql-spiffe.patch` (the MySQL datastore authenticates with a
+  SPIFFE workload identity: `--datastore-spiffe`, with
+  `--datastore-spiffe-socket`, `--datastore-spiffe-id` and
+  `--datastore-spiffe-server-id`, on `serve` and `migrate`; the X.509-SVID
+  and the server's bundle come from the Workload API on every handshake, so
+  rotation needs no restart and nothing is written to disk; upstream as the
+  drafts authzed/spicedb#3416 and #3417). That patch is the only change
+  Crachá makes to SpiceDB; `0002-bazel-build-files.patch` only writes the
+  BUILD file of the package it creates (`internal/datastore/common/spiffetls`)
+  and adds its files and that package to the BUILD files Gazelle generated,
+  since `go_deps.module_override` applies patches after Gazelle runs (a
+  BUILD file in it loads `@io_bazel_rules_go`, as Gazelle's do, and is a
+  `git diff`, the format Bazel's patcher reads). The binary is built as upstream's release is
   (cgo off, the `memoryprotection` tag, `-checklinkname=0`) and `spicedb
   version` reports `SPICEDB_VERSION` of its BUILD file, the release with a
   `-cracha.<n>` suffix; `//bazel/spicedb:spicedb_test` checks the
   version against `go.mod`, the patch's flags, and a schema write and
   permission check against the binary. To bump SpiceDB: rebase Bruno's fork
-  branch `mysql-client-tls-v<version>` of bpalermo/spicedb onto the new
-  release; regenerate the patch with `git diff v<version>..mysql-client-tls-v<version>`
-  over its non-test Go files; `bazel run @rules_go//go -- get
+  branch `spiffe-datastore-mysql-v<version>` of bpalermo/spicedb onto the new
+  release; regenerate the patch with `git diff v<version>..spiffe-datastore-mysql-v<version>`
+  over its non-test Go files (not `internal/testutil`); `bazel run @rules_go//go -- get
   github.com/authzed/spicedb@v<version>`, `bazel mod tidy`; refresh `0002`
-  if Gazelle's BUILD file for the package changed; set `SPICEDB_VERSION` to
+  if Gazelle's BUILD files for those packages changed; set `SPICEDB_VERSION` to
   `v<version>-cracha.1`; and report which shared modules Crachá's own
   requirements now hold above what that release's `go.mod` asks for. A change
   to the patch alone bumps the suffix.

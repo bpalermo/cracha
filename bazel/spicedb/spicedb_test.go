@@ -1,6 +1,6 @@
 // Package spicedb_test is the smoke test of the SpiceDB binary Crachá builds
 // and publishes (//bazel/spicedb:spicedb): it reports this build's
-// version, it has the flags of the MySQL client TLS patch, and it serves a
+// version, it has the flags of the SPIFFE datastore identity patch, and it serves a
 // schema write, a relationship write and a permission check end to end on the
 // in-memory datastore.
 package spicedb_test
@@ -87,16 +87,18 @@ func TestVersionMatchesGoMod(t *testing.T) {
 	}
 }
 
-func TestServeHasTheTLSFlags(t *testing.T) {
-	help := run(t, "serve", "--help")
-	for _, flag := range []string{
-		"--datastore-tls-ca-path",
-		"--datastore-tls-cert-path",
-		"--datastore-tls-key-path",
-		"--datastore-tls-server-name",
-	} {
-		if !strings.Contains(help, flag+" ") {
-			t.Errorf("spicedb serve --help does not list %s", flag)
+func TestHasTheSPIFFEFlags(t *testing.T) {
+	for _, cmd := range [][]string{{"serve"}, {"migrate"}, {"datastore", "migrate"}} {
+		help := run(t, append(cmd, "--help")...)
+		for _, flag := range []string{
+			"--datastore-spiffe",
+			"--datastore-spiffe-id",
+			"--datastore-spiffe-server-id",
+			"--datastore-spiffe-socket",
+		} {
+			if !strings.Contains(help, flag+" ") {
+				t.Errorf("spicedb %s --help does not list %s", strings.Join(cmd, " "), flag)
+			}
 		}
 	}
 }

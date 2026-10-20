@@ -1,10 +1,104 @@
+diff --git a/internal/datastore/common/spiffetls/BUILD.bazel b/internal/datastore/common/spiffetls/BUILD.bazel
+new file mode 100644
+--- /dev/null
++++ b/internal/datastore/common/spiffetls/BUILD.bazel
+@@ -0,0 +1,25 @@
++load("@io_bazel_rules_go//go:def.bzl", "go_library")
++
++alias(
++    name = "go_default_library",
++    actual = ":spiffetls",
++    visibility = ["//:__subpackages__"],
++)
++
++go_library(
++    name = "spiffetls",
++    srcs = ["spiffetls.go"],
++    importpath = "github.com/authzed/spicedb/internal/datastore/common/spiffetls",
++    visibility = [
++        "//:__subpackages__",
++        "@@//bazel/spicedb:__pkg__",
++    ],
++    deps = [
++        "//internal/logging",
++        "@com_github_prometheus_client_golang//prometheus",
++        "@com_github_spiffe_go_spiffe_v2//spiffeid",
++        "@com_github_spiffe_go_spiffe_v2//spiffetls/tlsconfig",
++        "@com_github_spiffe_go_spiffe_v2//svid/x509svid",
++        "@com_github_spiffe_go_spiffe_v2//workloadapi",
++    ],
++)
+diff --git a/internal/datastore/mysql/BUILD.bazel b/internal/datastore/mysql/BUILD.bazel
+--- a/internal/datastore/mysql/BUILD.bazel
++++ b/internal/datastore/mysql/BUILD.bazel
+@@ -28,6 +28,7 @@ go_library(
+     ],
+     deps = [
+         "//internal/datastore/common",
++        "//internal/datastore/common/spiffetls",
+         "//internal/datastore/mysql/common",
+         "//internal/datastore/mysql/migrations",
+         "//internal/datastore/proxy",
+diff --git a/internal/datastore/mysql/common/BUILD.bazel b/internal/datastore/mysql/common/BUILD.bazel
 --- a/internal/datastore/mysql/common/BUILD.bazel
 +++ b/internal/datastore/mysql/common/BUILD.bazel
-@@ -5,6 +5,7 @@
+@@ -4,6 +4,7 @@ go_library(
+     name = "common",
      srcs = [
          "credentials.go",
++        "spiffe.go",
          "transaction.go",
-+        "tls.go",
      ],
      importpath = "github.com/authzed/spicedb/internal/datastore/mysql/common",
-     visibility = ["//:__subpackages__"],
+@@ -12,6 +13,7 @@ go_library(
+         "@@//bazel/spicedb:__pkg__",
+     ],
+     deps = [
++        "//internal/datastore/common/spiffetls",
+         "//internal/logging",
+         "//pkg/datastore",
+         "//pkg/spiceerrors",
+diff --git a/internal/datastore/mysql/migrations/BUILD.bazel b/internal/datastore/mysql/migrations/BUILD.bazel
+--- a/internal/datastore/mysql/migrations/BUILD.bazel
++++ b/internal/datastore/mysql/migrations/BUILD.bazel
+@@ -28,6 +28,7 @@ go_library(
+     ],
+     deps = [
+         "//internal/datastore/common",
++        "//internal/datastore/common/spiffetls",
+         "//internal/datastore/mysql/common",
+         "//pkg/datastore",
+         "//pkg/migrate",
+diff --git a/internal/testserver/datastore/BUILD.bazel b/internal/testserver/datastore/BUILD.bazel
+--- a/internal/testserver/datastore/BUILD.bazel
++++ b/internal/testserver/datastore/BUILD.bazel
+@@ -17,6 +17,7 @@ go_library(
+         "@@//bazel/spicedb:__pkg__",
+     ],
+     deps = [
++        "//internal/datastore/common/spiffetls",
+         "//internal/datastore/crdb/migrations",
+         "//internal/datastore/crdb/version",
+         "//internal/datastore/mysql/migrations",
+diff --git a/pkg/cmd/datastore/dsconfig/BUILD.bazel b/pkg/cmd/datastore/dsconfig/BUILD.bazel
+--- a/pkg/cmd/datastore/dsconfig/BUILD.bazel
++++ b/pkg/cmd/datastore/dsconfig/BUILD.bazel
+@@ -11,6 +11,7 @@ go_library(
+     importpath = "github.com/authzed/spicedb/pkg/cmd/datastore/dsconfig",
+     visibility = ["//visibility:public"],
+     deps = [
++        "//internal/datastore/common/spiffetls",
+         "//pkg/caveats/types",
+         "//pkg/datalayer/schemamode",
+         "//pkg/datastore",
+diff --git a/pkg/datastore/migration/BUILD.bazel b/pkg/datastore/migration/BUILD.bazel
+--- a/pkg/datastore/migration/BUILD.bazel
++++ b/pkg/datastore/migration/BUILD.bazel
+@@ -6,6 +6,7 @@ go_library(
+     importpath = "github.com/authzed/spicedb/pkg/datastore/migration",
+     visibility = ["//visibility:public"],
+     deps = [
++        "//internal/datastore/common/spiffetls",
+         "//internal/logging",
+         "//pkg/datastore",
+         "//pkg/migrate",
