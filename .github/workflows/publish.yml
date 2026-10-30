@@ -245,7 +245,7 @@ jobs:
       # One login covers everything below: image_push (rules_img) and cosign
       # read the Docker config this writes. The chart push logs in on its own,
       # from HELM_REGISTRY_USERNAME/PASSWORD (see that step).
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ${{ env.IMAGE_REGISTRY_HOST }}
           username: ${{ secrets.QUAY_USERNAME }}
