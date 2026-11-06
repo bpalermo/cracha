@@ -66,7 +66,7 @@ jobs:
       # e2e/run.sh uses a cluster of this name if one exists. kind is pinned
       # to the release whose default node image e2e/kind-node-image is, as
       # in ci.yml; bump the two together.
-      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+      - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           version: v0.31.0
           node_image: ${{ steps.kind.outputs.node_image }}
